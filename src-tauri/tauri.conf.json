@@ -1,0 +1,68 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Macnu",
+  "version": "0.1.0",
+  "identifier": "com.qoest.macnu",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Macnu",
+        "width": 620,
+        "height": 420,
+        "minWidth": 620,
+        "minHeight": 420,
+        "maxWidth": 620,
+        "maxHeight": 420,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "center": true,
+        "shadow": false,
+        "visible": false
+      },
+      {
+        "label": "settings",
+        "title": "Macnu Settings",
+        "width": 650,
+        "height": 450,
+        "minWidth": 650,
+        "minHeight": 450,
+        "maxWidth": 650,
+        "maxHeight": 450,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": false,
+        "skipTaskbar": true,
+        "center": true,
+        "shadow": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "Utility",
+    "shortDescription": "A scrollable companion for crowded Mac menu bars",
+    "longDescription": "Macnu reveals macOS menu bar extras in a horizontally scrollable floating strip.",
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-",
+      "infoPlist": "Info.plist"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "macnu",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "build:app": "tauri build --bundles app && ./scripts/sign-app.sh",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "typescript": "~5.8.3",
+    "vite": "^7.1.7"
+  }
+}

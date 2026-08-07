@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Macnu uses system services to activate your original menu bar items.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Macnu mirrors your real menu bar icons into its quick horizontal slider.</string>
+</dict>
+</plist>
