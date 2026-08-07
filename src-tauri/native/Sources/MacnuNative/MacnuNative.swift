@@ -69,8 +69,20 @@ private struct ActivationSession {
     let baselineWindowIDs: Set<CGWindowID>
 }
 
+private struct CachedIconImage {
+    let pid: pid_t
+    let width: Int
+    let height: Int
+    let dataURL: String
+    let capturedAt: TimeInterval
+}
+
 private let activationSessionLock = NSLock()
 private var lastActivationSession: ActivationSession?
+private let iconImageCacheLock = NSLock()
+private var iconImageCache: [CGWindowID: CachedIconImage] = [:]
+private let iconImageCacheLifetime: TimeInterval = 30
+private let iconImageCacheRetention: TimeInterval = 120
 
 private struct CaptureResponse: Codable {
     let icons: [MenuIcon]
@@ -435,6 +447,53 @@ private func pngDataURL(from image: CGImage) -> String? {
     return "data:image/png;base64,\(data.base64EncodedString())"
 }
 
+private func reusableIconImages(
+    for windows: [MenuWindow],
+    at timestamp: TimeInterval
+) -> [CGWindowID: String] {
+    iconImageCacheLock.lock()
+    defer { iconImageCacheLock.unlock() }
+
+    for windowID in Array(iconImageCache.keys) where
+        timestamp - (iconImageCache[windowID]?.capturedAt ?? 0) > iconImageCacheRetention {
+        iconImageCache.removeValue(forKey: windowID)
+    }
+
+    var reusable: [CGWindowID: String] = [:]
+    for window in windows {
+        let width = max(1, Int(window.bounds.width * 2))
+        let height = max(1, Int(window.bounds.height * 2))
+        guard let cached = iconImageCache[window.id],
+              cached.pid == window.pid,
+              cached.width == width,
+              cached.height == height,
+              timestamp - cached.capturedAt < iconImageCacheLifetime else {
+            continue
+        }
+        reusable[window.id] = cached.dataURL
+    }
+    return reusable
+}
+
+private func cacheIconImage(
+    _ dataURL: String,
+    for windowID: CGWindowID,
+    pid: pid_t,
+    width: Int,
+    height: Int,
+    at timestamp: TimeInterval
+) {
+    iconImageCacheLock.lock()
+    iconImageCache[windowID] = CachedIconImage(
+        pid: pid,
+        width: width,
+        height: height,
+        dataURL: dataURL,
+        capturedAt: timestamp
+    )
+    iconImageCacheLock.unlock()
+}
+
 private func onScreenWindows() -> [OnScreenWindow] {
     let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let info = CGWindowListCopyWindowInfo(
@@ -747,34 +806,68 @@ private func captureMenuIcons() async -> CaptureResponse {
     }
 
     do {
-        let content = try await SCShareableContent.excludingDesktopWindows(
-            false,
-            onScreenWindowsOnly: false
+        let captureTimestamp = ProcessInfo.processInfo.systemUptime
+        let reusableImages = reusableIconImages(
+            for: windows,
+            at: captureTimestamp
         )
-        let shareableById = Dictionary(
-            uniqueKeysWithValues: content.windows.map { ($0.windowID, $0) }
-        )
+        let needsImageCapture = windows.contains {
+            reusableImages[$0.id] == nil
+        }
+        let shareableById: [CGWindowID: SCWindow]
+        if needsImageCapture {
+            let content = try await SCShareableContent.excludingDesktopWindows(
+                false,
+                onScreenWindowsOnly: false
+            )
+            shareableById = Dictionary(
+                uniqueKeysWithValues: content.windows.map { ($0.windowID, $0) }
+            )
+        } else {
+            shareableById = [:]
+        }
         let accessibilityItems = accessibilityCandidates()
         var icons: [MenuIcon] = []
         var seenIcons: Set<String> = []
 
         for menuWindow in windows {
-            guard let shareableWindow = shareableById[menuWindow.id] else { continue }
-
-            let filter = SCContentFilter(desktopIndependentWindow: shareableWindow)
-            let configuration = SCStreamConfiguration()
-            configuration.width = max(1, Int(menuWindow.bounds.width * 2))
-            configuration.height = max(1, Int(menuWindow.bounds.height * 2))
-            configuration.showsCursor = false
-            configuration.ignoreShadowsSingleWindow = true
-            configuration.captureResolution = .best
+            let captureWidth = max(1, Int(menuWindow.bounds.width * 2))
+            let captureHeight = max(1, Int(menuWindow.bounds.height * 2))
 
             do {
-                let image: CGImage = try await SCScreenshotManager.captureImage(
-                    contentFilter: filter,
-                    configuration: configuration
-                )
-                guard let dataURL = pngDataURL(from: image) else { continue }
+                let dataURL: String
+                if let reusableImage = reusableImages[menuWindow.id] {
+                    dataURL = reusableImage
+                } else {
+                    guard let shareableWindow = shareableById[menuWindow.id] else {
+                        continue
+                    }
+                    let filter = SCContentFilter(
+                        desktopIndependentWindow: shareableWindow
+                    )
+                    let configuration = SCStreamConfiguration()
+                    configuration.width = captureWidth
+                    configuration.height = captureHeight
+                    configuration.showsCursor = false
+                    configuration.ignoreShadowsSingleWindow = true
+                    configuration.captureResolution = .best
+                    let image: CGImage = try await SCScreenshotManager.captureImage(
+                        contentFilter: filter,
+                        configuration: configuration
+                    )
+                    guard let capturedImage = pngDataURL(from: image) else {
+                        continue
+                    }
+                    dataURL = capturedImage
+                    cacheIconImage(
+                        dataURL,
+                        for: menuWindow.id,
+                        pid: menuWindow.pid,
+                        width: captureWidth,
+                        height: captureHeight,
+                        at: captureTimestamp
+                    )
+                }
                 let matchedItem = matchedAccessibilityElement(
                     for: menuWindow,
                     in: accessibilityItems,

@@ -28,6 +28,11 @@ type MenuResponse = {
   error: string | null;
 };
 
+type ActiveDisplayCache = {
+  displayId: number;
+  response: MenuResponse | null;
+};
+
 type SettingsResponse = {
   shortcut: string;
   startAtLoginStatus: number;
@@ -311,12 +316,15 @@ let activeDisplayId: number | null = null;
 let refreshing = false;
 let queuedRefresh = false;
 let queuedPermissionPrompt = false;
+let queuedForceRefresh = false;
 let selectedIndex = 0;
 let permissionFlowStarted = false;
 let accessibilityFlowStarted = false;
 let blurDismissGeneration = 0;
 let blurDismissArmed = false;
 let pendingBlur = false;
+let pointerSelectionArmed = false;
+let lastArrowNavigationAt = 0;
 
 function applyShortcutDisplay(shortcut: string): void {
   shortcutDisplay.innerHTML = shortcutMarkup(shortcut);
@@ -436,7 +444,7 @@ async function openScreenPermission(): Promise<void> {
   if (!granted) {
     await invoke("open_privacy_settings", { kind: "screen" });
   } else {
-    await refreshIcons(true);
+    await refreshIcons(true, true);
   }
 }
 
@@ -449,35 +457,46 @@ async function openAccessibilityPermission(): Promise<void> {
   if (!granted) {
     await invoke("open_privacy_settings", { kind: "accessibility" });
   } else {
-    await refreshIcons(true);
+    await refreshIcons(true, true);
   }
 }
 
-function responseFingerprint(value: MenuResponse | null): string {
-  if (!value) return "";
-  return JSON.stringify([
-    value.displayId,
-    value.screenCaptureDenied,
-    value.accessibilityDenied,
-    value.error,
-    value.icons.map((icon) => [
-      icon.windowId,
-      icon.owner,
-      icon.label,
-      icon.x,
-      icon.y,
-      icon.width,
-      icon.height,
-      icon.image,
-      icon.activationPid,
-      icon.activationBundleId,
-      icon.activationX,
-      icon.activationY,
-      icon.activationWidth,
-      icon.activationHeight,
-      icon.activationAction,
-    ]),
-  ]);
+function responsesEqual(
+  left: MenuResponse | null,
+  right: MenuResponse | null,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  if (
+    left.displayId !== right.displayId ||
+    left.screenCaptureDenied !== right.screenCaptureDenied ||
+    left.accessibilityDenied !== right.accessibilityDenied ||
+    left.error !== right.error ||
+    left.icons.length !== right.icons.length
+  ) {
+    return false;
+  }
+
+  return left.icons.every((icon, index) => {
+    const other = right.icons[index];
+    return (
+      icon.windowId === other.windowId &&
+      icon.owner === other.owner &&
+      icon.label === other.label &&
+      icon.x === other.x &&
+      icon.y === other.y &&
+      icon.width === other.width &&
+      icon.height === other.height &&
+      icon.image === other.image &&
+      icon.activationPid === other.activationPid &&
+      icon.activationBundleId === other.activationBundleId &&
+      icon.activationX === other.activationX &&
+      icon.activationY === other.activationY &&
+      icon.activationWidth === other.activationWidth &&
+      icon.activationHeight === other.activationHeight &&
+      icon.activationAction === other.activationAction
+    );
+  });
 }
 
 function applyResponse(next: MenuResponse | null): void {
@@ -488,26 +507,26 @@ function applyResponse(next: MenuResponse | null): void {
   ) {
     return;
   }
-  if (responseFingerprint(response) === responseFingerprint(next)) return;
+  if (responsesEqual(response, next)) return;
   response = next;
   render();
 }
 
-async function cachedIcons(displayId: number): Promise<MenuResponse | null> {
-  return invoke<MenuResponse | null>("cached_menu_icons", { displayId });
-}
-
-async function refreshIcons(promptPermissions = false): Promise<void> {
+async function refreshIcons(
+  promptPermissions = false,
+  force = false,
+): Promise<void> {
   if (refreshing) {
     queuedRefresh = true;
     queuedPermissionPrompt ||= promptPermissions;
+    queuedForceRefresh ||= force;
     return;
   }
   refreshing = true;
   let next: MenuResponse | null = null;
 
   try {
-    next = await invoke<MenuResponse>("list_menu_icons");
+    next = await invoke<MenuResponse>("list_menu_icons", { force });
     applyResponse(next);
   } catch (error) {
     next = {
@@ -527,35 +546,31 @@ async function refreshIcons(promptPermissions = false): Promise<void> {
     }
     if (queuedRefresh) {
       const shouldPrompt = queuedPermissionPrompt;
+      const shouldForce = queuedForceRefresh;
       queuedRefresh = false;
       queuedPermissionPrompt = false;
-      void refreshIcons(shouldPrompt);
+      queuedForceRefresh = false;
+      void refreshIcons(shouldPrompt, shouldForce);
     }
   }
 }
 
-async function openPalette(): Promise<void> {
-  const displayId = await invoke<number>("active_display_id");
-  activeDisplayId = displayId;
+async function openPalette(generation: number): Promise<void> {
   selectedIndex = 0;
 
   try {
-    applyResponse(await cachedIcons(displayId));
+    const snapshot = await invoke<ActiveDisplayCache>(
+      "active_display_menu_icons",
+    );
+    if (generation !== blurDismissGeneration) return;
+    activeDisplayId = snapshot.displayId;
+    applyResponse(snapshot.response);
+    if (snapshot.response) updateSelection(0);
+    if (!snapshot.response) void refreshIcons(true);
   } catch {
+    if (generation !== blurDismissGeneration) return;
     applyResponse(null);
-  }
-
-  // Keep the cached list visible while a fresh capture runs silently.
-  void refreshIcons(true);
-}
-
-async function pollActiveCache(): Promise<void> {
-  if (activeDisplayId === null) return;
-  if (!(await currentWindow.isVisible())) return;
-  try {
-    applyResponse(await cachedIcons(activeDisplayId));
-  } catch {
-    // A background-cache miss is harmless; the next refresh will retry.
+    void refreshIcons(true);
   }
 }
 
@@ -563,8 +578,13 @@ function updateSelection(next: number): void {
   const icons = visibleIcons();
   if (!icons.length) return;
   selectedIndex = (next + icons.length) % icons.length;
-  render();
-  results.querySelector<HTMLElement>(".result.selected")?.scrollIntoView({
+  const items = results.querySelectorAll<HTMLElement>(".result");
+  items.forEach((item, index) => {
+    const selected = index === selectedIndex;
+    item.classList.toggle("selected", selected);
+    item.setAttribute("aria-selected", String(selected));
+  });
+  items[selectedIndex]?.scrollIntoView({
     block: "nearest",
   });
 }
@@ -596,12 +616,23 @@ input.addEventListener("input", () => {
 input.addEventListener("keydown", (event) => {
   if (event.key === "ArrowDown") {
     event.preventDefault();
+    event.stopPropagation();
+    const now = performance.now();
+    if (event.repeat && now - lastArrowNavigationAt < 90) return;
+    lastArrowNavigationAt = now;
+    pointerSelectionArmed = false;
     updateSelection(selectedIndex + 1);
   } else if (event.key === "ArrowUp") {
     event.preventDefault();
+    event.stopPropagation();
+    const now = performance.now();
+    if (event.repeat && now - lastArrowNavigationAt < 90) return;
+    lastArrowNavigationAt = now;
+    pointerSelectionArmed = false;
     updateSelection(selectedIndex - 1);
   } else if (event.key === "Enter") {
     event.preventDefault();
+    event.stopPropagation();
     activateSelected();
   } else if (event.key === "Escape") {
     void currentWindow.hide();
@@ -609,13 +640,20 @@ input.addEventListener("keydown", (event) => {
 });
 
 results.addEventListener("mousemove", (event) => {
+  if (!pointerSelectionArmed) {
+    pointerSelectionArmed = true;
+    return;
+  }
   const item = (event.target as HTMLElement).closest<HTMLButtonElement>(".result");
   if (!item) return;
   const index = Number(item.dataset.index);
   if (index === selectedIndex) return;
   selectedIndex = index;
-  results.querySelector(".result.selected")?.classList.remove("selected");
+  const previous = results.querySelector(".result.selected");
+  previous?.classList.remove("selected");
+  previous?.setAttribute("aria-selected", "false");
   item.classList.add("selected");
+  item.setAttribute("aria-selected", "true");
 });
 
 results.addEventListener("click", (event) => {
@@ -634,10 +672,10 @@ results.addEventListener("click", (event) => {
     accessibilityFlowStarted = false;
     void openAccessibilityPermission();
   }
-  if (target.closest(".retry")) void refreshIcons(true);
+  if (target.closest(".retry")) void refreshIcons(true, true);
 });
 
-refresh.addEventListener("click", () => void refreshIcons(true));
+refresh.addEventListener("click", () => void refreshIcons(true, true));
 app.querySelector<HTMLButtonElement>(".settings-button")!.addEventListener(
   "click",
   () => void invoke("open_settings"),
@@ -652,8 +690,10 @@ void currentWindow.listen("palette-opened", () => {
   pendingBlur = false;
   input.value = "";
   selectedIndex = 0;
+  pointerSelectionArmed = false;
+  lastArrowNavigationAt = 0;
   window.setTimeout(() => input.focus(), 30);
-  void openPalette();
+  void openPalette(generation);
 
   window.setTimeout(() => {
     if (generation !== blurDismissGeneration) return;
@@ -675,6 +715,10 @@ void currentWindow.listen("palette-opened", () => {
   }, 350);
 });
 
+void currentWindow.listen<MenuResponse>("menu-cache-updated", ({ payload }) => {
+  applyResponse(payload);
+});
+
 void currentWindow.onFocusChanged(({ payload: focused }) => {
   if (focused) {
     pendingBlur = false;
@@ -687,5 +731,4 @@ void currentWindow.onFocusChanged(({ payload: focused }) => {
   void currentWindow.hide();
 });
 
-window.setInterval(() => void pollActiveCache(), 2_000);
 }

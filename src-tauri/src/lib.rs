@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{
     menu::MenuBuilder,
@@ -18,7 +18,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MenuIcon {
     window_id: u32,
@@ -85,7 +85,7 @@ impl From<MenuIcon> for ActivationRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MenuResponse {
     icons: Vec<MenuIcon>,
@@ -95,13 +95,32 @@ struct MenuResponse {
     error: Option<String>,
 }
 
+#[derive(Clone)]
+struct MenuCacheEntry {
+    response: MenuResponse,
+    refreshed_at: Instant,
+}
+
 #[derive(Clone, Default)]
 struct MenuCache {
-    responses: Arc<Mutex<HashMap<u32, MenuResponse>>>,
+    responses: Arc<Mutex<HashMap<u32, MenuCacheEntry>>>,
     capture_lock: Arc<Mutex<()>>,
 }
 
+struct CacheRefresh {
+    response: MenuResponse,
+    changed: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveDisplayCache {
+    display_id: u32,
+    response: Option<MenuResponse>,
+}
+
 const DEFAULT_SHORTCUT: &str = "Command+Semicolon";
+const MENU_CACHE_FRESHNESS: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,67 +184,113 @@ fn copy_native_menu_icons() -> Result<MenuResponse, String> {
         .map_err(|error| format!("Could not decode native menu icons: {error}"))
 }
 
-fn refresh_menu_cache(cache: &MenuCache) -> Result<MenuResponse, String> {
-    let _capture_guard = cache
-        .capture_lock
-        .lock()
-        .map_err(|_| "The menu capture lock is unavailable.".to_string())?;
-    let response = copy_native_menu_icons()?;
-
-    if !response.screen_capture_denied && !response.accessibility_denied && response.error.is_none()
-    {
-        cache
-            .responses
-            .lock()
-            .map_err(|_| "The menu cache is unavailable.".to_string())?
-            .insert(response.display_id, response.clone());
-    }
-
-    Ok(response)
-}
-
-#[tauri::command]
-async fn list_menu_icons(cache: State<'_, MenuCache>) -> Result<MenuResponse, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let cache = cache.inner().clone();
-        return tauri::async_runtime::spawn_blocking(move || refresh_menu_cache(&cache))
-            .await
-            .map_err(|error| format!("Menu capture task failed: {error}"))?;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    Err("Macnu only supports macOS.".to_string())
-}
-
-#[tauri::command]
-fn cached_menu_icons(
+fn fresh_cached_menu_icons(
+    cache: &MenuCache,
     display_id: u32,
-    cache: State<'_, MenuCache>,
 ) -> Result<Option<MenuResponse>, String> {
     cache
         .responses
         .lock()
         .map_err(|_| "The menu cache is unavailable.".to_string())
-        .map(|responses| responses.get(&display_id).cloned())
+        .map(|responses| {
+            responses.get(&display_id).and_then(|entry| {
+                (entry.refreshed_at.elapsed() < MENU_CACHE_FRESHNESS)
+                    .then(|| entry.response.clone())
+            })
+        })
+}
+
+fn refresh_menu_cache(cache: &MenuCache, force: bool) -> Result<CacheRefresh, String> {
+    let display_id = unsafe { macnu_active_display_id() };
+    if !force {
+        if let Some(response) = fresh_cached_menu_icons(cache, display_id)? {
+            return Ok(CacheRefresh {
+                response,
+                changed: false,
+            });
+        }
+    }
+
+    let _capture_guard = cache
+        .capture_lock
+        .lock()
+        .map_err(|_| "The menu capture lock is unavailable.".to_string())?;
+
+    // A background refresh may have completed while this caller waited for
+    // the capture lock. Recheck so multiple callers never repeat the same
+    // expensive ScreenCaptureKit work.
+    let display_id = unsafe { macnu_active_display_id() };
+    if !force {
+        if let Some(response) = fresh_cached_menu_icons(cache, display_id)? {
+            return Ok(CacheRefresh {
+                response,
+                changed: false,
+            });
+        }
+    }
+
+    let response = copy_native_menu_icons()?;
+    let mut changed = true;
+
+    if !response.screen_capture_denied && !response.accessibility_denied && response.error.is_none()
+    {
+        let mut responses = cache
+            .responses
+            .lock()
+            .map_err(|_| "The menu cache is unavailable.".to_string())?;
+        changed = responses
+            .get(&response.display_id)
+            .is_none_or(|entry| entry.response != response);
+        responses.insert(
+            response.display_id,
+            MenuCacheEntry {
+                response: response.clone(),
+                refreshed_at: Instant::now(),
+            },
+        );
+    }
+
+    Ok(CacheRefresh { response, changed })
 }
 
 #[tauri::command]
-fn active_display_id() -> Result<u32, String> {
+async fn list_menu_icons(force: bool, cache: State<'_, MenuCache>) -> Result<MenuResponse, String> {
     #[cfg(target_os = "macos")]
     {
-        return Ok(unsafe { macnu_active_display_id() });
+        let cache = cache.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || refresh_menu_cache(&cache, force))
+            .await
+            .map_err(|error| format!("Menu capture task failed: {error}"))?
+            .map(|refresh| refresh.response)
     }
 
     #[cfg(not(target_os = "macos"))]
     Err("Macnu only supports macOS.".to_string())
+}
+
+#[tauri::command]
+fn active_display_menu_icons(cache: State<'_, MenuCache>) -> Result<ActiveDisplayCache, String> {
+    let display_id = unsafe { macnu_active_display_id() };
+    let response = cache
+        .responses
+        .lock()
+        .map_err(|_| "The menu cache is unavailable.".to_string())
+        .map(|responses| {
+            responses
+                .get(&display_id)
+                .map(|entry| entry.response.clone())
+        })?;
+    Ok(ActiveDisplayCache {
+        display_id,
+        response,
+    })
 }
 
 #[tauri::command]
 async fn activate_menu_icon(icon: MenuIcon) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        return tauri::async_runtime::spawn_blocking(move || {
+        tauri::async_runtime::spawn_blocking(move || {
             let request = ActivationRequest::from(icon);
             let request_json = serde_json::to_string(&request).map_err(|error| {
                 format!("Could not encode the activation catalog entry: {error}")
@@ -240,7 +305,7 @@ async fn activate_menu_icon(icon: MenuIcon) -> Result<(), String> {
             }
         })
         .await
-        .map_err(|error| format!("Menu activation task failed: {error}"))?;
+        .map_err(|error| format!("Menu activation task failed: {error}"))?
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -256,7 +321,7 @@ fn request_permission(kind: String) -> Result<bool, String> {
             "accessibility" => unsafe { macnu_request_accessibility() },
             _ => return Err("Unknown permission type.".to_string()),
         };
-        return Ok(granted);
+        Ok(granted)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -461,11 +526,9 @@ fn toggle_palette(app: &tauri::AppHandle) {
         return;
     };
 
-    if window.is_visible().unwrap_or(false) {
-        if window.is_focused().unwrap_or(false) {
-            let _ = window.hide();
-            return;
-        }
+    if window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false) {
+        let _ = window.hide();
+        return;
     }
 
     if let Some(settings) = app.get_webview_window("settings") {
@@ -549,11 +612,20 @@ pub fn run() {
             });
 
             #[cfg(target_os = "macos")]
+            let cache_app = app.handle().clone();
+            #[cfg(target_os = "macos")]
             thread::Builder::new()
                 .name("macnu-menu-cache".to_string())
                 .spawn(move || loop {
-                    let _ = refresh_menu_cache(&menu_cache);
-                    thread::sleep(Duration::from_secs(10));
+                    if let Ok(refresh) = refresh_menu_cache(&menu_cache, false) {
+                        if refresh.changed {
+                            let _ = cache_app.emit("menu-cache-updated", refresh.response);
+                        }
+                    }
+                    // Checking frequently prewarms the display under the
+                    // pointer. Fresh entries return immediately without a
+                    // ScreenCaptureKit capture.
+                    thread::sleep(Duration::from_secs(2));
                 })?;
 
             app.global_shortcut()
@@ -599,8 +671,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_menu_icons,
-            cached_menu_icons,
-            active_display_id,
+            active_display_menu_icons,
             activate_menu_icon,
             get_settings,
             update_shortcut,
