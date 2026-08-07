@@ -31,6 +31,7 @@ type MenuResponse = {
 type ActiveDisplayCache = {
   displayId: number;
   response: MenuResponse | null;
+  stale: boolean;
 };
 
 type SettingsResponse = {
@@ -566,7 +567,7 @@ async function openPalette(generation: number): Promise<void> {
     activeDisplayId = snapshot.displayId;
     applyResponse(snapshot.response);
     if (snapshot.response) updateSelection(0);
-    if (!snapshot.response) void refreshIcons(true);
+    if (!snapshot.response || snapshot.stale) void refreshIcons(true);
   } catch {
     if (generation !== blurDismissGeneration) return;
     applyResponse(null);

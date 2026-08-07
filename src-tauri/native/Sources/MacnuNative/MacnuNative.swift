@@ -218,6 +218,34 @@ private func menuWindows(
     }
 }
 
+private func menuSignature(for displayID: CGDirectDisplayID) -> UInt64 {
+    let displays = activeDisplayBounds()
+    let targetDisplay = CGDisplayBounds(displayID)
+    let windows = menuWindows(in: displays).filter { window in
+        containingDisplay(for: window.bounds, in: displays) == targetDisplay
+    }
+
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    func mix(_ value: UInt64) {
+        hash ^= value
+        hash &*= 1_099_511_628_211
+    }
+
+    mix(UInt64(displayID))
+    for window in windows {
+        mix(UInt64(window.id))
+        mix(UInt64(bitPattern: Int64(window.pid)))
+        mix(Double(window.bounds.minX).bitPattern)
+        mix(Double(window.bounds.minY).bitPattern)
+        mix(Double(window.bounds.width).bitPattern)
+        mix(Double(window.bounds.height).bitPattern)
+        for byte in window.owner.utf8 {
+            mix(UInt64(byte))
+        }
+    }
+    return hash
+}
+
 private func attribute(
     _ name: String,
     from element: AXUIElement
@@ -1010,6 +1038,11 @@ public func macnuFreeNativeString(_ pointer: UnsafeMutablePointer<CChar>?) {
 @_cdecl("macnu_active_display_id")
 public func macnuActiveDisplayId() -> UInt32 {
     activeDisplayIdUnderPointer()
+}
+
+@_cdecl("macnu_active_menu_signature")
+public func macnuActiveMenuSignature(_ displayID: UInt32) -> UInt64 {
+    menuSignature(for: displayID)
 }
 
 @_cdecl("macnu_request_screen_capture")

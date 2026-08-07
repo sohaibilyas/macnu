@@ -99,6 +99,7 @@ struct MenuResponse {
 struct MenuCacheEntry {
     response: MenuResponse,
     refreshed_at: Instant,
+    menu_signature: u64,
 }
 
 #[derive(Clone, Default)]
@@ -117,6 +118,7 @@ struct CacheRefresh {
 struct ActiveDisplayCache {
     display_id: u32,
     response: Option<MenuResponse>,
+    stale: bool,
 }
 
 const DEFAULT_SHORTCUT: &str = "Command+Semicolon";
@@ -159,6 +161,7 @@ unsafe extern "C" {
     fn macnu_copy_menu_icons_json() -> *mut c_char;
     fn macnu_free_native_string(pointer: *mut c_char);
     fn macnu_active_display_id() -> u32;
+    fn macnu_active_menu_signature(display_id: u32) -> u64;
     fn macnu_request_screen_capture() -> bool;
     fn macnu_request_accessibility() -> bool;
     fn macnu_start_at_login_status() -> i32;
@@ -187,6 +190,7 @@ fn copy_native_menu_icons() -> Result<MenuResponse, String> {
 fn fresh_cached_menu_icons(
     cache: &MenuCache,
     display_id: u32,
+    menu_signature: u64,
 ) -> Result<Option<MenuResponse>, String> {
     cache
         .responses
@@ -194,7 +198,8 @@ fn fresh_cached_menu_icons(
         .map_err(|_| "The menu cache is unavailable.".to_string())
         .map(|responses| {
             responses.get(&display_id).and_then(|entry| {
-                (entry.refreshed_at.elapsed() < MENU_CACHE_FRESHNESS)
+                (entry.menu_signature == menu_signature
+                    && entry.refreshed_at.elapsed() < MENU_CACHE_FRESHNESS)
                     .then(|| entry.response.clone())
             })
         })
@@ -202,8 +207,9 @@ fn fresh_cached_menu_icons(
 
 fn refresh_menu_cache(cache: &MenuCache, force: bool) -> Result<CacheRefresh, String> {
     let display_id = unsafe { macnu_active_display_id() };
+    let menu_signature = unsafe { macnu_active_menu_signature(display_id) };
     if !force {
-        if let Some(response) = fresh_cached_menu_icons(cache, display_id)? {
+        if let Some(response) = fresh_cached_menu_icons(cache, display_id, menu_signature)? {
             return Ok(CacheRefresh {
                 response,
                 changed: false,
@@ -220,8 +226,9 @@ fn refresh_menu_cache(cache: &MenuCache, force: bool) -> Result<CacheRefresh, St
     // the capture lock. Recheck so multiple callers never repeat the same
     // expensive ScreenCaptureKit work.
     let display_id = unsafe { macnu_active_display_id() };
+    let menu_signature = unsafe { macnu_active_menu_signature(display_id) };
     if !force {
-        if let Some(response) = fresh_cached_menu_icons(cache, display_id)? {
+        if let Some(response) = fresh_cached_menu_icons(cache, display_id, menu_signature)? {
             return Ok(CacheRefresh {
                 response,
                 changed: false,
@@ -230,6 +237,7 @@ fn refresh_menu_cache(cache: &MenuCache, force: bool) -> Result<CacheRefresh, St
     }
 
     let response = copy_native_menu_icons()?;
+    let menu_signature = unsafe { macnu_active_menu_signature(response.display_id) };
     let mut changed = true;
 
     if !response.screen_capture_denied && !response.accessibility_denied && response.error.is_none()
@@ -246,6 +254,7 @@ fn refresh_menu_cache(cache: &MenuCache, force: bool) -> Result<CacheRefresh, St
             MenuCacheEntry {
                 response: response.clone(),
                 refreshed_at: Instant::now(),
+                menu_signature,
             },
         );
     }
@@ -271,18 +280,22 @@ async fn list_menu_icons(force: bool, cache: State<'_, MenuCache>) -> Result<Men
 #[tauri::command]
 fn active_display_menu_icons(cache: State<'_, MenuCache>) -> Result<ActiveDisplayCache, String> {
     let display_id = unsafe { macnu_active_display_id() };
-    let response = cache
+    let menu_signature = unsafe { macnu_active_menu_signature(display_id) };
+    let (response, stale) = cache
         .responses
         .lock()
         .map_err(|_| "The menu cache is unavailable.".to_string())
         .map(|responses| {
-            responses
-                .get(&display_id)
-                .map(|entry| entry.response.clone())
+            let entry = responses.get(&display_id);
+            (
+                entry.map(|cached| cached.response.clone()),
+                entry.is_some_and(|cached| cached.menu_signature != menu_signature),
+            )
         })?;
     Ok(ActiveDisplayCache {
         display_id,
         response,
+        stale,
     })
 }
 
