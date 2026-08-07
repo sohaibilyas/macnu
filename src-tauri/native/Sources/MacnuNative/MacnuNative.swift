@@ -71,8 +71,11 @@ private struct ActivationSession {
 
 private struct CachedIconImage {
     let pid: pid_t
+    let x: CGFloat
+    let y: CGFloat
     let width: Int
     let height: Int
+    let identity: String
     let dataURL: String
     let capturedAt: TimeInterval
 }
@@ -380,85 +383,92 @@ private func allowsCrossProcessAccessibilityMatch(for menuWindow: MenuWindow) ->
         || owner == "systemuiserver"
 }
 
+private func accessibilityMatchCost(
+    for menuWindow: MenuWindow,
+    candidate: AccessibilityCandidate,
+    displays: [CGRect]
+) -> CGFloat? {
+    let menuDisplay = containingDisplay(for: menuWindow.bounds, in: displays)
+    let allowsCrossProcess = allowsCrossProcessAccessibilityMatch(
+        for: menuWindow
+    )
+
+    let belongsToMenuApplication = candidate.pid == menuWindow.pid
+        || candidate.appName.caseInsensitiveCompare(menuWindow.owner) == .orderedSame
+    guard belongsToMenuApplication || allowsCrossProcess else {
+        return nil
+    }
+
+    let globalHorizontalDistance = abs(
+        candidate.frame.midX - menuWindow.bounds.midX
+    )
+    let globalVerticalDistance = abs(
+        candidate.frame.midY - menuWindow.bounds.midY
+    )
+    let candidateDisplay = containingDisplay(
+        for: candidate.frame,
+        in: displays
+    )
+    let horizontalDistance: CGFloat
+    let verticalDistance: CGFloat
+    if let menuDisplay, let candidateDisplay {
+        // Status items are right-aligned. Comparing their distance from each
+        // display's right edge also supports AX items exposed only on the main
+        // display while their WindowServer copy is on an external display.
+        let relativeHorizontalDistance = abs(
+            (menuDisplay.maxX - menuWindow.bounds.midX)
+                - (candidateDisplay.maxX - candidate.frame.midX)
+        )
+        let relativeVerticalDistance = abs(
+            (menuWindow.bounds.midY - menuDisplay.minY)
+                - (candidate.frame.midY - candidateDisplay.minY)
+        )
+        horizontalDistance = min(
+            globalHorizontalDistance,
+            relativeHorizontalDistance
+        )
+        verticalDistance = min(
+            globalVerticalDistance,
+            relativeVerticalDistance
+        )
+    } else {
+        horizontalDistance = globalHorizontalDistance
+        verticalDistance = globalVerticalDistance
+    }
+    let widthDistance = abs(candidate.frame.width - menuWindow.bounds.width) * 0.25
+    let displayPenalty: CGFloat = menuDisplay == candidateDisplay ? 0 : 12
+    let processPenalty: CGFloat = candidate.pid == menuWindow.pid ? 0 : 18
+    let cost = horizontalDistance
+        + (verticalDistance * 2)
+        + widthDistance
+        + displayPenalty
+        + processPenalty
+    return cost < max(60, menuWindow.bounds.width * 1.65) ? cost : nil
+}
+
 private func matchedAccessibilityElement(
     for menuWindow: MenuWindow,
     in candidates: [AccessibilityCandidate],
     displays: [CGRect],
     requiringAction: Bool = false
 ) -> AccessibilityCandidate? {
-    let menuDisplay = containingDisplay(for: menuWindow.bounds, in: displays)
-    let allowsCrossProcess = allowsCrossProcessAccessibilityMatch(
-        for: menuWindow
-    )
-
-    return candidates
-        .compactMap { candidate -> (AccessibilityCandidate, CGFloat)? in
-            let belongsToMenuApplication = candidate.pid == menuWindow.pid
-                || candidate.appName.caseInsensitiveCompare(menuWindow.owner) == .orderedSame
-            guard belongsToMenuApplication || allowsCrossProcess else {
-                return nil
-            }
-            if requiringAction
-                && !candidate.actions.contains(kAXPressAction as String)
-                && !candidate.actions.contains(kAXShowMenuAction as String) {
-                return nil
-            }
-
-            let globalHorizontalDistance = abs(
-                candidate.frame.midX - menuWindow.bounds.midX
-            )
-            let globalVerticalDistance = abs(
-                candidate.frame.midY - menuWindow.bounds.midY
-            )
-            let candidateDisplay = containingDisplay(
-                for: candidate.frame,
-                in: displays
-            )
-            let horizontalDistance: CGFloat
-            let verticalDistance: CGFloat
-            if let menuDisplay, let candidateDisplay {
-                // Status items are right-aligned. Comparing their distance
-                // from each display's right edge lets an external-display
-                // window match the corresponding AX item exposed on the main
-                // display, even when the displays have different widths.
-                let relativeHorizontalDistance = abs(
-                    (menuDisplay.maxX - menuWindow.bounds.midX)
-                        - (candidateDisplay.maxX - candidate.frame.midX)
-                )
-                let relativeVerticalDistance = abs(
-                    (menuWindow.bounds.midY - menuDisplay.minY)
-                        - (candidate.frame.midY - candidateDisplay.minY)
-                )
-                horizontalDistance = min(
-                    globalHorizontalDistance,
-                    relativeHorizontalDistance
-                )
-                verticalDistance = min(
-                    globalVerticalDistance,
-                    relativeVerticalDistance
-                )
-            } else {
-                horizontalDistance = globalHorizontalDistance
-                verticalDistance = globalVerticalDistance
-            }
-            let widthDistance = abs(candidate.frame.width - menuWindow.bounds.width) * 0.25
-            let displayPenalty: CGFloat = menuDisplay == candidateDisplay ? 0 : 12
-            // Cross-process candidates are restricted above to genuine macOS
-            // hosts. This penalty keeps a host-owned candidate preferable when
-            // it is just as close as the source application's AX element.
-            let processPenalty: CGFloat = candidate.pid == menuWindow.pid ? 0 : 18
-            return (
-                candidate,
-                horizontalDistance
-                    + (verticalDistance * 2)
-                    + widthDistance
-                    + displayPenalty
-                    + processPenalty
-            )
+    candidates.compactMap { candidate -> (AccessibilityCandidate, CGFloat)? in
+        if requiringAction
+            && !candidate.actions.contains(kAXPressAction as String)
+            && !candidate.actions.contains(kAXShowMenuAction as String) {
+            return nil
         }
-        .filter { $0.1 < max(56, menuWindow.bounds.width * 1.5) }
-        .min { $0.1 < $1.1 }?
-        .0
+        guard let cost = accessibilityMatchCost(
+            for: menuWindow,
+            candidate: candidate,
+            displays: displays
+        ) else {
+            return nil
+        }
+        return (candidate, cost)
+    }
+    .min { $0.1 < $1.1 }?
+    .0
 }
 
 private func matchedAccessibilityElements(
@@ -466,25 +476,112 @@ private func matchedAccessibilityElements(
     in candidates: [AccessibilityCandidate],
     displays: [CGRect]
 ) -> [CGWindowID: AccessibilityCandidate] {
-    var remainingCandidates = candidates
-    var matches: [CGWindowID: AccessibilityCandidate] = [:]
+    guard let targetDisplay = windows.first.flatMap({
+        containingDisplay(for: $0.bounds, in: displays)
+    }) else {
+        return [:]
+    }
 
-    // Status items are anchored to the right edge. Their WindowServer frames
-    // can drift progressively farther from AX frames toward the notch, so
-    // resolve right-to-left and consume every AX element at most once. This
-    // preserves menu-bar order and prevents adjacent icons from sharing or
-    // swapping identities.
-    for menuWindow in windows.sorted(by: { $0.bounds.minX > $1.bounds.minX }) {
-        guard let match = matchedAccessibilityElement(
-            for: menuWindow,
-            in: remainingCandidates,
-            displays: displays
-        ) else {
-            continue
+    let orderedWindows = windows.sorted { $0.bounds.midX < $1.bounds.midX }
+    let orderedCandidates = candidates.sorted { left, right in
+        func projectedMidX(_ candidate: AccessibilityCandidate) -> CGFloat {
+            guard let display = containingDisplay(
+                for: candidate.frame,
+                in: displays
+            ) else {
+                return candidate.frame.midX
+            }
+            return targetDisplay.maxX - (display.maxX - candidate.frame.midX)
         }
-        matches[menuWindow.id] = match
-        remainingCandidates.removeAll { candidate in
-            CFEqual(candidate.element, match.element)
+        let leftX = projectedMidX(left)
+        let rightX = projectedMidX(right)
+        if leftX == rightX {
+            return left.frame.width < right.frame.width
+        }
+        return leftX < rightX
+    }
+
+    // A notch can remove a WindowServer item while AX still exposes it, and
+    // WindowServer coordinates can drift as a group. Solve the two ordered
+    // sequences globally with gaps instead of greedily choosing a neighbour.
+    // This prevents one hidden item from shifting every name that follows it.
+    let windowCount = orderedWindows.count
+    let candidateCount = orderedCandidates.count
+    let infinity = CGFloat.greatestFiniteMagnitude
+    let skippedCandidateCost: CGFloat = 36
+    let skippedWindowCost: CGFloat = 84
+    var costs = Array(
+        repeating: Array(repeating: infinity, count: candidateCount + 1),
+        count: windowCount + 1
+    )
+    var steps = Array(
+        repeating: Array(repeating: UInt8(0), count: candidateCount + 1),
+        count: windowCount + 1
+    )
+    costs[0][0] = 0
+    if candidateCount > 0 {
+        for index in 1...candidateCount {
+            costs[0][index] = CGFloat(index) * skippedCandidateCost
+            steps[0][index] = 2
+        }
+    }
+    if windowCount > 0 {
+        for index in 1...windowCount {
+            costs[index][0] = CGFloat(index) * skippedWindowCost
+            steps[index][0] = 3
+        }
+    }
+
+    if windowCount > 0 && candidateCount > 0 {
+        for windowIndex in 1...windowCount {
+            for candidateIndex in 1...candidateCount {
+                var bestCost = costs[windowIndex][candidateIndex - 1]
+                    + skippedCandidateCost
+                var bestStep: UInt8 = 2
+
+                let skipWindow = costs[windowIndex - 1][candidateIndex]
+                    + skippedWindowCost
+                if skipWindow < bestCost {
+                    bestCost = skipWindow
+                    bestStep = 3
+                }
+
+                if let matchCost = accessibilityMatchCost(
+                    for: orderedWindows[windowIndex - 1],
+                    candidate: orderedCandidates[candidateIndex - 1],
+                    displays: displays
+                ) {
+                    let match = costs[windowIndex - 1][candidateIndex - 1]
+                        + matchCost
+                    if match <= bestCost {
+                        bestCost = match
+                        bestStep = 1
+                    }
+                }
+
+                costs[windowIndex][candidateIndex] = bestCost
+                steps[windowIndex][candidateIndex] = bestStep
+            }
+        }
+    }
+
+    var matches: [CGWindowID: AccessibilityCandidate] = [:]
+    var windowIndex = windowCount
+    var candidateIndex = candidateCount
+    while windowIndex > 0 || candidateIndex > 0 {
+        switch steps[windowIndex][candidateIndex] {
+        case 1:
+            matches[orderedWindows[windowIndex - 1].id] =
+                orderedCandidates[candidateIndex - 1]
+            windowIndex -= 1
+            candidateIndex -= 1
+        case 2:
+            candidateIndex -= 1
+        case 3:
+            windowIndex -= 1
+        default:
+            windowIndex = 0
+            candidateIndex = 0
         }
     }
     return matches
@@ -530,6 +627,7 @@ private func pngDataURL(from image: CGImage) -> String? {
 
 private func reusableIconImages(
     for windows: [MenuWindow],
+    matchedItems: [CGWindowID: AccessibilityCandidate],
     at timestamp: TimeInterval
 ) -> [CGWindowID: String] {
     iconImageCacheLock.lock()
@@ -544,10 +642,17 @@ private func reusableIconImages(
     for window in windows {
         let width = max(1, Int(window.bounds.width * 2))
         let height = max(1, Int(window.bounds.height * 2))
+        let identity = iconCacheIdentity(
+            for: window,
+            candidate: matchedItems[window.id]
+        )
         guard let cached = iconImageCache[window.id],
               cached.pid == window.pid,
+              cached.x == window.bounds.minX,
+              cached.y == window.bounds.minY,
               cached.width == width,
               cached.height == height,
+              cached.identity == identity,
               timestamp - cached.capturedAt < iconImageCacheLifetime else {
             continue
         }
@@ -558,21 +663,42 @@ private func reusableIconImages(
 
 private func cacheIconImage(
     _ dataURL: String,
-    for windowID: CGWindowID,
-    pid: pid_t,
+    for window: MenuWindow,
+    identity: String,
     width: Int,
     height: Int,
     at timestamp: TimeInterval
 ) {
     iconImageCacheLock.lock()
-    iconImageCache[windowID] = CachedIconImage(
-        pid: pid,
+    iconImageCache[window.id] = CachedIconImage(
+        pid: window.pid,
+        x: window.bounds.minX,
+        y: window.bounds.minY,
         width: width,
         height: height,
+        identity: identity,
         dataURL: dataURL,
         capturedAt: timestamp
     )
     iconImageCacheLock.unlock()
+}
+
+private func iconCacheIdentity(
+    for window: MenuWindow,
+    candidate: AccessibilityCandidate?
+) -> String {
+    guard let candidate else {
+        return "\(window.pid)|\(window.owner.lowercased())|unmatched"
+    }
+    let label = accessibilityLabel(
+        candidate: candidate,
+        fallback: candidate.appName
+    )
+    return [
+        String(candidate.pid),
+        candidate.appName.lowercased(),
+        label.lowercased()
+    ].joined(separator: "|")
 }
 
 private func onScreenWindows() -> [OnScreenWindow] {
@@ -888,8 +1014,15 @@ private func captureMenuIcons() async -> CaptureResponse {
 
     do {
         let captureTimestamp = ProcessInfo.processInfo.systemUptime
+        let accessibilityItems = accessibilityCandidates()
+        let matchedItems = matchedAccessibilityElements(
+            for: windows,
+            in: accessibilityItems,
+            displays: displays
+        )
         let reusableImages = reusableIconImages(
             for: windows,
+            matchedItems: matchedItems,
             at: captureTimestamp
         )
         let needsImageCapture = windows.contains {
@@ -907,12 +1040,6 @@ private func captureMenuIcons() async -> CaptureResponse {
         } else {
             shareableById = [:]
         }
-        let accessibilityItems = accessibilityCandidates()
-        let matchedItems = matchedAccessibilityElements(
-            for: windows,
-            in: accessibilityItems,
-            displays: displays
-        )
         var icons: [MenuIcon] = []
         var seenIcons: Set<String> = []
 
@@ -947,8 +1074,11 @@ private func captureMenuIcons() async -> CaptureResponse {
                     dataURL = capturedImage
                     cacheIconImage(
                         dataURL,
-                        for: menuWindow.id,
-                        pid: menuWindow.pid,
+                        for: menuWindow,
+                        identity: iconCacheIdentity(
+                            for: menuWindow,
+                            candidate: matchedItems[menuWindow.id]
+                        ),
                         width: captureWidth,
                         height: captureHeight,
                         at: captureTimestamp

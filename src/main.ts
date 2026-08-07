@@ -363,7 +363,13 @@ function visibleIcons(): MenuIcon[] {
 
 function render(): void {
   if (!response) {
-    results.innerHTML = "";
+    results.innerHTML = `
+      <div class="state fetching-state" role="status" aria-live="polite">
+        <span class="loader" aria-hidden="true"></span>
+        <strong>Fetching menu bar icons…</strong>
+        <small>Checking the active display for the latest names and icons.</small>
+      </div>
+    `;
     return;
   }
 
@@ -437,6 +443,8 @@ function render(): void {
     )
     .join("");
 }
+
+render();
 
 async function openScreenPermission(): Promise<void> {
   if (permissionFlowStarted) return;
@@ -565,9 +573,13 @@ async function openPalette(generation: number): Promise<void> {
     );
     if (generation !== blurDismissGeneration) return;
     activeDisplayId = snapshot.displayId;
-    applyResponse(snapshot.response);
-    if (snapshot.response) updateSelection(0);
-    if (!snapshot.response || snapshot.stale) void refreshIcons(true);
+    if (snapshot.response && !snapshot.stale) {
+      applyResponse(snapshot.response);
+      updateSelection(0);
+    } else {
+      applyResponse(null);
+      void refreshIcons(true);
+    }
   } catch {
     if (generation !== blurDismissGeneration) return;
     applyResponse(null);
@@ -693,6 +705,8 @@ void currentWindow.listen("palette-opened", () => {
   selectedIndex = 0;
   pointerSelectionArmed = false;
   lastArrowNavigationAt = 0;
+  activeDisplayId = null;
+  applyResponse(null);
   window.setTimeout(() => input.focus(), 30);
   void openPalette(generation);
 
