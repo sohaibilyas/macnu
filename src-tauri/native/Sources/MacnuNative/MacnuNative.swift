@@ -336,6 +336,22 @@ private func accessibilityCandidates() -> [AccessibilityCandidate] {
     return candidates
 }
 
+private func allowsCrossProcessAccessibilityMatch(for menuWindow: MenuWindow) -> Bool {
+    let bundleIdentifier = NSRunningApplication(
+        processIdentifier: menuWindow.pid
+    )?.bundleIdentifier?.lowercased()
+    if bundleIdentifier == "com.apple.controlcenter"
+        || bundleIdentifier == "com.apple.systemuiserver" {
+        return true
+    }
+
+    let owner = menuWindow.owner.lowercased()
+    return owner == "control center"
+        || owner == "control centre"
+        || owner == "controlcenter"
+        || owner == "systemuiserver"
+}
+
 private func matchedAccessibilityElement(
     for menuWindow: MenuWindow,
     in candidates: [AccessibilityCandidate],
@@ -343,9 +359,17 @@ private func matchedAccessibilityElement(
     requiringAction: Bool = false
 ) -> AccessibilityCandidate? {
     let menuDisplay = containingDisplay(for: menuWindow.bounds, in: displays)
+    let allowsCrossProcess = allowsCrossProcessAccessibilityMatch(
+        for: menuWindow
+    )
 
     return candidates
         .compactMap { candidate -> (AccessibilityCandidate, CGFloat)? in
+            let belongsToMenuApplication = candidate.pid == menuWindow.pid
+                || candidate.appName.caseInsensitiveCompare(menuWindow.owner) == .orderedSame
+            guard belongsToMenuApplication || allowsCrossProcess else {
+                return nil
+            }
             if requiringAction
                 && !candidate.actions.contains(kAXPressAction as String)
                 && !candidate.actions.contains(kAXShowMenuAction as String) {
@@ -391,9 +415,9 @@ private func matchedAccessibilityElement(
             }
             let widthDistance = abs(candidate.frame.width - menuWindow.bounds.width) * 0.25
             let displayPenalty: CGFloat = menuDisplay == candidateDisplay ? 0 : 12
-            // Some macOS-hosted extras have a window owned by SystemUIServer
-            // or Control Centre while their AX element belongs to the source
-            // app. Prefer a matching PID without excluding those valid items.
+            // Cross-process candidates are restricted above to genuine macOS
+            // hosts. This penalty keeps a host-owned candidate preferable when
+            // it is just as close as the source application's AX element.
             let processPenalty: CGFloat = candidate.pid == menuWindow.pid ? 0 : 18
             return (
                 candidate,
