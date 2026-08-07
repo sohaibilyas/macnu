@@ -461,6 +461,35 @@ private func matchedAccessibilityElement(
         .0
 }
 
+private func matchedAccessibilityElements(
+    for windows: [MenuWindow],
+    in candidates: [AccessibilityCandidate],
+    displays: [CGRect]
+) -> [CGWindowID: AccessibilityCandidate] {
+    var remainingCandidates = candidates
+    var matches: [CGWindowID: AccessibilityCandidate] = [:]
+
+    // Status items are anchored to the right edge. Their WindowServer frames
+    // can drift progressively farther from AX frames toward the notch, so
+    // resolve right-to-left and consume every AX element at most once. This
+    // preserves menu-bar order and prevents adjacent icons from sharing or
+    // swapping identities.
+    for menuWindow in windows.sorted(by: { $0.bounds.minX > $1.bounds.minX }) {
+        guard let match = matchedAccessibilityElement(
+            for: menuWindow,
+            in: remainingCandidates,
+            displays: displays
+        ) else {
+            continue
+        }
+        matches[menuWindow.id] = match
+        remainingCandidates.removeAll { candidate in
+            CFEqual(candidate.element, match.element)
+        }
+    }
+    return matches
+}
+
 private func accessibilityLabel(
     candidate: AccessibilityCandidate?,
     fallback: String
@@ -879,6 +908,11 @@ private func captureMenuIcons() async -> CaptureResponse {
             shareableById = [:]
         }
         let accessibilityItems = accessibilityCandidates()
+        let matchedItems = matchedAccessibilityElements(
+            for: windows,
+            in: accessibilityItems,
+            displays: displays
+        )
         var icons: [MenuIcon] = []
         var seenIcons: Set<String> = []
 
@@ -920,17 +954,14 @@ private func captureMenuIcons() async -> CaptureResponse {
                         at: captureTimestamp
                     )
                 }
-                let matchedItem = matchedAccessibilityElement(
-                    for: menuWindow,
-                    in: accessibilityItems,
-                    displays: displays
-                )
-                let activationItem = matchedAccessibilityElement(
-                    for: menuWindow,
-                    in: accessibilityItems,
-                    displays: displays,
-                    requiringAction: true
-                )
+                let matchedItem = matchedItems[menuWindow.id]
+                let activationItem = matchedItem.flatMap { item in
+                    if item.actions.contains(kAXPressAction as String)
+                        || item.actions.contains(kAXShowMenuAction as String) {
+                        return item
+                    }
+                    return nil
+                }
                 let identityItem = activationItem ?? matchedItem
                 let activationApplication = identityItem.flatMap {
                     NSRunningApplication(processIdentifier: $0.pid)
