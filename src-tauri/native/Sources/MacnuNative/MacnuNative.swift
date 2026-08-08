@@ -23,6 +23,9 @@ private struct AccessibilityCandidate {
     let element: AXUIElement
     let pid: pid_t
     let appName: String
+    let bundleIdentifier: String?
+    let label: String
+    let identifier: String?
     let frame: CGRect
     let actions: Set<String>
 }
@@ -63,10 +66,13 @@ private struct ActivationRequest: Codable {
 }
 
 private struct ActivationSession {
-    let menuWindowID: CGWindowID
-    let targetPID: pid_t
+    let menuWindowID: CGWindowID?
     let anchor: CGPoint
     let baselineWindowIDs: Set<CGWindowID>
+    let accessibilityPID: pid_t?
+    let accessibilityLabel: String?
+    let accessibilityFrame: CGRect?
+    let accessibilityAction: String?
 }
 
 private struct CachedIconImage {
@@ -84,6 +90,8 @@ private let activationSessionLock = NSLock()
 private var lastActivationSession: ActivationSession?
 private let iconImageCacheLock = NSLock()
 private var iconImageCache: [CGWindowID: CachedIconImage] = [:]
+private let applicationIconCacheLock = NSLock()
+private var applicationIconCache: [String: String] = [:]
 private let iconImageCacheLifetime: TimeInterval = 30
 private let iconImageCacheRetention: TimeInterval = 120
 
@@ -294,6 +302,31 @@ private func actionNames(of element: AXUIElement) -> Set<String> {
     return Set(actions)
 }
 
+private func accessibilityText(
+    from element: AXUIElement,
+    fallback: String
+) -> String {
+    for name in [
+        kAXDescriptionAttribute,
+        kAXTitleAttribute,
+        kAXHelpAttribute,
+        kAXValueAttribute,
+        kAXIdentifierAttribute
+    ] {
+        if let value = attribute(name, from: element) as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = trimmed.split(separator: " ")
+            let isDisplayContainerName = parts.count == 2
+                && parts[0].caseInsensitiveCompare("Mac") == .orderedSame
+                && Int(parts[1]) != nil
+            if !trimmed.isEmpty && !isDisplayContainerName {
+                return trimmed
+            }
+        }
+    }
+    return fallback
+}
+
 private func descendants(of element: AXUIElement, depth: Int = 0) -> [AXUIElement] {
     guard depth < 3 else { return [] }
     guard
@@ -322,6 +355,7 @@ private func accessibilityCandidates() -> [AccessibilityCandidate] {
         let appName = runningApplication.localizedName
             ?? runningApplication.bundleIdentifier
             ?? "Menu bar app"
+        let bundleIdentifier = runningApplication.bundleIdentifier
         let application = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(application, 1.0)
 
@@ -355,266 +389,253 @@ private func accessibilityCandidates() -> [AccessibilityCandidate] {
                 continue
             }
 
+            let actions = actionNames(of: element)
+            guard actions.contains(kAXPressAction as String)
+                || actions.contains(kAXShowMenuAction as String) else {
+                continue
+            }
+            let rawIdentifier = attribute(
+                kAXIdentifierAttribute,
+                from: element
+            ) as? String
+            let identifier = rawIdentifier?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
             candidates.append(AccessibilityCandidate(
                 element: element,
                 pid: pid,
                 appName: appName,
+                bundleIdentifier: bundleIdentifier,
+                label: accessibilityText(from: element, fallback: appName),
+                identifier: identifier?.isEmpty == false ? identifier : nil,
                 frame: elementFrame,
-                actions: actionNames(of: element)
+                actions: actions
             ))
         }
     }
     return candidates
 }
 
-private func allowsCrossProcessAccessibilityMatch(for menuWindow: MenuWindow) -> Bool {
-    let bundleIdentifier = NSRunningApplication(
-        processIdentifier: menuWindow.pid
-    )?.bundleIdentifier?.lowercased()
-    if bundleIdentifier == "com.apple.controlcenter"
-        || bundleIdentifier == "com.apple.systemuiserver" {
-        return true
+private func projectedFrame(
+    for candidate: AccessibilityCandidate,
+    onto targetDisplay: CGRect,
+    displays: [CGRect]
+) -> CGRect {
+    guard let sourceDisplay = containingDisplay(
+        for: candidate.frame,
+        in: displays
+    ) else {
+        return candidate.frame
     }
-
-    let owner = menuWindow.owner.lowercased()
-    return owner == "control center"
-        || owner == "control centre"
-        || owner == "controlcenter"
-        || owner == "systemuiserver"
+    return CGRect(
+        x: targetDisplay.maxX - (sourceDisplay.maxX - candidate.frame.minX),
+        y: targetDisplay.minY + (candidate.frame.minY - sourceDisplay.minY),
+        width: candidate.frame.width,
+        height: candidate.frame.height
+    )
 }
 
-private func accessibilityMatchCost(
-    for menuWindow: MenuWindow,
-    candidate: AccessibilityCandidate,
+private func catalogCandidates(
+    _ candidates: [AccessibilityCandidate],
+    targetDisplay: CGRect,
     displays: [CGRect]
-) -> CGFloat? {
-    let menuDisplay = containingDisplay(for: menuWindow.bounds, in: displays)
-    let allowsCrossProcess = allowsCrossProcessAccessibilityMatch(
-        for: menuWindow
-    )
+) -> [AccessibilityCandidate] {
+    var grouped: [String: [AccessibilityCandidate]] = [:]
+    for candidate in candidates {
+        let source = candidate.bundleIdentifier
+            ?? "pid:\(candidate.pid)"
+        let item = candidate.identifier?.lowercased()
+            ?? candidate.label.lowercased()
+        grouped["\(source)|\(item)", default: []].append(candidate)
+    }
 
-    let belongsToMenuApplication = candidate.pid == menuWindow.pid
-        || candidate.appName.caseInsensitiveCompare(menuWindow.owner) == .orderedSame
-    guard belongsToMenuApplication || allowsCrossProcess else {
+    return grouped.values.compactMap { copies in
+        let onTargetDisplay = copies.filter {
+            containingDisplay(for: $0.frame, in: displays) == targetDisplay
+        }
+        let eligible = onTargetDisplay.isEmpty ? copies : onTargetDisplay
+        return eligible.min { left, right in
+            let leftFrame = projectedFrame(
+                for: left,
+                onto: targetDisplay,
+                displays: displays
+            )
+            let rightFrame = projectedFrame(
+                for: right,
+                onto: targetDisplay,
+                displays: displays
+            )
+            if leftFrame.minX == rightFrame.minX {
+                return leftFrame.width < rightFrame.width
+            }
+            return leftFrame.minX < rightFrame.minX
+        }
+    }
+    .sorted {
+        projectedFrame(for: $0, onto: targetDisplay, displays: displays).minX
+            < projectedFrame(for: $1, onto: targetDisplay, displays: displays).minX
+    }
+}
+
+private func geometryCost(
+    window: MenuWindow,
+    candidate: AccessibilityCandidate,
+    targetDisplay: CGRect,
+    displays: [CGRect]
+) -> CGFloat {
+    let frame = projectedFrame(
+        for: candidate,
+        onto: targetDisplay,
+        displays: displays
+    )
+    return abs(frame.midX - window.bounds.midX)
+        + (abs(frame.midY - window.bounds.midY) * 2)
+        + (abs(frame.width - window.bounds.width) * 0.25)
+}
+
+private func accessibilityLineage(
+    from element: AXUIElement,
+    maximumDepth: Int = 4
+) -> [AXUIElement] {
+    var lineage = [element]
+    var current = element
+    for _ in 0..<maximumDepth {
+        guard let rawParent = attribute(kAXParentAttribute, from: current),
+              CFGetTypeID(rawParent) == AXUIElementGetTypeID() else {
+            break
+        }
+        let parent = unsafeBitCast(rawParent, to: AXUIElement.self)
+        lineage.append(parent)
+        current = parent
+    }
+    return lineage
+}
+
+private func hitTestedCandidateIndex(
+    for window: MenuWindow,
+    candidates: [AccessibilityCandidate]
+) -> Int? {
+    let systemWide = AXUIElementCreateSystemWide()
+    var hitElement: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(
+        systemWide,
+        Float(window.bounds.midX),
+        Float(window.bounds.midY),
+        &hitElement
+    ) == .success, let hitElement else {
         return nil
     }
 
-    let globalHorizontalDistance = abs(
-        candidate.frame.midX - menuWindow.bounds.midX
-    )
-    let globalVerticalDistance = abs(
-        candidate.frame.midY - menuWindow.bounds.midY
-    )
-    let candidateDisplay = containingDisplay(
-        for: candidate.frame,
-        in: displays
-    )
-    let horizontalDistance: CGFloat
-    let verticalDistance: CGFloat
-    if let menuDisplay, let candidateDisplay {
-        // Status items are right-aligned. Comparing their distance from each
-        // display's right edge also supports AX items exposed only on the main
-        // display while their WindowServer copy is on an external display.
-        let relativeHorizontalDistance = abs(
-            (menuDisplay.maxX - menuWindow.bounds.midX)
-                - (candidateDisplay.maxX - candidate.frame.midX)
-        )
-        let relativeVerticalDistance = abs(
-            (menuWindow.bounds.midY - menuDisplay.minY)
-                - (candidate.frame.midY - candidateDisplay.minY)
-        )
-        horizontalDistance = min(
-            globalHorizontalDistance,
-            relativeHorizontalDistance
-        )
-        verticalDistance = min(
-            globalVerticalDistance,
-            relativeVerticalDistance
-        )
-    } else {
-        horizontalDistance = globalHorizontalDistance
-        verticalDistance = globalVerticalDistance
+    let lineage = accessibilityLineage(from: hitElement)
+    if let exact = candidates.indices.first(where: { index in
+        lineage.contains { CFEqual($0, candidates[index].element) }
+    }) {
+        return exact
     }
-    let widthDistance = abs(candidate.frame.width - menuWindow.bounds.width) * 0.25
-    let displayPenalty: CGFloat = menuDisplay == candidateDisplay ? 0 : 12
-    let processPenalty: CGFloat = candidate.pid == menuWindow.pid ? 0 : 18
-    let cost = horizontalDistance
-        + (verticalDistance * 2)
-        + widthDistance
-        + displayPenalty
-        + processPenalty
-    return cost < max(60, menuWindow.bounds.width * 1.65) ? cost : nil
+
+    var hitPID: pid_t = 0
+    guard AXUIElementGetPid(hitElement, &hitPID) == .success else {
+        return nil
+    }
+    let sameProcess = candidates.indices.filter {
+        candidates[$0].pid == hitPID
+    }
+    if sameProcess.count == 1 {
+        return sameProcess[0]
+    }
+
+    let hitIdentifiers = Set(lineage.compactMap {
+        (attribute(kAXIdentifierAttribute, from: $0) as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }.filter { !$0.isEmpty })
+    let identifierMatches = sameProcess.filter { index in
+        candidates[index].identifier.map(hitIdentifiers.contains) ?? false
+    }
+    if identifierMatches.count == 1 {
+        return identifierMatches[0]
+    }
+
+    let hitLabels = Set(lineage.map {
+        accessibilityText(from: $0, fallback: "").lowercased()
+    }.filter { !$0.isEmpty })
+    let labelMatches = sameProcess.filter {
+        hitLabels.contains(candidates[$0].label.lowercased())
+    }
+    return labelMatches.count == 1 ? labelMatches[0] : nil
 }
 
-private func matchedAccessibilityElement(
-    for menuWindow: MenuWindow,
-    in candidates: [AccessibilityCandidate],
-    displays: [CGRect],
-    requiringAction: Bool = false
-) -> AccessibilityCandidate? {
-    candidates.compactMap { candidate -> (AccessibilityCandidate, CGFloat)? in
-        if requiringAction
-            && !candidate.actions.contains(kAXPressAction as String)
-            && !candidate.actions.contains(kAXShowMenuAction as String) {
-            return nil
-        }
-        guard let cost = accessibilityMatchCost(
-            for: menuWindow,
-            candidate: candidate,
-            displays: displays
-        ) else {
-            return nil
-        }
-        return (candidate, cost)
-    }
-    .min { $0.1 < $1.1 }?
-    .0
-}
-
-private func matchedAccessibilityElements(
-    for windows: [MenuWindow],
-    in candidates: [AccessibilityCandidate],
+private func confidentWindowMatches(
+    windows: [MenuWindow],
+    candidates: [AccessibilityCandidate],
+    targetDisplay: CGRect,
     displays: [CGRect]
-) -> [CGWindowID: AccessibilityCandidate] {
-    guard let targetDisplay = windows.first.flatMap({
-        containingDisplay(for: $0.bounds, in: displays)
-    }) else {
-        return [:]
-    }
+) -> [Int: MenuWindow] {
+    guard !windows.isEmpty, !candidates.isEmpty else { return [:] }
 
-    let orderedWindows = windows.sorted { $0.bounds.midX < $1.bounds.midX }
-    let orderedCandidates = candidates.sorted { left, right in
-        func projectedMidX(_ candidate: AccessibilityCandidate) -> CGFloat {
-            guard let display = containingDisplay(
-                for: candidate.frame,
-                in: displays
-            ) else {
-                return candidate.frame.midX
-            }
-            return targetDisplay.maxX - (display.maxX - candidate.frame.midX)
-        }
-        let leftX = projectedMidX(left)
-        let rightX = projectedMidX(right)
-        if leftX == rightX {
-            return left.frame.width < right.frame.width
-        }
-        return leftX < rightX
-    }
-
-    // A notch can remove a WindowServer item while AX still exposes it, and
-    // WindowServer coordinates can drift as a group. Solve the two ordered
-    // sequences globally with gaps instead of greedily choosing a neighbour.
-    // This prevents one hidden item from shifting every name that follows it.
-    let windowCount = orderedWindows.count
-    let candidateCount = orderedCandidates.count
-    let infinity = CGFloat.greatestFiniteMagnitude
-    let skippedCandidateCost: CGFloat = 36
-    let skippedWindowCost: CGFloat = 84
-    var costs = Array(
-        repeating: Array(repeating: infinity, count: candidateCount + 1),
-        count: windowCount + 1
-    )
-    var steps = Array(
-        repeating: Array(repeating: UInt8(0), count: candidateCount + 1),
-        count: windowCount + 1
-    )
-    costs[0][0] = 0
-    if candidateCount > 0 {
-        for index in 1...candidateCount {
-            costs[0][index] = CGFloat(index) * skippedCandidateCost
-            steps[0][index] = 2
+    let costs = candidates.map { candidate in
+        windows.map {
+            geometryCost(
+                window: $0,
+                candidate: candidate,
+                targetDisplay: targetDisplay,
+                displays: displays
+            )
         }
     }
-    if windowCount > 0 {
-        for index in 1...windowCount {
-            costs[index][0] = CGFloat(index) * skippedWindowCost
-            steps[index][0] = 3
+    var matches: [Int: MenuWindow] = [:]
+    var usedCandidates: Set<Int> = []
+    var usedWindows: Set<Int> = []
+
+    // Public AX hit-testing is authoritative when it resolves a unique status
+    // item at the center of a WindowServer icon. This avoids all notch-offset
+    // inference for items macOS can identify directly.
+    for windowIndex in windows.indices {
+        guard let candidateIndex = hitTestedCandidateIndex(
+            for: windows[windowIndex],
+            candidates: candidates
+        ), !usedCandidates.contains(candidateIndex) else {
+            continue
         }
+        matches[candidateIndex] = windows[windowIndex]
+        usedCandidates.insert(candidateIndex)
+        usedWindows.insert(windowIndex)
     }
 
-    if windowCount > 0 && candidateCount > 0 {
-        for windowIndex in 1...windowCount {
-            for candidateIndex in 1...candidateCount {
-                var bestCost = costs[windowIndex][candidateIndex - 1]
-                    + skippedCandidateCost
-                var bestStep: UInt8 = 2
-
-                let skipWindow = costs[windowIndex - 1][candidateIndex]
-                    + skippedWindowCost
-                if skipWindow < bestCost {
-                    bestCost = skipWindow
-                    bestStep = 3
-                }
-
-                if let matchCost = accessibilityMatchCost(
-                    for: orderedWindows[windowIndex - 1],
-                    candidate: orderedCandidates[candidateIndex - 1],
-                    displays: displays
-                ) {
-                    let match = costs[windowIndex - 1][candidateIndex - 1]
-                        + matchCost
-                    if match <= bestCost {
-                        bestCost = match
-                        bestStep = 1
-                    }
-                }
-
-                costs[windowIndex][candidateIndex] = bestCost
-                steps[windowIndex][candidateIndex] = bestStep
-            }
+    for candidateIndex in candidates.indices where !usedCandidates.contains(candidateIndex) {
+        let rankedWindows = windows.indices.filter {
+            !usedWindows.contains($0)
+        }.sorted {
+            costs[candidateIndex][$0] < costs[candidateIndex][$1]
         }
-    }
+        guard let windowIndex = rankedWindows.first else { continue }
+        let bestCost = costs[candidateIndex][windowIndex]
+        let threshold = min(
+            20,
+            max(12, windows[windowIndex].bounds.width * 0.35)
+        )
+        guard bestCost <= threshold else { continue }
 
-    var matches: [CGWindowID: AccessibilityCandidate] = [:]
-    var windowIndex = windowCount
-    var candidateIndex = candidateCount
-    while windowIndex > 0 || candidateIndex > 0 {
-        switch steps[windowIndex][candidateIndex] {
-        case 1:
-            matches[orderedWindows[windowIndex - 1].id] =
-                orderedCandidates[candidateIndex - 1]
-            windowIndex -= 1
-            candidateIndex -= 1
-        case 2:
-            candidateIndex -= 1
-        case 3:
-            windowIndex -= 1
-        default:
-            windowIndex = 0
-            candidateIndex = 0
+        let nextWindowCost = rankedWindows.dropFirst().first.map {
+            costs[candidateIndex][$0]
+        } ?? .greatestFiniteMagnitude
+        guard nextWindowCost - bestCost >= 10 else { continue }
+
+        let rankedCandidates = candidates.indices.filter {
+            !usedCandidates.contains($0)
+        }.sorted {
+            costs[$0][windowIndex] < costs[$1][windowIndex]
         }
+        guard rankedCandidates.first == candidateIndex else { continue }
+        let nextCandidateCost = rankedCandidates.dropFirst().first.map {
+            costs[$0][windowIndex]
+        } ?? .greatestFiniteMagnitude
+        guard nextCandidateCost - bestCost >= 10 else { continue }
+
+        matches[candidateIndex] = windows[windowIndex]
+        usedCandidates.insert(candidateIndex)
+        usedWindows.insert(windowIndex)
     }
     return matches
-}
-
-private func accessibilityLabel(
-    candidate: AccessibilityCandidate?,
-    fallback: String
-) -> String {
-    guard let candidate else {
-        return fallback
-    }
-
-    for name in [
-        kAXDescriptionAttribute,
-        kAXTitleAttribute,
-        kAXHelpAttribute,
-        kAXValueAttribute,
-        kAXIdentifierAttribute
-    ] {
-        if let value = attribute(name, from: candidate.element) as? String {
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            let parts = trimmed.split(separator: " ")
-            let isDisplayContainerName = parts.count == 2
-                && parts[0].caseInsensitiveCompare("Mac") == .orderedSame
-                && Int(parts[1]) != nil
-            if !trimmed.isEmpty && !isDisplayContainerName {
-                return trimmed
-            }
-        }
-    }
-
-    return fallback
 }
 
 private func pngDataURL(from image: CGImage) -> String? {
@@ -623,6 +644,64 @@ private func pngDataURL(from image: CGImage) -> String? {
         return nil
     }
     return "data:image/png;base64,\(data.base64EncodedString())"
+}
+
+private func applicationIconDataURL(
+    for candidate: AccessibilityCandidate
+) -> String? {
+    let key = candidate.bundleIdentifier ?? "pid:\(candidate.pid)"
+    applicationIconCacheLock.lock()
+    if let cached = applicationIconCache[key] {
+        applicationIconCacheLock.unlock()
+        return cached
+    }
+    applicationIconCacheLock.unlock()
+
+    guard let icon = NSRunningApplication(
+        processIdentifier: candidate.pid
+    )?.icon else {
+        return nil
+    }
+    var proposedRect = CGRect(x: 0, y: 0, width: 64, height: 64)
+    guard let image = icon.cgImage(
+        forProposedRect: &proposedRect,
+        context: nil,
+        hints: nil
+    ), let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+       let context = CGContext(
+           data: nil,
+           width: 64,
+           height: 64,
+           bitsPerComponent: 8,
+           bytesPerRow: 0,
+           space: colorSpace,
+           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+       ) else {
+        return nil
+    }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: 64, height: 64))
+    guard let resizedImage = context.makeImage(),
+          let dataURL = pngDataURL(from: resizedImage) else {
+        return nil
+    }
+
+    applicationIconCacheLock.lock()
+    applicationIconCache[key] = dataURL
+    applicationIconCacheLock.unlock()
+    return dataURL
+}
+
+private func neutralIconDataURL() -> String {
+    let svg = """
+    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+      <rect x="8" y="14" width="48" height="36" rx="12" fill="#20232b" stroke="#7f8799" stroke-width="3"/>
+      <circle cx="22" cy="32" r="4" fill="#c7ccd8"/>
+      <circle cx="32" cy="32" r="4" fill="#c7ccd8"/>
+      <circle cx="42" cy="32" r="4" fill="#c7ccd8"/>
+    </svg>
+    """
+    return "data:image/svg+xml;base64,\(Data(svg.utf8).base64EncodedString())"
 }
 
 private func reusableIconImages(
@@ -690,14 +769,10 @@ private func iconCacheIdentity(
     guard let candidate else {
         return "\(window.pid)|\(window.owner.lowercased())|unmatched"
     }
-    let label = accessibilityLabel(
-        candidate: candidate,
-        fallback: candidate.appName
-    )
     return [
         String(candidate.pid),
+        candidate.bundleIdentifier ?? "",
         candidate.appName.lowercased(),
-        label.lowercased()
     ].joined(separator: "|")
 }
 
@@ -720,8 +795,8 @@ private func onScreenWindows() -> [OnScreenWindow] {
                 dictionaryRepresentation: boundsDictionary as CFDictionary
             ),
             layer != 25,
-            bounds.width >= 80,
-            bounds.height >= 40
+            bounds.width >= 32,
+            bounds.height >= 24
         else {
             return nil
         }
@@ -778,15 +853,26 @@ private func anchoredPopupWindows(for session: ActivationSession) -> [OnScreenWi
 }
 
 private func rememberActivation(
-    menuWindow: MenuWindow,
-    targetPID: pid_t,
+    menuWindow: MenuWindow?,
+    candidate: AccessibilityCandidate?,
+    action: String?,
     baselineWindowIDs: Set<CGWindowID>
 ) {
+    guard let anchor = menuWindow.map({
+        CGPoint(x: $0.bounds.midX, y: $0.bounds.midY)
+    }) ?? candidate.map({
+        CGPoint(x: $0.frame.midX, y: $0.frame.midY)
+    }) else {
+        return
+    }
     let session = ActivationSession(
-        menuWindowID: menuWindow.id,
-        targetPID: targetPID,
-        anchor: CGPoint(x: menuWindow.bounds.midX, y: menuWindow.bounds.midY),
-        baselineWindowIDs: baselineWindowIDs
+        menuWindowID: menuWindow?.id,
+        anchor: anchor,
+        baselineWindowIDs: baselineWindowIDs,
+        accessibilityPID: candidate?.pid,
+        accessibilityLabel: candidate?.label,
+        accessibilityFrame: candidate?.frame,
+        accessibilityAction: action
     )
     activationSessionLock.lock()
     lastActivationSession = session
@@ -813,10 +899,27 @@ private func dismissLastActivatedPopup() {
     // wait because disappearance, not appearance, is the expected result.
     if !anchoredPopupWindows(for: session).isEmpty {
         let displays = activeDisplayBounds()
-        if let menuWindow = menuWindows(in: displays).first(where: {
-            $0.id == session.menuWindowID
-        }) {
+        if let menuWindowID = session.menuWindowID,
+           let menuWindow = menuWindows(in: displays).first(where: {
+               $0.id == menuWindowID
+           }) {
             _ = postMenuWindowClick(menuWindow)
+            Thread.sleep(forTimeInterval: 0.045)
+        } else if let pid = session.accessibilityPID,
+                  let label = session.accessibilityLabel,
+                  let frame = session.accessibilityFrame,
+                  let candidate = resolvedAccessibilityCandidate(
+                      pid: pid,
+                      label: label,
+                      frame: frame,
+                      preferredAction: session.accessibilityAction,
+                      in: accessibilityCandidates()
+                  ) {
+            let action = session.accessibilityAction
+                ?? (candidate.actions.contains(kAXPressAction as String)
+                    ? kAXPressAction as String
+                    : kAXShowMenuAction as String)
+            _ = AXUIElementPerformAction(candidate.element, action as CFString)
             Thread.sleep(forTimeInterval: 0.045)
         }
     }
@@ -840,18 +943,16 @@ private func handOffActivation(to pid: pid_t) {
     Thread.sleep(forTimeInterval: 0.06)
 }
 
-private func cachedActivationCandidate(
-    for request: ActivationRequest,
-    menuWindow: MenuWindow,
+private func resolvedAccessibilityCandidate(
+    pid: pid_t,
+    label: String,
+    frame: CGRect?,
+    preferredAction: String?,
     in candidates: [AccessibilityCandidate]
 ) -> AccessibilityCandidate? {
-    guard let activationPid = request.activationPid else {
-        return nil
-    }
-
     let actionable = candidates.filter { candidate in
-        guard candidate.pid == activationPid else { return false }
-        if let action = request.activationAction {
+        guard candidate.pid == pid else { return false }
+        if let action = preferredAction {
             return candidate.actions.contains(action)
         }
         return candidate.actions.contains(kAXPressAction as String)
@@ -859,50 +960,83 @@ private func cachedActivationCandidate(
     }
     guard !actionable.isEmpty else { return nil }
 
-    // The cached label is a more stable identity than position. When the user
-    // rearranges status items, resolve the same labeled AX element at its new
-    // location instead of selecting whichever element occupies the old frame.
     let labelMatches = actionable.filter { candidate in
-        let currentLabel = accessibilityLabel(
-            candidate: candidate,
-            fallback: candidate.appName
-        )
-        return currentLabel.caseInsensitiveCompare(request.label) == .orderedSame
+        candidate.label.caseInsensitiveCompare(label) == .orderedSame
     }
-    if !labelMatches.isEmpty {
-        return labelMatches.min { left, right in
-            let leftDistance = hypot(
-                left.frame.midX - menuWindow.bounds.midX,
-                left.frame.midY - menuWindow.bounds.midY
-            )
-            let rightDistance = hypot(
-                right.frame.midX - menuWindow.bounds.midX,
-                right.frame.midY - menuWindow.bounds.midY
-            )
-            return leftDistance < rightDistance
-        }
+    let eligible = labelMatches.isEmpty ? actionable : labelMatches
+    guard let frame else {
+        return eligible.count == 1 ? eligible[0] : nil
     }
+    return eligible.min { left, right in
+        hypot(left.frame.midX - frame.midX, left.frame.midY - frame.midY)
+            < hypot(right.frame.midX - frame.midX, right.frame.midY - frame.midY)
+    }
+}
 
-    guard
-        let x = request.activationX,
-        let y = request.activationY,
-        let width = request.activationWidth,
-        let height = request.activationHeight
-    else {
-        return actionable.count == 1 ? actionable[0] : nil
+private func cachedActivationCandidate(
+    for request: ActivationRequest,
+    in candidates: [AccessibilityCandidate]
+) -> AccessibilityCandidate? {
+    guard let activationPid = request.activationPid else { return nil }
+    let cachedFrame: CGRect?
+    if let x = request.activationX,
+       let y = request.activationY,
+       let width = request.activationWidth,
+       let height = request.activationHeight {
+        cachedFrame = CGRect(x: x, y: y, width: width, height: height)
+    } else {
+        cachedFrame = nil
     }
-    let cachedFrame = CGRect(x: x, y: y, width: width, height: height)
-    return actionable.min { left, right in
-        let leftDistance = hypot(
-            left.frame.midX - cachedFrame.midX,
-            left.frame.midY - cachedFrame.midY
-        )
-        let rightDistance = hypot(
-            right.frame.midX - cachedFrame.midX,
-            right.frame.midY - cachedFrame.midY
-        )
-        return leftDistance < rightDistance
+    return resolvedAccessibilityCandidate(
+        pid: activationPid,
+        label: request.label,
+        frame: cachedFrame,
+        preferredAction: request.activationAction,
+        in: candidates
+    )
+}
+
+private func confidentMenuWindow(
+    for request: ActivationRequest,
+    candidate: AccessibilityCandidate,
+    allCandidates: [AccessibilityCandidate],
+    displays: [CGRect]
+) -> MenuWindow? {
+    let requestedFrame = CGRect(
+        x: request.x,
+        y: request.y,
+        width: request.width,
+        height: request.height
+    )
+    guard let targetDisplay = containingDisplay(
+        for: requestedFrame,
+        in: displays
+    ) else {
+        return nil
     }
+    let windows = menuWindows(in: displays).filter {
+        containingDisplay(for: $0.bounds, in: displays) == targetDisplay
+    }
+    let catalog = catalogCandidates(
+        allCandidates,
+        targetDisplay: targetDisplay,
+        displays: displays
+    )
+    guard let index = catalog.firstIndex(where: { item in
+        guard item.pid == candidate.pid else { return false }
+        if let identifier = candidate.identifier {
+            return item.identifier == identifier
+        }
+        return item.label.caseInsensitiveCompare(candidate.label) == .orderedSame
+    }) else {
+        return nil
+    }
+    return confidentWindowMatches(
+        windows: windows,
+        candidates: catalog,
+        targetDisplay: targetDisplay,
+        displays: displays
+    )[index]
 }
 
 private func postMenuWindowClick(_ menuWindow: MenuWindow) -> Bool {
@@ -1014,18 +1148,29 @@ private func captureMenuIcons() async -> CaptureResponse {
 
     do {
         let captureTimestamp = ProcessInfo.processInfo.systemUptime
-        let accessibilityItems = accessibilityCandidates()
-        let matchedItems = matchedAccessibilityElements(
-            for: windows,
-            in: accessibilityItems,
+        let catalog = catalogCandidates(
+            accessibilityCandidates(),
+            targetDisplay: targetDisplay,
             displays: displays
         )
+        let confidentMatches = confidentWindowMatches(
+            windows: windows,
+            candidates: catalog,
+            targetDisplay: targetDisplay,
+            displays: displays
+        )
+        let matchedItems = Dictionary(
+            uniqueKeysWithValues: confidentMatches.map {
+                ($0.value.id, catalog[$0.key])
+            }
+        )
+        let matchedWindows = Array(confidentMatches.values)
         let reusableImages = reusableIconImages(
-            for: windows,
+            for: matchedWindows,
             matchedItems: matchedItems,
             at: captureTimestamp
         )
-        let needsImageCapture = windows.contains {
+        let needsImageCapture = matchedWindows.contains {
             reusableImages[$0.id] == nil
         }
         let shareableById: [CGWindowID: SCWindow]
@@ -1040,105 +1185,81 @@ private func captureMenuIcons() async -> CaptureResponse {
         } else {
             shareableById = [:]
         }
-        var icons: [MenuIcon] = []
-        var seenIcons: Set<String> = []
-
-        for menuWindow in windows {
+        var capturedImages = reusableImages
+        for menuWindow in matchedWindows where capturedImages[menuWindow.id] == nil {
             let captureWidth = max(1, Int(menuWindow.bounds.width * 2))
             let captureHeight = max(1, Int(menuWindow.bounds.height * 2))
-
             do {
-                let dataURL: String
-                if let reusableImage = reusableImages[menuWindow.id] {
-                    dataURL = reusableImage
-                } else {
-                    guard let shareableWindow = shareableById[menuWindow.id] else {
-                        continue
-                    }
-                    let filter = SCContentFilter(
-                        desktopIndependentWindow: shareableWindow
-                    )
-                    let configuration = SCStreamConfiguration()
-                    configuration.width = captureWidth
-                    configuration.height = captureHeight
-                    configuration.showsCursor = false
-                    configuration.ignoreShadowsSingleWindow = true
-                    configuration.captureResolution = .best
-                    let image: CGImage = try await SCScreenshotManager.captureImage(
-                        contentFilter: filter,
-                        configuration: configuration
-                    )
-                    guard let capturedImage = pngDataURL(from: image) else {
-                        continue
-                    }
-                    dataURL = capturedImage
-                    cacheIconImage(
-                        dataURL,
-                        for: menuWindow,
-                        identity: iconCacheIdentity(
-                            for: menuWindow,
-                            candidate: matchedItems[menuWindow.id]
-                        ),
-                        width: captureWidth,
-                        height: captureHeight,
-                        at: captureTimestamp
-                    )
-                }
-                let matchedItem = matchedItems[menuWindow.id]
-                let activationItem = matchedItem.flatMap { item in
-                    if item.actions.contains(kAXPressAction as String)
-                        || item.actions.contains(kAXShowMenuAction as String) {
-                        return item
-                    }
-                    return nil
-                }
-                let identityItem = activationItem ?? matchedItem
-                let activationApplication = identityItem.flatMap {
-                    NSRunningApplication(processIdentifier: $0.pid)
-                }
-                let activationAction = activationItem.flatMap { item in
-                    if item.actions.contains(kAXPressAction as String) {
-                        return kAXPressAction as String
-                    }
-                    if item.actions.contains(kAXShowMenuAction as String) {
-                        return kAXShowMenuAction as String
-                    }
-                    return nil
-                }
-                let actualOwner = matchedItem?.appName ?? menuWindow.owner
-                let label = accessibilityLabel(
-                    candidate: matchedItem,
-                    fallback: actualOwner
-                )
-                let identity = [
-                    actualOwner.lowercased(),
-                    label.lowercased(),
-                    dataURL
-                ].joined(separator: "\u{0}")
-                guard seenIcons.insert(identity).inserted else {
+                guard let shareableWindow = shareableById[menuWindow.id] else {
                     continue
                 }
-
-                icons.append(MenuIcon(
-                    windowId: menuWindow.id,
-                    owner: actualOwner,
-                    label: label,
-                    x: menuWindow.bounds.minX,
-                    y: menuWindow.bounds.minY,
-                    width: menuWindow.bounds.width,
-                    height: menuWindow.bounds.height,
-                    image: dataURL,
-                    activationPid: identityItem?.pid,
-                    activationBundleId: activationApplication?.bundleIdentifier,
-                    activationX: activationItem.map { Double($0.frame.minX) },
-                    activationY: activationItem.map { Double($0.frame.minY) },
-                    activationWidth: activationItem.map { Double($0.frame.width) },
-                    activationHeight: activationItem.map { Double($0.frame.height) },
-                    activationAction: activationAction
-                ))
+                let filter = SCContentFilter(
+                    desktopIndependentWindow: shareableWindow
+                )
+                let configuration = SCStreamConfiguration()
+                configuration.width = captureWidth
+                configuration.height = captureHeight
+                configuration.showsCursor = false
+                configuration.ignoreShadowsSingleWindow = true
+                configuration.captureResolution = .best
+                let image: CGImage = try await SCScreenshotManager.captureImage(
+                    contentFilter: filter,
+                    configuration: configuration
+                )
+                guard let dataURL = pngDataURL(from: image) else { continue }
+                capturedImages[menuWindow.id] = dataURL
+                cacheIconImage(
+                    dataURL,
+                    for: menuWindow,
+                    identity: iconCacheIdentity(
+                        for: menuWindow,
+                        candidate: matchedItems[menuWindow.id]
+                    ),
+                    width: captureWidth,
+                    height: captureHeight,
+                    at: captureTimestamp
+                )
             } catch {
                 continue
             }
+        }
+
+        let fallbackImage = neutralIconDataURL()
+        let icons = catalog.enumerated().map { index, candidate in
+            let menuWindow = confidentMatches[index]
+            let displayFrame = menuWindow?.bounds ?? projectedFrame(
+                for: candidate,
+                onto: targetDisplay,
+                displays: displays
+            )
+            let image = menuWindow.flatMap { capturedImages[$0.id] }
+                ?? applicationIconDataURL(for: candidate)
+                ?? fallbackImage
+            let activationAction: String?
+            if candidate.actions.contains(kAXPressAction as String) {
+                activationAction = kAXPressAction as String
+            } else if candidate.actions.contains(kAXShowMenuAction as String) {
+                activationAction = kAXShowMenuAction as String
+            } else {
+                activationAction = nil
+            }
+            return MenuIcon(
+                windowId: menuWindow?.id ?? 0,
+                owner: candidate.appName,
+                label: candidate.label,
+                x: displayFrame.minX,
+                y: displayFrame.minY,
+                width: displayFrame.width,
+                height: displayFrame.height,
+                image: image,
+                activationPid: candidate.pid,
+                activationBundleId: candidate.bundleIdentifier,
+                activationX: Double(candidate.frame.minX),
+                activationY: Double(candidate.frame.minY),
+                activationWidth: Double(candidate.frame.width),
+                activationHeight: Double(candidate.frame.height),
+                activationAction: activationAction
+            )
         }
 
         return CaptureResponse(
@@ -1293,101 +1414,75 @@ public func macnuActivateMenuIconJSON(
         return 4
     }
 
-    let displays = activeDisplayBounds()
-    guard let menuWindow = menuWindows(in: displays).first(where: {
-        $0.id == request.windowId
-    }) else {
-        NSLog(
-            "[Macnu activation] window %u is no longer available",
-            request.windowId
-        )
-        return 1
-    }
-
-    NSLog(
-        "[Macnu activation] owner=%@ pid=%d window=%u onScreen=%d frame=%@",
-        menuWindow.owner,
-        menuWindow.pid,
-        menuWindow.id,
-        menuWindow.isOnScreen ? 1 : 0,
-        NSStringFromRect(menuWindow.bounds)
-    )
-
     guard AXIsProcessTrusted() else {
         _ = macnuRequestAccessibility()
         return 2
     }
 
-    let catalogPID = pid_t(request.activationPid ?? menuWindow.pid)
+    let displays = activeDisplayBounds()
+    let accessibilityItems = accessibilityCandidates()
+    guard let activationCandidate = cachedActivationCandidate(
+        for: request,
+        in: accessibilityItems
+    ) else {
+        NSLog("[Macnu activation] accessibility item is no longer available")
+        return 1
+    }
+    let catalogPID = activationCandidate.pid
     let baselineWindowIDs = Set(onScreenWindows().map(\.id))
-    if clickMenuWindow(menuWindow, targetPID: catalogPID) {
+    let menuWindow = confidentMenuWindow(
+        for: request,
+        candidate: activationCandidate,
+        allCandidates: accessibilityItems,
+        displays: displays
+    )
+
+    // WindowServer delivery is used only when the fresh Accessibility-first
+    // catalog still produces the same unambiguous one-to-one match. A stale or
+    // uncertain window ID is never clicked.
+    if let menuWindow,
+       clickMenuWindow(menuWindow, targetPID: catalogPID) {
         rememberActivation(
             menuWindow: menuWindow,
-            targetPID: catalogPID,
+            candidate: activationCandidate,
+            action: request.activationAction,
             baselineWindowIDs: baselineWindowIDs
         )
-        NSLog("[Macnu activation] delivered through WindowServer")
+        NSLog("[Macnu activation] delivered through confident WindowServer match")
         return 0
     }
 
-    // Generic recovery only: resolve the cached label back to the source
-    // app's current accessibility element. No application name or bundle ID
-    // changes which activation path is selected.
     handOffActivation(to: catalogPID)
-    let accessibilityItems = accessibilityCandidates()
-    let activationCandidate = cachedActivationCandidate(
-        for: request,
-        menuWindow: menuWindow,
-        in: accessibilityItems
-    ) ?? matchedAccessibilityElement(
-            for: menuWindow,
-            in: accessibilityItems,
-            displays: displays,
-            requiringAction: true
-        )
-
-    if let candidate = activationCandidate {
-        let menuDisplay = containingDisplay(for: menuWindow.bounds, in: displays)
-        let candidateDisplay = containingDisplay(for: candidate.frame, in: displays)
-
-        // Visible items must stay tied to the requested display. A notch-hidden
-        // item, however, may only expose an AX replica on another display; an
-        // exact process match is safe in that case.
-        let isRequestedDisplay = menuDisplay == candidateDisplay
-        let isHiddenOwnerReplica = !menuWindow.isOnScreen
-            && candidate.pid == catalogPID
-        if isRequestedDisplay || isHiddenOwnerReplica {
-            let cachedActions = request.activationAction.map { [$0] } ?? []
-            let actions = cachedActions + [kAXPressAction as String, kAXShowMenuAction as String]
-            let uniqueActions = actions.reduce(into: [String]()) { result, action in
-                if !result.contains(action) { result.append(action) }
+    let cachedActions = request.activationAction.map { [$0] } ?? []
+    let actions = cachedActions + [kAXPressAction as String, kAXShowMenuAction as String]
+    let uniqueActions = actions.reduce(into: [String]()) { result, action in
+        if !result.contains(action) { result.append(action) }
+    }
+    for action in uniqueActions {
+        guard activationCandidate.actions.contains(action) else { continue }
+        let visibleWindows = Set(onScreenWindows().map(\.id))
+        if AXUIElementPerformAction(
+            activationCandidate.element,
+            action as CFString
+        ) == .success {
+            let openedPopup = waitForOpenedPopup(
+                since: visibleWindows,
+                targetPID: catalogPID,
+                anchor: CGPoint(
+                    x: activationCandidate.frame.midX,
+                    y: activationCandidate.frame.midY
+                )
+            )
+            if openedPopup {
+                rememberActivation(
+                    menuWindow: nil,
+                    candidate: activationCandidate,
+                    action: action,
+                    baselineWindowIDs: visibleWindows
+                )
             }
-            for action in uniqueActions {
-                guard candidate.actions.contains(action as String) else {
-                    continue
-                }
-                let visibleWindows = Set(onScreenWindows().map(\.id))
-                if AXUIElementPerformAction(
-                    candidate.element,
-                    action as CFString
-                ) == .success,
-                   waitForOpenedPopup(
-                    since: visibleWindows,
-                    targetPID: catalogPID,
-                    anchor: CGPoint(
-                        x: candidate.frame.midX,
-                        y: candidate.frame.midY
-                    )
-                   ) {
-                    rememberActivation(
-                        menuWindow: menuWindow,
-                        targetPID: catalogPID,
-                        baselineWindowIDs: visibleWindows
-                    )
-                    NSLog("[Macnu activation] opened with AX action %@", action)
-                    return 0
-                }
-            }
+            NSLog("[Macnu activation] delivered through Accessibility action %@", action)
+            return 0
         }
     }
 
