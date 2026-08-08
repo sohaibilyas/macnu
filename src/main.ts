@@ -292,7 +292,6 @@ app.innerHTML = `
         aria-label="Search menu bar icons"
       />
       <span class="current-shortcut"><kbd>⌘</kbd><kbd>;</kbd></span>
-      <button class="close" aria-label="Close">×</button>
     </header>
     <div class="divider"></div>
     <main class="results" role="listbox"></main>
@@ -626,6 +625,17 @@ input.addEventListener("input", () => {
   render();
 });
 
+window.addEventListener(
+  "keydown",
+  (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    void currentWindow.hide();
+  },
+  { capture: true },
+);
+
 input.addEventListener("keydown", (event) => {
   if (event.key === "ArrowDown") {
     event.preventDefault();
@@ -647,9 +657,14 @@ input.addEventListener("keydown", (event) => {
     event.preventDefault();
     event.stopPropagation();
     activateSelected();
-  } else if (event.key === "Escape") {
-    void currentWindow.hide();
   }
+});
+
+results.addEventListener("focusin", (event) => {
+  const item = (event.target as HTMLElement).closest<HTMLButtonElement>(".result");
+  if (!item) return;
+  pointerSelectionArmed = false;
+  updateSelection(Number(item.dataset.index));
 });
 
 results.addEventListener("mousemove", (event) => {
@@ -693,9 +708,6 @@ app.querySelector<HTMLButtonElement>(".settings-button")!.addEventListener(
   "click",
   () => void invoke("open_settings"),
 );
-app.querySelector<HTMLButtonElement>(".close")!.addEventListener("click", () => {
-  void currentWindow.hide();
-});
 
 void currentWindow.listen("palette-opened", () => {
   const generation = ++blurDismissGeneration;
