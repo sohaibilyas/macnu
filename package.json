@@ -2,6 +2,15 @@
   "name": "macnu",
   "private": true,
   "version": "0.1.0",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "author": "Sohaib Ilyas",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sohaibilyas/macnu.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sohaibilyas/macnu/issues"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
