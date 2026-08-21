@@ -39,3 +39,14 @@ npm run build:app
 The packaged app is written to `src-tauri/target/release/bundle/macos`.
 Production releases must instead use a Developer ID signature and Apple
 notarization.
+
+## License
+
+Macnu is source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). You may use, study, modify,
+and share it for purposes permitted by that license. This is not an
+OSI-approved open-source license because it does not permit commercial use.
+
+Commercial use requires a separate written license from Sohaib Ilyas. See
+[LICENSING.md](LICENSING.md). The [Macnu name and branding](TRADEMARKS.md),
+Apple signing credentials, and update-signing private keys remain reserved.

@@ -2,8 +2,11 @@
 name = "macnu"
 version = "0.1.0"
 description = "A fast, searchable launcher for crowded macOS menu bars"
-authors = ["Macnu"]
+authors = ["Sohaib Ilyas"]
 edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/sohaibilyas/macnu"
+publish = false
 
 [lib]
 name = "macnu_lib"
