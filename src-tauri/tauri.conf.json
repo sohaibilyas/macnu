@@ -57,8 +57,8 @@
     "active": true,
     "targets": ["app", "dmg"],
     "category": "Utility",
-    "shortDescription": "A scrollable companion for crowded Mac menu bars",
-    "longDescription": "Macnu reveals macOS menu bar extras in a horizontally scrollable floating strip.",
+    "shortDescription": "A searchable launcher for crowded Mac menu bars",
+    "longDescription": "Macnu finds macOS status items—including icons hidden behind the notch—and opens their original menus from a fast search palette.",
     "macOS": {
       "minimumSystemVersion": "14.0",
       "signingIdentity": "-",

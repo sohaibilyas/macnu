@@ -11,10 +11,11 @@ npm install
 npm run tauri dev
 ```
 
-On first launch, allow Macnu under **System Settings → Privacy & Security →
-Screen Recording**, then reopen it. macOS requires this permission so
-ScreenCaptureKit can mirror the real icon artwork. Allow **Accessibility** when
-you first click an icon so Macnu can activate the original status item.
+On first launch, Macnu guides you through granting **Accessibility** under
+**System Settings → Privacy & Security**. This permission is required to find
+and activate menu-bar items. Screen Recording is optional and is used only to
+show captured menu-bar artwork; Macnu remains functional with application or
+neutral fallback icons when it is not granted.
 
 Macnu stays available as a native status item in the top bar. Click its `M`
 icon or press **Command + Semicolon (`⌘;`)** to open the launcher. Type to filter,
@@ -27,11 +28,14 @@ to be moved into **Applications** before it can be registered as a login item.
 
 ## Build
 
-Build the app bundle with a stable local designated requirement so macOS
-Accessibility permission survives subsequent local rebuilds:
+Build the local development app bundle with an ad-hoc signature and stable
+designated requirement so macOS Accessibility permission survives subsequent
+local rebuilds:
 
 ```bash
 npm run build:app
 ```
 
 The packaged app is written to `src-tauri/target/release/bundle/macos`.
+Production releases must instead use a Developer ID signature and Apple
+notarization.

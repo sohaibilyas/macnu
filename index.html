@@ -3,8 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#111318" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f8f9fc" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#090a0e" />
     <title>Macnu</title>
+    <script>
+      try {
+        const appearance = localStorage.getItem("macnu.appearance");
+        if (appearance === "light" || appearance === "dark") {
+          document.documentElement.dataset.appearance = appearance;
+        }
+      } catch (_) {}
+    </script>
   </head>
   <body>
     <main id="app"></main>

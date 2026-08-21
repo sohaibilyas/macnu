@@ -5,6 +5,6 @@
   <key>NSAppleEventsUsageDescription</key>
   <string>Macnu uses system services to activate your original menu bar items.</string>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>Macnu mirrors your real menu bar icons into its quick horizontal slider.</string>
+  <string>Macnu mirrors your real menu bar icons into its searchable launcher.</string>
 </dict>
 </plist>

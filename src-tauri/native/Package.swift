@@ -11,6 +11,11 @@ let package = Package(
         .target(
             name: "MacnuNative",
             path: "Sources/MacnuNative"
+        ),
+        .testTarget(
+            name: "MacnuNativeTests",
+            dependencies: ["MacnuNative"],
+            path: "Tests/MacnuNativeTests"
         )
     ]
 )

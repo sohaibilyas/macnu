@@ -5,3 +5,15 @@ src-tauri/target
 src-tauri/native/.build
 .DS_Store
 *.log
+
+# Local signing and notarization credentials
+*.p8
+*.p12
+*.pfx
+*.pem
+*.cer
+*.certSigningRequest
+*.key
+.env
+.env.*
+!.env.example
