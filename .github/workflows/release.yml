@@ -99,6 +99,13 @@ jobs:
           npm ci --no-audit --no-fund
           npm --prefix services/lemon-webhook ci --no-audit --no-fund
 
+      - name: Install Rust formatting component
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup component add rustfmt --toolchain "$RUSTUP_TOOLCHAIN"
+          cargo fmt --version
+
       - name: Run release gates before exposing Apple secrets
         shell: bash
         run: |
