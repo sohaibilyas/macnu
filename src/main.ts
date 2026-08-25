@@ -1,5 +1,7 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./styles.css";
 
 type Appearance = "system" | "light" | "dark";
@@ -88,6 +90,48 @@ type PermissionStatus = Pick<
   SettingsResponse,
   "accessibilityGranted" | "screenCaptureGranted"
 >;
+
+type LicenseState =
+  | "development"
+  | "unlicensed"
+  | "validating"
+  | "licensed"
+  | "needsValidation";
+
+type LicenseStatus = {
+  state: LicenseState;
+  licenseRequired: boolean;
+  canUseApp: boolean;
+  plan: "personal" | "business" | null;
+  offlineGrace: boolean;
+  validationDue: boolean;
+  lastValidatedAt: number | null;
+  graceEndsAt: number | null;
+  message: string | null;
+};
+type SettingsView = "general" | "permissions" | "updates" | "license";
+
+type UpdateCheck = {
+  supported: boolean;
+  available: boolean;
+  currentVersion: string;
+  version: string | null;
+  notes: string | null;
+};
+
+type UpdateInstallEvent =
+  | { event: "started"; contentLength: number | null }
+  | { event: "progress"; chunkLength: number; downloaded: number }
+  | { event: "verifying" }
+  | { event: "installing" }
+  | { event: "restarting" };
+
+
+const PERSONAL_CHECKOUT_URL =
+  "https://qoest.lemonsqueezy.com/checkout/buy/12e893f2-c4df-423e-b2b1-b6b7f24bd07d?enabled=2046255";
+const BUSINESS_CHECKOUT_URL =
+  "https://qoest.lemonsqueezy.com/checkout/buy/fc6c40ec-376e-4fc5-806b-830a56ab3790?enabled=2046262";
+const RECOVER_LICENSE_URL = "https://app.lemonsqueezy.com/my-orders";
 
 const currentWindow = getCurrentWindow();
 const app = document.querySelector<HTMLElement>("#app")!;
@@ -193,7 +237,29 @@ async function initSettings(): Promise<void> {
               <span aria-hidden="true">✓</span>
               Permissions
             </button>
-            <div class="settings-version">Macnu 0.1.0</div>
+            <button
+              class="settings-nav"
+              data-settings-view="updates"
+              role="tab"
+              aria-controls="updates-panel"
+              aria-selected="false"
+              hidden
+            >
+              <span aria-hidden="true">↑</span>
+              Updates
+            </button>
+            <button
+              class="settings-nav"
+              data-settings-view="license"
+              role="tab"
+              aria-controls="license-panel"
+              aria-selected="false"
+              hidden
+            >
+              <span aria-hidden="true">◇</span>
+              License
+            </button>
+            <div class="settings-version">Macnu</div>
           </aside>
           <main class="settings-content">
             <section
@@ -239,6 +305,9 @@ async function initSettings(): Promise<void> {
                   </div>
                 </div>
               </section>
+              <div class="source-build-notice" data-source-build-notice role="note" hidden>
+                Source build — no paid license or signed Macnu releases are included.
+              </div>
             </section>
 
             <section
@@ -281,6 +350,81 @@ async function initSettings(): Promise<void> {
                 <button class="permission-recheck" data-run-onboarding>Run setup again</button>
               </div>
             </section>
+            <section
+              class="settings-panel"
+              id="updates-panel"
+              data-settings-panel="updates"
+              role="tabpanel"
+              hidden
+            >
+              <div class="settings-copy">
+                <h1>Updates</h1>
+                <p>Macnu checks quietly and installs only signed official releases.</p>
+              </div>
+              <article class="update-card" data-update-card>
+                <span class="update-state-mark" data-update-mark aria-hidden="true">↻</span>
+                <div class="update-state-copy">
+                  <strong data-update-title>Ready to check</strong>
+                  <small data-update-summary>Macnu</small>
+                </div>
+                <button class="secondary-action update-check" data-check-updates>Check Now</button>
+              </article>
+              <div class="update-progress" data-update-progress hidden>
+                <progress max="1" value="0" aria-label="Update download progress"></progress>
+                <span data-update-progress-label>Preparing update…</span>
+              </div>
+              <div class="update-notes" data-update-notes-container hidden>
+                <strong>What’s new</strong>
+                <p data-update-notes></p>
+              </div>
+              <div class="update-actions">
+                <button class="primary-action update-install" data-install-update hidden>
+                  Download and Restart
+                </button>
+                <span class="update-panel-status" data-update-status role="status" aria-live="polite" aria-atomic="true"></span>
+              </div>
+            </section>
+
+
+            <section
+              class="settings-panel"
+              id="license-panel"
+              data-settings-panel="license"
+              role="tabpanel"
+              hidden
+            >
+              <div class="settings-copy">
+                <h1>License</h1>
+                <p>Manage the license activated on this Mac.</p>
+              </div>
+              <section class="license-summary" aria-label="License details">
+                <div class="license-summary-heading">
+                  <span class="license-state-mark" aria-hidden="true">✓</span>
+                  <div>
+                    <strong data-license-plan>Macnu license</strong>
+                    <small data-license-summary>Activated on this Mac</small>
+                  </div>
+                </div>
+                <dl class="license-facts">
+                  <div>
+                    <dt>License key</dt>
+                    <dd>Stored securely in Keychain</dd>
+                  </div>
+                </dl>
+              </section>
+              <div class="license-settings-actions">
+                <button class="secondary-action license-refresh" data-refresh-license>Check Again</button>
+                <button class="danger-action license-deactivate" data-request-deactivation>Deactivate This Mac</button>
+              </div>
+              <div class="license-panel-status" role="status" aria-live="polite" aria-atomic="true"></div>
+              <div class="license-deactivate-confirmation" role="group" aria-label="Confirm license deactivation" hidden>
+                <span>This Mac will return to the activation screen.</span>
+                <div>
+                  <button class="secondary-action" data-cancel-deactivation>Cancel</button>
+                  <button class="danger-action" data-confirm-deactivation>Deactivate</button>
+                </div>
+              </div>
+            </section>
 
             <div class="settings-message-row">
               <div class="settings-message" role="status" aria-live="polite"></div>
@@ -288,6 +432,50 @@ async function initSettings(): Promise<void> {
             </div>
           </main>
         </div>
+
+        <main class="license-gate" aria-labelledby="license-gate-title" hidden>
+          <div class="license-gate-simple">
+            <img src="${appIconUrl}" alt="" draggable="false" />
+            <div class="gate-copy">
+              <h1 id="license-gate-title">Activate Macnu</h1>
+              <p>Enter the license key from your purchase email.</p>
+            </div>
+            <form class="license-activation-form" novalidate>
+              <label for="license-key">License key</label>
+              <div class="license-key-control">
+                <input
+                  id="license-key"
+                  name="license-key"
+                  type="text"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                  aria-describedby="license-gate-status license-gate-error"
+                  placeholder="XXXX-XXXX-XXXX-XXXX"
+                />
+                <button class="primary-action" type="submit">Activate</button>
+              </div>
+            </form>
+            <div id="license-gate-status" class="license-gate-status" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="license-gate-error" class="license-gate-error" role="alert" aria-live="assertive"></div>
+            <nav class="license-help-links" aria-label="License help">
+              <a data-license-link="personal" role="link" aria-disabled="true">Personal — $9.99</a>
+              <button
+                type="button"
+                data-show-business-checkout
+                aria-expanded="false"
+                aria-controls="business-seat-picker"
+              >Business — $9.99/seat</button>
+              <a data-license-link="recover" role="link" aria-disabled="true">Recover license</a>
+            </nav>
+            <form id="business-seat-picker" class="business-seat-picker" hidden>
+              <label for="business-seats">Business seats</label>
+              <input id="business-seats" name="business-seats" type="number" min="1" max="999" step="1" value="1" inputmode="numeric" />
+              <button class="secondary-action" type="submit">Continue</button>
+              <small>2 Macs per seat</small>
+            </form>
+          </div>
+        </main>
 
         <main class="onboarding permission-gate" aria-labelledby="permission-gate-title" hidden>
           <div class="gate-simple">
@@ -322,10 +510,43 @@ async function initSettings(): Promise<void> {
   const loginSettingsLink = app.querySelector<HTMLButtonElement>(".login-settings-link")!;
   const settingsLayout = app.querySelector<HTMLElement>(".settings-layout")!;
   const settingsLoading = app.querySelector<HTMLElement>(".settings-loading")!;
+  const licenseGate = app.querySelector<HTMLElement>(".license-gate")!;
+  const licenseForm = app.querySelector<HTMLFormElement>(".license-activation-form")!;
+  const licenseInput = app.querySelector<HTMLInputElement>("#license-key")!;
+  const licenseActivateButton = licenseForm.querySelector<HTMLButtonElement>("button[type='submit']")!;
+  const licenseGateStatus = app.querySelector<HTMLElement>(".license-gate-status")!;
+  const licenseGateError = app.querySelector<HTMLElement>(".license-gate-error")!;
+  const businessCheckoutButton = app.querySelector<HTMLButtonElement>("[data-show-business-checkout]")!;
+  const businessSeatForm = app.querySelector<HTMLFormElement>(".business-seat-picker")!;
+  const businessSeatInput = app.querySelector<HTMLInputElement>("#business-seats")!;
+  const licensePanelStatus = app.querySelector<HTMLElement>(".license-panel-status")!;
+  const deactivationConfirmation = app.querySelector<HTMLElement>(".license-deactivate-confirmation")!;
   const onboarding = app.querySelector<HTMLElement>(".onboarding")!;
+  const settingsVersion = app.querySelector<HTMLElement>(".settings-version")!;
+  const updatesNav = app.querySelector<HTMLButtonElement>("[data-settings-view='updates']")!;
+  const updateCard = app.querySelector<HTMLElement>("[data-update-card]")!;
+  const updateMark = app.querySelector<HTMLElement>("[data-update-mark]")!;
+  const updateTitle = app.querySelector<HTMLElement>("[data-update-title]")!;
+  const updateSummary = app.querySelector<HTMLElement>("[data-update-summary]")!;
+  const updateCheckButton = app.querySelector<HTMLButtonElement>("[data-check-updates]")!;
+  const updateInstallButton = app.querySelector<HTMLButtonElement>("[data-install-update]")!;
+  const updateProgress = app.querySelector<HTMLElement>("[data-update-progress]")!;
+  const updateProgressBar = updateProgress.querySelector<HTMLProgressElement>("progress")!;
+  const updateProgressLabel = app.querySelector<HTMLElement>("[data-update-progress-label]")!;
+  const updateNotesContainer = app.querySelector<HTMLElement>("[data-update-notes-container]")!;
+  const updateNotes = app.querySelector<HTMLElement>("[data-update-notes]")!;
+  const updateStatus = app.querySelector<HTMLElement>("[data-update-status]")!;
+  let appVersion = "";
+  let pendingUpdateVersion: string | null = null;
+  let automaticUpdateCheckStarted = false;
+  let updateBusy = false;
+  let updateContentLength: number | null = null;
   let settings: SettingsResponse | null = null;
   let permissionStatus: PermissionStatus | null = null;
   let recording = false;
+  let licenseStatusLoaded = false;
+  let settingsResolved = false;
+  let licenseGuardVisible = true;
   let permissionGuardVisible = false;
   let permissionSettingsOpened = false;
 
@@ -335,6 +556,11 @@ async function initSettings(): Promise<void> {
   }
 
   function showActionError(error: unknown): void {
+    if (!licenseGate.hidden) {
+      licenseGateStatus.textContent = "";
+      licenseGateError.textContent = String(error);
+      return;
+    }
     if (!onboarding.hidden) {
       const errorTarget = app.querySelector<HTMLElement>(".onboarding-error");
       if (errorTarget) {
@@ -352,7 +578,173 @@ async function initSettings(): Promise<void> {
     });
   }
 
-  function showSettingsView(view: "general" | "permissions"): void {
+  function setUpdateBusy(busy: boolean): void {
+    updateBusy = busy;
+    updateCheckButton.disabled = busy;
+    updateInstallButton.disabled = busy;
+    updateCard.setAttribute("aria-busy", String(busy));
+  }
+
+  function setUpdateStatus(text = "", error = false): void {
+    updateStatus.classList.toggle("error", error);
+    updateStatus.textContent = text;
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1_024) return `${bytes} B`;
+    if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KB`;
+    return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  }
+
+  function setDisplayedVersion(version: string): void {
+    appVersion = version;
+    settingsVersion.textContent = `Macnu ${version}`;
+  }
+
+  function applyUpdateCheck(result: UpdateCheck): void {
+    setDisplayedVersion(result.currentVersion);
+    pendingUpdateVersion = result.available ? result.version : null;
+    updateContentLength = null;
+    updateProgress.hidden = true;
+    updateProgressBar.max = 1;
+    updateProgressBar.value = 0;
+    updateCard.classList.remove("available", "current", "error", "checking");
+    updateCheckButton.textContent = "Check Again";
+
+    if (!result.supported) {
+      updateMark.textContent = "—";
+      updateTitle.textContent = "Updates aren’t included in this build";
+      updateSummary.textContent = `Macnu ${result.currentVersion}`;
+      updateInstallButton.hidden = true;
+      updateNotesContainer.hidden = true;
+      setUpdateStatus();
+      return;
+    }
+
+    if (result.available && result.version) {
+      updateCard.classList.add("available");
+      updateMark.textContent = "↑";
+      updateTitle.textContent = `Macnu ${result.version} is available`;
+      updateSummary.textContent = `Installed version ${result.currentVersion}`;
+      updateInstallButton.hidden = false;
+      updateNotes.textContent = result.notes ?? "";
+      updateNotesContainer.hidden = !result.notes;
+      setUpdateStatus("Signed official release ready.");
+      return;
+    }
+
+    updateCard.classList.add("current");
+    updateMark.textContent = "✓";
+    updateTitle.textContent = "Macnu is up to date";
+    updateSummary.textContent = `Version ${result.currentVersion}`;
+    updateInstallButton.hidden = true;
+    updateNotesContainer.hidden = true;
+    updateNotes.textContent = "";
+    setUpdateStatus("Checked just now.");
+  }
+
+  async function checkForUpdates(manual = false): Promise<void> {
+    if (updateBusy) return;
+    setUpdateBusy(true);
+    pendingUpdateVersion = null;
+    updateInstallButton.hidden = true;
+    updateNotesContainer.hidden = true;
+    updateProgress.hidden = true;
+    updateCard.classList.remove("available", "current", "error");
+    updateCard.classList.add("checking");
+    updateMark.textContent = "↻";
+    updateTitle.textContent = "Checking for updates…";
+    updateSummary.textContent = appVersion ? `Macnu ${appVersion}` : "Macnu";
+    setUpdateStatus(manual ? "Contacting the official release feed…" : "");
+
+    try {
+      applyUpdateCheck(await invoke<UpdateCheck>("check_for_updates"));
+    } catch (error) {
+      updateCard.classList.remove("checking");
+      updateCard.classList.add("error");
+      updateMark.textContent = "!";
+      updateTitle.textContent = "Couldn’t check for updates";
+      updateSummary.textContent = appVersion ? `Macnu ${appVersion}` : "Your current app is unchanged.";
+      updateInstallButton.hidden = true;
+      setUpdateStatus(String(error), true);
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  async function installAvailableUpdate(): Promise<void> {
+    if (updateBusy || !pendingUpdateVersion) return;
+    const expectedVersion = pendingUpdateVersion;
+    setUpdateBusy(true);
+    setUpdateStatus("Downloading signed update…");
+    updateProgress.hidden = false;
+    updateProgressBar.max = 1;
+    updateProgressBar.value = 0;
+    updateProgressLabel.textContent = "Starting download…";
+
+    const onEvent = new Channel<UpdateInstallEvent>();
+    onEvent.onmessage = (event) => {
+      switch (event.event) {
+        case "started":
+          updateContentLength = event.contentLength;
+          updateProgressBar.max = event.contentLength && event.contentLength > 0
+            ? event.contentLength
+            : 1;
+          updateProgressBar.value = 0;
+          updateProgressLabel.textContent = event.contentLength
+            ? `Downloading ${formatBytes(event.contentLength)}…`
+            : "Downloading update…";
+          break;
+        case "progress": {
+          if (updateContentLength && updateContentLength > 0) {
+            updateProgressBar.max = updateContentLength;
+            updateProgressBar.value = Math.min(event.downloaded, updateContentLength);
+            const percentage = Math.min(
+              100,
+              Math.round((event.downloaded / updateContentLength) * 100),
+            );
+            updateProgressLabel.textContent = `Downloading… ${percentage}%`;
+          } else {
+            updateProgressLabel.textContent = `Downloaded ${formatBytes(event.downloaded)}…`;
+          }
+          break;
+        }
+        case "verifying":
+          updateProgressBar.removeAttribute("value");
+          updateProgressLabel.textContent = "Verifying signature and app identity…";
+          setUpdateStatus("Checking the signed app before installation.");
+          break;
+        case "installing":
+          updateProgressLabel.textContent = "Installing update…";
+          setUpdateStatus("Your current copy stays safe until installation succeeds.");
+          break;
+        case "restarting":
+          updateProgressLabel.textContent = "Restarting Macnu…";
+          setUpdateStatus("Update installed.");
+          break;
+      }
+    };
+
+    try {
+      await invoke("install_update", { expectedVersion, onEvent });
+    } catch (error) {
+      updateProgress.hidden = true;
+      setUpdateStatus(String(error), true);
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
+  void getVersion()
+    .then((version) => {
+      setDisplayedVersion(version);
+      if (!pendingUpdateVersion) updateSummary.textContent = `Macnu ${version}`;
+    })
+    .catch(() => {
+      settingsVersion.textContent = "Macnu";
+    });
+
+  function showSettingsView(view: SettingsView): void {
     app.querySelectorAll<HTMLButtonElement>("[data-settings-view]").forEach((button) => {
       const selected = button.dataset.settingsView === view;
       button.classList.toggle("selected", selected);
@@ -364,12 +756,108 @@ async function initSettings(): Promise<void> {
     });
   }
 
-  function syncPermissionGuard(): void {
-    settingsLayout.hidden = permissionGuardVisible;
-    onboarding.hidden = !permissionGuardVisible;
-    app.querySelector<HTMLElement>(".settings-heading small")!.textContent = permissionGuardVisible
-      ? "Setup"
-      : "Settings";
+  function syncVisibleSurface(): void {
+    const waitingForLicense = !licenseStatusLoaded;
+    const waitingForSettings = !licenseGuardVisible && !settingsResolved;
+    const loading = waitingForLicense || waitingForSettings;
+
+    settingsLoading.hidden = !loading;
+    settingsLayout.hidden = loading || licenseGuardVisible || permissionGuardVisible;
+    licenseGate.hidden = loading || !licenseGuardVisible;
+    onboarding.hidden = loading || licenseGuardVisible || !permissionGuardVisible;
+    app.querySelector<HTMLElement>(".settings-heading small")!.textContent = licenseGuardVisible
+      ? "Activation"
+      : permissionGuardVisible
+        ? "Setup"
+        : "Settings";
+  }
+
+  function readablePlan(plan: LicenseStatus["plan"]): string {
+    if (plan === "business") return "Business license";
+    if (plan === "personal") return "Personal license";
+    return "Macnu license";
+  }
+
+  function formatLicenseDate(timestamp: number | null): string | null {
+    if (timestamp === null) return null;
+    const date = new Date(timestamp * 1_000);
+    if (Number.isNaN(date.getTime())) return null;
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(date);
+  }
+
+  function applyLicenseStatus(next: LicenseStatus): void {
+    licenseStatusLoaded = true;
+    licenseGuardVisible = next.licenseRequired && !next.canUseApp;
+    app.querySelector<HTMLElement>("[data-source-build-notice]")!.hidden =
+      next.state !== "development" || next.licenseRequired;
+
+    const licenseNav = app.querySelector<HTMLButtonElement>("[data-settings-view='license']")!;
+    const showLicenseSettings = next.licenseRequired && next.canUseApp && next.plan !== null;
+    licenseNav.hidden = !showLicenseSettings;
+    if (!showLicenseSettings && licenseNav.classList.contains("selected")) {
+      showSettingsView("general");
+    }
+
+    updatesNav.hidden = !next.licenseRequired;
+    if (!next.licenseRequired && updatesNav.classList.contains("selected")) {
+      showSettingsView("general");
+    }
+    if (next.licenseRequired && !automaticUpdateCheckStarted) {
+      automaticUpdateCheckStarted = true;
+      window.setTimeout(() => {
+        void checkForUpdates();
+      }, 900);
+    }
+
+    app.querySelector<HTMLElement>("[data-license-plan]")!.textContent = readablePlan(next.plan);
+    const summary = app.querySelector<HTMLElement>("[data-license-summary]")!;
+    if (next.offlineGrace) {
+      const graceEnd = formatLicenseDate(next.graceEndsAt);
+      summary.textContent = graceEnd
+        ? `Offline access until ${graceEnd}`
+        : "Using temporary offline access";
+    } else if (next.validationDue) {
+      summary.textContent = "License check recommended";
+    } else {
+      const lastChecked = formatLicenseDate(next.lastValidatedAt);
+      summary.textContent = lastChecked ? `Checked ${lastChecked}` : "Activated on this Mac";
+    }
+
+    licenseGateError.textContent = "";
+    licenseGateStatus.textContent = next.state === "validating"
+      ? "Checking license…"
+      : licenseGuardVisible
+        ? next.message ?? "A license is required to use Macnu."
+        : "";
+    setLicensePanelMessage(next.canUseApp ? next.message ?? "" : "");
+    deactivationConfirmation.hidden = true;
+    syncVisibleSurface();
+
+    if (licenseGuardVisible) {
+      window.setTimeout(() => licenseInput.focus());
+    }
+  }
+
+  function setLicensePanelMessage(text = "", error = false): void {
+    licensePanelStatus.classList.toggle("error", error);
+    licensePanelStatus.textContent = text;
+  }
+
+  function resetBusinessCheckout(): void {
+    businessSeatForm.hidden = true;
+    businessSeatInput.value = "1";
+    businessCheckoutButton.setAttribute("aria-expanded", "false");
+  }
+
+  function hideSettingsWindow(): void {
+    licenseInput.value = "";
+    licenseGateError.textContent = "";
+    deactivationConfirmation.hidden = true;
+    resetBusinessCheckout();
+    void currentWindow.hide();
   }
 
   function updatePermissionStatus(next: PermissionStatus): void {
@@ -414,7 +902,7 @@ async function initSettings(): Promise<void> {
 
     if (!next.accessibilityGranted) {
       permissionGuardVisible = true;
-      syncPermissionGuard();
+      syncVisibleSurface();
     } else if (previouslyGranted === false && permissionGuardVisible) {
       window.setTimeout(() => app.querySelector<HTMLButtonElement>(".finish-onboarding")?.focus());
     }
@@ -427,9 +915,9 @@ async function initSettings(): Promise<void> {
     recorder.innerHTML = shortcutMarkup(next.shortcut);
     recorder.classList.remove("recording");
     recording = false;
-    settingsLoading.hidden = true;
+    settingsResolved = true;
     permissionGuardVisible = !next.onboardingCompleted || !next.accessibilityGranted;
-    syncPermissionGuard();
+    syncVisibleSurface();
     if (permissionGuardVisible) {
       window.setTimeout(() => {
         app.querySelector<HTMLButtonElement>(".finish-onboarding:not([hidden]), .gate-open-settings:not([hidden])")?.focus();
@@ -451,9 +939,30 @@ async function initSettings(): Promise<void> {
     try {
       applySettings(await invoke<SettingsResponse>("get_settings"));
     } catch (error) {
-      settingsLoading.hidden = true;
-      settingsLayout.hidden = false;
+      settingsResolved = true;
+      syncVisibleSurface();
       setMessage(String(error), "error");
+    }
+  }
+
+  async function refreshLicenseStatus(force = false): Promise<LicenseStatus> {
+    const next = force
+      ? await invoke<LicenseStatus>("refresh_license", { force: true })
+      : await invoke<LicenseStatus>("get_license_status");
+    applyLicenseStatus(next);
+    return next;
+  }
+
+  async function refreshAppState(): Promise<void> {
+    try {
+      const next = await refreshLicenseStatus();
+      if (next.canUseApp) await refreshSettings();
+    } catch (error) {
+      licenseStatusLoaded = true;
+      licenseGuardVisible = true;
+      syncVisibleSurface();
+      licenseGateStatus.textContent = "";
+      licenseGateError.textContent = String(error);
     }
   }
 
@@ -468,6 +977,107 @@ async function initSettings(): Promise<void> {
       buttons.forEach((button) => (button.disabled = false));
     }
   }
+
+  licenseForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    licenseGateError.textContent = "";
+    if (!licenseInput.value.trim()) {
+      licenseGateError.textContent = "Enter your license key.";
+      licenseInput.focus();
+      return;
+    }
+
+    licenseActivateButton.disabled = true;
+    licenseForm.setAttribute("aria-busy", "true");
+    licenseGateStatus.textContent = "Checking license…";
+
+    // Start the native invocation before clearing the field. No raw key is
+    // copied into frontend state, storage, logs, or the returned status.
+    const activation = invoke<LicenseStatus>("activate_license", {
+      licenseKey: licenseInput.value.trim(),
+    });
+    licenseInput.value = "";
+
+    try {
+      const next = await activation;
+      applyLicenseStatus(next);
+      if (!next.canUseApp) {
+        licenseGateStatus.textContent = "";
+        licenseGateError.textContent = next.message ?? "That license could not be activated.";
+        licenseInput.focus();
+      } else {
+        await refreshSettings();
+      }
+    } catch (error) {
+      licenseGateStatus.textContent = "";
+      licenseGateError.textContent = String(error);
+      licenseInput.focus();
+    } finally {
+      licenseActivateButton.disabled = false;
+      licenseForm.removeAttribute("aria-busy");
+    }
+  });
+
+  licenseInput.addEventListener("input", () => {
+    licenseGateError.textContent = "";
+  });
+
+  async function openLicenseUrl(url: string): Promise<void> {
+    licenseGateError.textContent = "";
+    try {
+      await openUrl(url);
+    } catch (error) {
+      licenseGateStatus.textContent = "";
+      licenseGateError.textContent = `Could not open your browser: ${String(error)}`;
+    }
+  }
+
+  const licenseUrls: Record<string, string> = {
+    personal: PERSONAL_CHECKOUT_URL,
+    recover: RECOVER_LICENSE_URL,
+  };
+
+  app.querySelectorAll<HTMLAnchorElement>("[data-license-link]").forEach((link) => {
+    const url = licenseUrls[link.dataset.licenseLink ?? ""];
+    if (url) {
+      link.href = url;
+      link.removeAttribute("aria-disabled");
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        resetBusinessCheckout();
+        void openLicenseUrl(url);
+      });
+    } else {
+      link.tabIndex = 0;
+      link.title = "Link coming soon";
+    }
+  });
+
+  businessCheckoutButton.addEventListener("click", () => {
+    const willOpen = businessSeatForm.hidden;
+    businessSeatForm.hidden = !willOpen;
+    businessCheckoutButton.setAttribute("aria-expanded", String(willOpen));
+    licenseGateStatus.textContent = "";
+    licenseGateError.textContent = "";
+    if (willOpen) {
+      businessSeatInput.focus();
+      businessSeatInput.select();
+    }
+  });
+
+  businessSeatForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const seats = Number(businessSeatInput.value);
+    if (!Number.isSafeInteger(seats) || seats < 1 || seats > 999) {
+      licenseGateError.textContent = "Enter a seat count from 1 to 999.";
+      businessSeatInput.focus();
+      return;
+    }
+
+    const checkoutUrl = new URL(BUSINESS_CHECKOUT_URL);
+    checkoutUrl.searchParams.set("quantity", String(seats));
+    void openLicenseUrl(checkoutUrl.toString());
+  });
 
   async function openPermission(kind: "accessibility" | "screen"): Promise<void> {
     if (kind === "accessibility" && permissionGuardVisible) {
@@ -532,13 +1142,67 @@ async function initSettings(): Promise<void> {
 
   app.addEventListener("click", (event) => {
     const target = event.target as HTMLElement;
+    const disabledLicenseLink = target.closest<HTMLAnchorElement>("[data-license-link][aria-disabled='true']");
+    if (disabledLicenseLink) {
+      event.preventDefault();
+      licenseGateStatus.textContent = "Purchasing will be available in the release build.";
+      return;
+    }
     if (target.closest(".login-settings-link")) {
       void invoke("open_login_items_settings");
       return;
     }
     const nav = target.closest<HTMLButtonElement>("[data-settings-view]");
     if (nav) {
-      showSettingsView(nav.dataset.settingsView as "general" | "permissions");
+      showSettingsView(nav.dataset.settingsView as SettingsView);
+      return;
+    }
+    if (target.closest("[data-check-updates]")) {
+      void checkForUpdates(true);
+      return;
+    }
+    if (target.closest("[data-install-update]")) {
+      void installAvailableUpdate();
+      return;
+    }
+    const refreshLicenseButton = target.closest<HTMLButtonElement>("[data-refresh-license]");
+    if (refreshLicenseButton) {
+      refreshLicenseButton.disabled = true;
+      setLicensePanelMessage("Checking license…");
+      void refreshLicenseStatus(true)
+        .then((next) => {
+          if (next.canUseApp) {
+            setLicensePanelMessage(next.message ?? "License is up to date.");
+          }
+        })
+        .catch((error) => setLicensePanelMessage(String(error), true))
+        .finally(() => (refreshLicenseButton.disabled = false));
+      return;
+    }
+    if (target.closest("[data-request-deactivation]")) {
+      deactivationConfirmation.hidden = false;
+      app.querySelector<HTMLButtonElement>("[data-cancel-deactivation]")!.focus();
+      return;
+    }
+    if (target.closest("[data-cancel-deactivation]")) {
+      deactivationConfirmation.hidden = true;
+      app.querySelector<HTMLButtonElement>("[data-request-deactivation]")!.focus();
+      return;
+    }
+    const confirmDeactivationButton = target.closest<HTMLButtonElement>("[data-confirm-deactivation]");
+    if (confirmDeactivationButton) {
+      confirmDeactivationButton.disabled = true;
+      setLicensePanelMessage("Deactivating…");
+      void invoke<LicenseStatus>("deactivate_license")
+        .then((next) => {
+          applyLicenseStatus(next);
+          licenseGateStatus.textContent = "License deactivated on this Mac.";
+        })
+        .catch((error) => {
+          deactivationConfirmation.hidden = false;
+          setLicensePanelMessage(String(error), true);
+        })
+        .finally(() => (confirmDeactivationButton.disabled = false));
       return;
     }
     const appearance = target.closest<HTMLButtonElement>("[data-appearance]");
@@ -580,7 +1244,7 @@ async function initSettings(): Promise<void> {
         .then((next) => {
           applySettings(next);
           showSettingsView("general");
-          void currentWindow.hide();
+          hideSettingsWindow();
         })
         .catch(showActionError)
         .finally(() => (button.disabled = false));
@@ -595,7 +1259,7 @@ async function initSettings(): Promise<void> {
 
       const tabs = Array.from(
         app.querySelectorAll<HTMLButtonElement>("[data-settings-view]"),
-      );
+      ).filter((tab) => !tab.hidden);
       const currentIndex = tabs.indexOf(document.activeElement as HTMLButtonElement);
       if (currentIndex < 0) return;
 
@@ -624,28 +1288,39 @@ async function initSettings(): Promise<void> {
     }
     if (event.key === "Escape" || (event.metaKey && event.key === "w")) {
       event.preventDefault();
-      void currentWindow.hide();
+      if (event.key === "Escape" && !deactivationConfirmation.hidden) {
+        deactivationConfirmation.hidden = true;
+        app.querySelector<HTMLButtonElement>("[data-request-deactivation]")?.focus();
+        return;
+      }
+      hideSettingsWindow();
     }
   });
 
   app.querySelector<HTMLButtonElement>(".settings-close")!.addEventListener(
     "click",
-    () => void currentWindow.hide(),
+    hideSettingsWindow,
   );
   void currentWindow.onCloseRequested((event) => {
     event.preventDefault();
-    void currentWindow.hide();
+    hideSettingsWindow();
   });
   void currentWindow.listen("settings-opened", () => {
     applyAppearance();
-    void refreshSettings();
+    licenseInput.value = "";
+    licenseGateError.textContent = "";
+    void refreshAppState();
+  });
+  void currentWindow.listen<LicenseStatus>("license-status-changed", ({ payload }) => {
+    applyLicenseStatus(payload);
+    if (payload.canUseApp && !settingsResolved) void refreshSettings();
   });
   void currentWindow.listen<PermissionStatus>("permission-status-changed", ({ payload }) => {
     updatePermissionStatus(payload);
     if (settings) settings = { ...settings, ...payload };
   });
   updateAppearanceControls();
-  await refreshSettings();
+  await refreshAppState();
 }
 
 if (currentWindow.label === "settings") {
@@ -1136,9 +1811,9 @@ void currentWindow.listen<MenuResponse>("menu-cache-updated", ({ payload }) => {
   applyResponse(payload);
 });
 
-// The release binary's private live-test flag keeps the palette inspectable
-// while the Computer Use helper briefly becomes the frontmost process. Normal
-// launches retain the click-away behavior below.
+// UI automation test mode keeps the palette inspectable while the test runner
+// briefly becomes the frontmost process. Normal launches retain the
+// click-away behavior below.
 void currentWindow.listen("palette-test-mode", () => {
   paletteTestMode = true;
 });

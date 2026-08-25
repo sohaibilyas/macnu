@@ -6,6 +6,20 @@
   "permissions": [
     "core:default",
     "core:window:allow-hide",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://qoest.lemonsqueezy.com/checkout/buy/12e893f2-c4df-423e-b2b1-b6b7f24bd07d?enabled=2046255"
+        },
+        {
+          "url": "https://qoest.lemonsqueezy.com/checkout/buy/fc6c40ec-376e-4fc5-806b-830a56ab3790*"
+        },
+        {
+          "url": "https://app.lemonsqueezy.com/my-orders"
+        }
+      ]
+    }
   ]
 }

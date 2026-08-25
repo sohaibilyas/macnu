@@ -3,6 +3,7 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 import ScreenCaptureKit
+import Security
 import ServiceManagement
 
 private struct MenuWindow {
@@ -124,6 +125,108 @@ private let accessibilityCatalogQueue: OperationQueue = {
 private let diagnosticsEnabled = ProcessInfo.processInfo.environment[
     "MACNU_DIAGNOSTICS"
 ] == "1" || ProcessInfo.processInfo.arguments.contains("--diagnostics")
+
+// License credentials and the installation identifier are generic-password
+// items in the encrypted, file-based login Keychain. Its application ACL is
+// tied to Macnu's signing requirement. Nothing here is bridged to WebKit; Rust
+// exposes only a redacted status. We intentionally do not opt into the Data
+// Protection Keychain, which requires provisioning-profile access groups that
+// a directly distributed Developer ID app does not have.
+private let licensingKeychainService = "com.qoest.macnu.licensing.v1"
+private let installationIdentifierAccount = "installation-id"
+private let licenseRecordAccount = "license-record"
+private let maximumLicenseRecordBytes = 64 * 1024
+private let installationIdentifierLock = NSLock()
+
+private func keychainQuery(account: String) -> [String: Any] {
+    [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: licensingKeychainService,
+        kSecAttrAccount as String: account
+    ]
+}
+
+private func keychainData(account: String) -> Data? {
+    var query = keychainQuery(account: account)
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    query[kSecReturnData as String] = true
+    var item: CFTypeRef?
+    guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else {
+        return nil
+    }
+    return item as? Data
+}
+
+private func keychainItemStatus(account: String) -> Int32 {
+    var query = keychainQuery(account: account)
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    let status = SecItemCopyMatching(query as CFDictionary, nil)
+    if status == errSecSuccess { return 0 }
+    if status == errSecItemNotFound { return 1 }
+    return 2
+}
+
+@discardableResult
+private func saveKeychainData(_ data: Data, account: String) -> Bool {
+    let query = keychainQuery(account: account)
+    let attributes: [String: Any] = [
+        kSecValueData as String: data
+    ]
+    let updateStatus = SecItemUpdate(
+        query as CFDictionary,
+        attributes as CFDictionary
+    )
+    if updateStatus == errSecSuccess {
+        return true
+    }
+    guard updateStatus == errSecItemNotFound else { return false }
+
+    var newItem = query
+    for (key, value) in attributes {
+        newItem[key] = value
+    }
+    return SecItemAdd(newItem as CFDictionary, nil) == errSecSuccess
+}
+
+@discardableResult
+private func deleteKeychainData(account: String) -> Bool {
+    let status = SecItemDelete(keychainQuery(account: account) as CFDictionary)
+    return status == errSecSuccess || status == errSecItemNotFound
+}
+
+func normalizedInstallationIdentifier(_ candidate: String?) -> String? {
+    guard let candidate,
+          let identifier = UUID(uuidString: candidate) else {
+        return nil
+    }
+    return identifier.uuidString.lowercased()
+}
+
+private func installationIdentifier() -> String? {
+    installationIdentifierLock.lock()
+    defer { installationIdentifierLock.unlock() }
+
+    if let data = keychainData(account: installationIdentifierAccount),
+       let stored = String(data: data, encoding: .utf8),
+       let identifier = normalizedInstallationIdentifier(stored) {
+        return identifier
+    }
+
+    _ = deleteKeychainData(account: installationIdentifierAccount)
+    let identifier = UUID().uuidString.lowercased()
+    var newItem = keychainQuery(account: installationIdentifierAccount)
+    newItem[kSecValueData as String] = Data(identifier.utf8)
+    let status = SecItemAdd(newItem as CFDictionary, nil)
+    guard status == errSecSuccess || status == errSecDuplicateItem else {
+        return nil
+    }
+    // Re-read after insertion so concurrent callers converge on the same ID.
+    guard let data = keychainData(account: installationIdentifierAccount),
+          let stored = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    return normalizedInstallationIdentifier(stored)
+}
 
 private struct CaptureResponse: Codable {
     let icons: [MenuIcon]
@@ -2104,6 +2207,45 @@ public func macnuCopyMenuIconsJSON() -> UnsafeMutablePointer<CChar>? {
 @_cdecl("macnu_free_native_string")
 public func macnuFreeNativeString(_ pointer: UnsafeMutablePointer<CChar>?) {
     free(pointer)
+}
+
+@_cdecl("macnu_copy_installation_id")
+public func macnuCopyInstallationID() -> UnsafeMutablePointer<CChar>? {
+    guard let identifier = installationIdentifier() else { return nil }
+    return strdup(identifier)
+}
+
+@_cdecl("macnu_copy_license_record_json")
+public func macnuCopyLicenseRecordJSON() -> UnsafeMutablePointer<CChar>? {
+    guard let data = keychainData(account: licenseRecordAccount),
+          data.count <= maximumLicenseRecordBytes,
+          let record = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    return strdup(record)
+}
+
+@_cdecl("macnu_license_record_status")
+public func macnuLicenseRecordStatus() -> Int32 {
+    keychainItemStatus(account: licenseRecordAccount)
+}
+
+@_cdecl("macnu_save_license_record_json")
+public func macnuSaveLicenseRecordJSON(
+    _ recordJSON: UnsafePointer<CChar>?
+) -> Int32 {
+    guard let recordJSON else { return 1 }
+    let record = String(cString: recordJSON)
+    let data = Data(record.utf8)
+    guard !data.isEmpty, data.count <= maximumLicenseRecordBytes else {
+        return 1
+    }
+    return saveKeychainData(data, account: licenseRecordAccount) ? 0 : 2
+}
+
+@_cdecl("macnu_delete_license_record")
+public func macnuDeleteLicenseRecord() -> Int32 {
+    deleteKeychainData(account: licenseRecordAccount) ? 0 : 2
 }
 
 @_cdecl("macnu_active_display_id")

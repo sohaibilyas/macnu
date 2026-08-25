@@ -634,6 +634,17 @@ footer kbd {
   background: var(--control-surface);
 }
 
+.source-build-notice {
+  margin-top: 11px;
+  padding: 8px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  color: var(--text-faint);
+  background: var(--sidebar-surface);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
 .setting-row {
   display: grid;
   min-height: 78px;
@@ -938,6 +949,511 @@ footer kbd {
   align-items: center;
   gap: 7px;
   margin-top: 11px;
+}
+
+.update-card {
+  display: grid;
+  min-height: 86px;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 13px;
+  border: 1px solid var(--control-border);
+  border-radius: 15px;
+  background: var(--control-surface);
+}
+
+.update-card.available {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+}
+
+.update-card.current .update-state-mark {
+  color: var(--success-text);
+  background: var(--success-surface);
+}
+
+.update-card.error .update-state-mark {
+  color: var(--danger-text);
+}
+
+.update-state-mark {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid var(--control-border);
+  border-radius: 12px;
+  color: var(--accent-text);
+  background: var(--surface-raised);
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.update-card.checking .update-state-mark {
+  animation: spin 0.9s linear infinite;
+}
+
+.update-state-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.update-state-copy strong {
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 630;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-state-copy small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.update-check {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.update-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.update-progress progress {
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 99px;
+  background: var(--control-surface);
+  appearance: none;
+}
+
+.update-progress progress::-webkit-progress-bar {
+  border-radius: 99px;
+  background: var(--control-surface);
+}
+
+.update-progress progress::-webkit-progress-value {
+  border-radius: 99px;
+  background: var(--accent-muted);
+  transition: width 120ms ease;
+}
+
+.update-progress span {
+  min-width: 112px;
+  color: var(--text-tertiary);
+  font-size: 9.5px;
+  text-align: right;
+}
+
+.update-notes {
+  max-height: 94px;
+  margin-top: 12px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--divider);
+  border-radius: 11px;
+  background: var(--sidebar-surface);
+  user-select: text;
+}
+
+.update-notes strong {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.update-notes p {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.update-actions {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 11px;
+}
+
+.update-install {
+  flex: 0 0 auto;
+  margin: 0;
+  border-color: #5267cf;
+  color: white;
+  background: #596ed7;
+  font-weight: 650;
+}
+
+.update-install:hover:not(:disabled) {
+  background: #6277df;
+}
+
+.update-panel-status {
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
+.update-panel-status.error {
+  color: var(--danger-text);
+}
+
+.license-gate {
+  display: grid;
+  height: 100%;
+  min-height: 0;
+  padding: 24px 30px 30px;
+  place-items: center;
+}
+
+.license-gate-simple {
+  display: flex;
+  width: min(410px, 100%);
+  align-items: center;
+  flex-direction: column;
+  text-align: center;
+}
+
+.license-gate-simple > img {
+  display: block;
+  width: 54px;
+  height: 54px;
+  margin-bottom: 15px;
+  object-fit: contain;
+  filter: drop-shadow(0 8px 14px var(--window-shadow));
+}
+
+.license-activation-form {
+  width: min(390px, 100%);
+  margin-top: 20px;
+  text-align: left;
+}
+
+.license-activation-form > label {
+  display: block;
+  margin: 0 0 7px 2px;
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.license-key-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.license-key-control input {
+  width: 100%;
+  min-width: 0;
+  height: 43px;
+  padding: 0 13px;
+  border: 1px solid var(--control-border);
+  border-radius: 11px;
+  outline: 0;
+  color: var(--text-strong);
+  background: var(--control-surface);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 11px;
+  letter-spacing: 0.025em;
+  user-select: text;
+}
+
+.license-key-control input::placeholder {
+  color: var(--text-faint);
+}
+
+.license-key-control input:focus {
+  border-color: var(--focus-ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus-ring) 24%, transparent);
+}
+
+.license-key-control .primary-action {
+  min-width: 92px;
+  height: 43px;
+  margin: 0;
+  border-color: #5267cf;
+  color: white;
+  background: #596ed7;
+  box-shadow: 0 4px 12px rgba(48, 64, 145, 0.2);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.license-key-control .primary-action:hover {
+  background: #6277df;
+}
+
+.license-gate-status,
+.license-gate-error {
+  width: 100%;
+  min-height: 18px;
+  padding-top: 8px;
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.license-gate-status {
+  color: var(--text-tertiary);
+}
+
+.license-gate-error {
+  padding-top: 2px;
+  color: var(--danger-text);
+}
+
+.license-help-links {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.license-help-links a,
+.license-help-links button {
+  min-height: 28px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--accent-text);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-decoration: none;
+}
+
+.license-help-links a:hover:not([aria-disabled="true"]),
+.license-help-links a:focus-visible,
+.license-help-links button:hover,
+.license-help-links button:focus-visible {
+  background: var(--control-hover);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.license-help-links a[aria-disabled="true"] {
+  color: var(--text-faint);
+  cursor: default;
+}
+
+.business-seat-picker {
+  display: grid;
+  width: min(330px, 100%);
+  grid-template-columns: auto 72px auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7px;
+  padding: 9px 10px;
+  border: 1px solid var(--control-border);
+  border-radius: 11px;
+  background: var(--control-surface);
+  text-align: left;
+}
+
+.business-seat-picker label {
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.business-seat-picker input {
+  width: 72px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--control-border);
+  border-radius: 8px;
+  outline: 0;
+  color: var(--text-strong);
+  background: var(--surface-raised);
+  font: inherit;
+  text-align: center;
+}
+
+.business-seat-picker input:focus {
+  border-color: var(--focus-ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus-ring) 24%, transparent);
+}
+
+.business-seat-picker .secondary-action {
+  min-height: 30px;
+  margin: 0;
+  padding: 0 12px;
+}
+
+.business-seat-picker small {
+  grid-column: 1 / -1;
+  color: var(--text-tertiary);
+  font-size: 9.5px;
+  text-align: center;
+}
+
+.license-summary {
+  margin-top: 18px;
+  overflow: hidden;
+  border: 1px solid var(--control-border);
+  border-radius: 16px;
+  background: var(--control-surface);
+}
+
+.license-summary-heading {
+  display: grid;
+  min-height: 78px;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+  padding: 13px 15px;
+}
+
+.license-state-mark {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 12px;
+  color: var(--success-text);
+  background: var(--success-surface);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.license-summary-heading > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.license-summary-heading strong {
+  font-size: 12px;
+  font-weight: 630;
+}
+
+.license-summary-heading small {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.license-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+  border-top: 1px solid var(--divider);
+}
+
+.license-facts > div {
+  display: flex;
+  min-width: 0;
+  min-height: 52px;
+  justify-content: center;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 15px;
+}
+
+.license-facts > div + div {
+  border-left: 1px solid var(--divider);
+}
+
+.license-facts:has(> [hidden]) > div:not([hidden]) {
+  grid-column: 1 / -1;
+}
+
+.license-facts dt {
+  color: var(--text-faint);
+  font-size: 9px;
+}
+
+.license-facts dd {
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.license-settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.license-settings-actions button,
+.license-deactivate-confirmation button {
+  min-height: 31px;
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 9px;
+  font-size: 10px;
+}
+
+.danger-action {
+  border: 1px solid color-mix(in srgb, var(--danger-text) 32%, transparent);
+  color: var(--danger-text);
+  background: transparent;
+  cursor: pointer;
+}
+
+.danger-action:hover {
+  background: color-mix(in srgb, var(--danger-text) 9%, transparent);
+}
+
+.license-panel-status {
+  min-height: 24px;
+  padding: 7px 2px 0;
+  color: var(--accent-muted);
+  font-size: 10px;
+}
+
+.license-panel-status.error {
+  color: var(--danger-text);
+}
+
+.license-deactivate-confirmation {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px 9px 13px;
+  border: 1px solid color-mix(in srgb, var(--danger-text) 25%, transparent);
+  border-radius: 12px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--danger-text) 6%, transparent);
+  font-size: 10px;
+}
+
+.license-deactivate-confirmation > div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
 }
 
 .onboarding {

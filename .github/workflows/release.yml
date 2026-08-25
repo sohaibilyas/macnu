@@ -1,0 +1,626 @@
+name: Build Macnu release draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable tag to build, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macnu-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate-dispatch:
+    name: Validate release request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Require main and a stable tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must be strict stable vX.Y.Z." >&2
+            exit 1
+          fi
+
+  build-macos:
+    name: Build, sign, notarize, and verify Apple assets
+    needs: validate-dispatch
+    runs-on: macos-26
+    timeout-minutes: 75
+    environment: release-apple
+    permissions:
+      contents: read
+    outputs:
+      tag_commit: ${{ steps.provenance.outputs.tag_commit }}
+      dmg_sha256: ${{ steps.unsigned_digests.outputs.dmg_sha256 }}
+      archive_sha256: ${{ steps.unsigned_digests.outputs.archive_sha256 }}
+    env:
+      CI: "true"
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      MACNU_RELEASE_TAG: ${{ inputs.tag }}
+      MACNU_REQUIRE_CLEAN: "1"
+      RUSTUP_TOOLCHAIN: 1.97.1
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate protected tag provenance
+        id: provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git cat-file -t "refs/tags/$MACNU_RELEASE_TAG")" = "tag"
+          TAG_COMMIT="$(git rev-parse "refs/tags/$MACNU_RELEASE_TAG^{commit}")"
+          MAIN_COMMIT="$(git rev-parse refs/remotes/origin/main)"
+          test "$(git rev-parse HEAD)" = "$TAG_COMMIT"
+          git merge-base --is-ancestor "$TAG_COMMIT" "$MAIN_COMMIT"
+          printf 'tag_commit=%s\n' "$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Set up locked Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUSTUP_TOOLCHAIN"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+          cargo --version
+          xcodebuild -version
+
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm --prefix services/lemon-webhook ci --no-audit --no-fund
+
+      - name: Run release gates before exposing Apple secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run release:preflight -- --tag "$MACNU_RELEASE_TAG" --require-clean
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo fmt --manifest-path tools/release-verifier/Cargo.toml -- --check
+          cargo fmt --manifest-path vendor/tauri-plugin-updater/Cargo.toml -- --check
+          npm run build
+          npm run test:rust:source
+          npm run test:rust:official
+          npm run test:release-verifier
+          npm run test:release-shell
+          npm run test:vendor-updater
+          swift test --package-path src-tauri/native
+          npm --prefix services/lemon-webhook run check
+          npm --prefix services/lemon-webhook run dry-run
+          git diff --check
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Import ephemeral Apple signing credentials
+        shell: bash
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEY_ID: ${{ vars.APPLE_API_KEY }}
+          APPLE_TEAM_ID: UVYJU3MY6G
+        run: |
+          set -euo pipefail
+          : "${APPLE_API_PRIVATE_KEY:?Missing APPLE_API_PRIVATE_KEY secret}"
+          : "${APPLE_CERTIFICATE_BASE64:?Missing APPLE_CERTIFICATE secret}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?Missing APPLE_CERTIFICATE_PASSWORD secret}"
+          : "${APPLE_KEY_ID:?Missing APPLE_API_KEY environment variable}"
+
+          umask 077
+          CERTIFICATE_PATH="$RUNNER_TEMP/macnu-developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/macnu-signing.keychain-db"
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_KEY_ID}.p8"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          {
+            echo "APPLE_API_KEY_PATH=$API_KEY_PATH"
+            echo "MACNU_EPHEMERAL_CERTIFICATE=$CERTIFICATE_PATH"
+            echo "MACNU_EPHEMERAL_KEYCHAIN=$KEYCHAIN_PATH"
+          } >> "$GITHUB_ENV"
+
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
+          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$API_KEY_PATH"
+          grep -q '^-----BEGIN PRIVATE KEY-----' "$API_KEY_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+          IDENTITIES="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")"
+          IDENTITY_COUNT="$(printf '%s\n' "$IDENTITIES" | grep -c '"Developer ID Application:' || true)"
+          if [ "$IDENTITY_COUNT" -ne 1 ]; then
+            echo "Expected exactly one Developer ID Application identity." >&2
+            exit 1
+          fi
+          SIGNING_IDENTITY="$(printf '%s\n' "$IDENTITIES" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p')"
+          case "$SIGNING_IDENTITY" in
+            *"($APPLE_TEAM_ID)") ;;
+            *) echo "Developer ID certificate belongs to the wrong Apple team." >&2; exit 1 ;;
+          esac
+          printf 'APPLE_SIGNING_IDENTITY=%s\n' "$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build and verify unsigned official updater archive
+        shell: bash
+        env:
+          APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+          MACNU_SKIP_FRONTEND_BUILD: "1"
+        run: |
+          set -euo pipefail
+          : "${APPLE_API_ISSUER:?Missing APPLE_API_ISSUER environment variable}"
+          : "${APPLE_API_KEY:?Missing APPLE_API_KEY environment variable}"
+          npm run build:official
+
+      - name: Remove ephemeral Apple signing credentials
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          KEYCHAIN_PATH="${MACNU_EPHEMERAL_KEYCHAIN:-$RUNNER_TEMP/macnu-signing.keychain-db}"
+          CERTIFICATE_PATH="${MACNU_EPHEMERAL_CERTIFICATE:-$RUNNER_TEMP/macnu-developer-id.p12}"
+          if [ -e "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
+          rm -f "$CERTIFICATE_PATH"
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8
+          {
+            echo "APPLE_API_KEY_PATH="
+            echo "APPLE_SIGNING_IDENTITY="
+            echo "MACNU_EPHEMERAL_CERTIFICATE="
+            echo "MACNU_EPHEMERAL_KEYCHAIN="
+          } >> "$GITHUB_ENV"
+
+      - name: Stage independently hashed unsigned assets
+        id: unsigned_digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${MACNU_RELEASE_TAG#v}"
+          BUNDLE_ROOT="$GITHUB_WORKSPACE/src-tauri/target/universal-apple-darwin/release/bundle"
+          UNSIGNED_DIR="$RUNNER_TEMP/macnu-unsigned"
+          mkdir "$UNSIGNED_DIR"
+          install -m 0644 "$BUNDLE_ROOT/dmg/Macnu_${VERSION}_universal.dmg" "$UNSIGNED_DIR/"
+          install -m 0644 "$BUNDLE_ROOT/macos/Macnu.app.tar.gz" "$UNSIGNED_DIR/"
+          test "$(find "$UNSIGNED_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 2
+          {
+            printf 'dmg_sha256=%s\n' "$(shasum -a 256 "$UNSIGNED_DIR/Macnu_${VERSION}_universal.dmg" | awk '{print $1}')"
+            printf 'archive_sha256=%s\n' "$(shasum -a 256 "$UNSIGNED_DIR/Macnu.app.tar.gz" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified unsigned assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: macnu-${{ inputs.tag }}-unsigned
+          path: ${{ runner.temp }}/macnu-unsigned/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: false
+
+      - name: Upload archive-only signing input
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: macnu-${{ inputs.tag }}-signing-input
+          path: ${{ runner.temp }}/macnu-unsigned/Macnu.app.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: false
+
+  sign-updater:
+    name: Sign updater on a fresh isolated runner
+    needs: build-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release-updater
+    permissions:
+      contents: read
+    outputs:
+      signature_sha256: ${{ steps.signature_digest.outputs.signature_sha256 }}
+
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Download preverified archive-only signing input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: macnu-${{ inputs.tag }}-signing-input
+          path: ${{ runner.temp }}/macnu-signing-input
+
+      - name: Verify updater archive against build-job digest
+        shell: bash
+        env:
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.build-macos.outputs.archive_sha256 }}
+        run: |
+          set -euo pipefail
+          INPUT_DIR="$RUNNER_TEMP/macnu-signing-input"
+          test "$(find "$INPUT_DIR" -maxdepth 1 -type f | wc -l | tr -d " ")" -eq 1
+          test "$(sha256sum "$INPUT_DIR/Macnu.app.tar.gz" | awk "{print \$1}")" = "$EXPECTED_ARCHIVE_SHA256"
+
+      - name: Provision integrity-pinned Tauri signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIGNER_ROOT="$RUNNER_TEMP/tauri-signer"
+          mkdir -p "$SIGNER_ROOT/node_modules/@tauri-apps/cli"
+          mkdir -p "$SIGNER_ROOT/node_modules/@tauri-apps/cli-linux-x64-gnu"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "$SIGNER_ROOT/cli.tgz" \
+            'https://registry.npmjs.org/@tauri-apps/cli/-/cli-2.11.4.tgz'
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "$SIGNER_ROOT/cli-linux-x64-gnu.tgz" \
+            'https://registry.npmjs.org/@tauri-apps/cli-linux-x64-gnu/-/cli-linux-x64-gnu-2.11.4.tgz'
+
+          verify_sri() {
+            FILE="$1"
+            EXPECTED="$2"
+            ACTUAL="sha512-$(openssl dgst -sha512 -binary "$FILE" | openssl base64 -A)"
+            test "$ACTUAL" = "$EXPECTED"
+          }
+          verify_sri \
+            "$SIGNER_ROOT/cli.tgz" \
+            'sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ=='
+          verify_sri \
+            "$SIGNER_ROOT/cli-linux-x64-gnu.tgz" \
+            'sha512-2VRNWl84FOH0m2giiDkO2h0QXlcMJeX+zJDpI5kDIQAx6s+geF3v48F4DXfJez4GS/FdoDGnPnw1C2iYGbQ7bQ=='
+
+          tar -xzf "$SIGNER_ROOT/cli.tgz" --strip-components=1 \
+            -C "$SIGNER_ROOT/node_modules/@tauri-apps/cli"
+          tar -xzf "$SIGNER_ROOT/cli-linux-x64-gnu.tgz" --strip-components=1 \
+            -C "$SIGNER_ROOT/node_modules/@tauri-apps/cli-linux-x64-gnu"
+          PINNED_SIGNER="$SIGNER_ROOT/node_modules/@tauri-apps/cli/tauri.js"
+          test "$(node "$PINNED_SIGNER" --version)" = "tauri-cli 2.11.4"
+          printf 'MACNU_PINNED_SIGNER=%s\n' "$PINNED_SIGNER" >> "$GITHUB_ENV"
+
+      - name: Sign only the digest-verified updater archive
+        shell: bash
+        env:
+          UPDATER_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          UPDATER_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${UPDATER_PRIVATE_KEY:?Missing TAURI_SIGNING_PRIVATE_KEY secret}"
+          : "${UPDATER_PRIVATE_KEY_PASSWORD:?Missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret}"
+          ARCHIVE_PATH="$RUNNER_TEMP/macnu-signing-input/Macnu.app.tar.gz"
+          SIGNATURE_PATH="$ARCHIVE_PATH.sig"
+          test ! -e "$SIGNATURE_PATH"
+          updater_private_key="$UPDATER_PRIVATE_KEY"
+          updater_private_key_password="$UPDATER_PRIVATE_KEY_PASSWORD"
+          unset UPDATER_PRIVATE_KEY
+          unset UPDATER_PRIVATE_KEY_PASSWORD
+          TAURI_SIGNING_PRIVATE_KEY="$updater_private_key" \
+            TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$updater_private_key_password" \
+            node "$MACNU_PINNED_SIGNER" signer sign "$ARCHIVE_PATH" >/dev/null
+          unset updater_private_key
+          unset updater_private_key_password
+          test -s "$SIGNATURE_PATH"
+
+      - name: Record independent signature digest
+        id: signature_digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIGNATURE_PATH="$RUNNER_TEMP/macnu-signing-input/Macnu.app.tar.gz.sig"
+          printf 'signature_sha256=%s\n' "$(sha256sum "$SIGNATURE_PATH" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload isolated updater signature
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: macnu-${{ inputs.tag }}-signature
+          path: ${{ runner.temp }}/macnu-signing-input/Macnu.app.tar.gz.sig
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: false
+
+  finalize-release:
+    name: Verify and assemble release payload
+    needs: [build-macos, sign-updater]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      dmg_sha256: ${{ steps.release_digests.outputs.dmg_sha256 }}
+      archive_sha256: ${{ steps.release_digests.outputs.archive_sha256 }}
+      signature_sha256: ${{ steps.release_digests.outputs.signature_sha256 }}
+      manifest_sha256: ${{ steps.release_digests.outputs.manifest_sha256 }}
+      checksums_sha256: ${{ steps.release_digests.outputs.checksums_sha256 }}
+
+    steps:
+      - name: Check out the tagged verifier source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Recheck tag provenance
+        shell: bash
+        env:
+          EXPECTED_TAG_COMMIT: ${{ needs.build-macos.outputs.tag_commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$EXPECTED_TAG_COMMIT"
+          git merge-base --is-ancestor "$EXPECTED_TAG_COMMIT" refs/remotes/origin/main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24.18.0
+          package-manager-cache: false
+
+      - name: Set up locked Rust toolchain
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: 1.97.1
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUSTUP_TOOLCHAIN"
+
+      - name: Download unsigned assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: macnu-${{ inputs.tag }}-unsigned
+          path: ${{ runner.temp }}/macnu-final-input
+
+      - name: Download isolated signature
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: macnu-${{ inputs.tag }}-signature
+          path: ${{ runner.temp }}/macnu-final-input
+
+      - name: Verify signature and assemble final payload
+        id: release_digests
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_DMG_SHA256: ${{ needs.build-macos.outputs.dmg_sha256 }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.build-macos.outputs.archive_sha256 }}
+          EXPECTED_SIGNATURE_SHA256: ${{ needs.sign-updater.outputs.signature_sha256 }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          INPUT_DIR="$RUNNER_TEMP/macnu-final-input"
+          RELEASE_DIR="$RUNNER_TEMP/macnu-release"
+          DMG_NAME="Macnu_${VERSION}_universal.dmg"
+          test "$(find "$INPUT_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 3
+          test "$(sha256sum "$INPUT_DIR/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_DMG_SHA256"
+          test "$(sha256sum "$INPUT_DIR/Macnu.app.tar.gz" | awk '{print $1}')" = "$EXPECTED_ARCHIVE_SHA256"
+          test "$(sha256sum "$INPUT_DIR/Macnu.app.tar.gz.sig" | awk '{print $1}')" = "$EXPECTED_SIGNATURE_SHA256"
+
+          cargo run \
+            --quiet \
+            --locked \
+            --release \
+            --manifest-path tools/release-verifier/Cargo.toml \
+            -- \
+            --signature-only \
+            "$INPUT_DIR/Macnu.app.tar.gz" \
+            "$INPUT_DIR/Macnu.app.tar.gz.sig"
+
+          mkdir "$RELEASE_DIR"
+          install -m 0644 "$INPUT_DIR/$DMG_NAME" "$RELEASE_DIR/$DMG_NAME"
+          install -m 0644 "$INPUT_DIR/Macnu.app.tar.gz" "$RELEASE_DIR/Macnu.app.tar.gz"
+          install -m 0644 "$INPUT_DIR/Macnu.app.tar.gz.sig" "$RELEASE_DIR/Macnu.app.tar.gz.sig"
+          node scripts/generate-update-manifest.mjs \
+            "$VERSION" \
+            "$RELEASE_DIR/Macnu.app.tar.gz.sig" \
+            "$RELEASE_DIR/latest.json"
+          node scripts/verify-update-manifest.mjs \
+            "$VERSION" \
+            "$RELEASE_DIR/Macnu.app.tar.gz.sig" \
+            "$RELEASE_DIR/latest.json"
+          (
+            cd "$RELEASE_DIR"
+            sha256sum \
+              "$DMG_NAME" \
+              Macnu.app.tar.gz \
+              Macnu.app.tar.gz.sig \
+              latest.json > SHA256SUMS.txt
+          )
+          test "$(find "$RELEASE_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 5
+          {
+            printf 'dmg_sha256=%s\n' "$(sha256sum "$RELEASE_DIR/$DMG_NAME" | awk '{print $1}')"
+            printf 'archive_sha256=%s\n' "$(sha256sum "$RELEASE_DIR/Macnu.app.tar.gz" | awk '{print $1}')"
+            printf 'signature_sha256=%s\n' "$(sha256sum "$RELEASE_DIR/Macnu.app.tar.gz.sig" | awk '{print $1}')"
+            printf 'manifest_sha256=%s\n' "$(sha256sum "$RELEASE_DIR/latest.json" | awk '{print $1}')"
+            printf 'checksums_sha256=%s\n' "$(sha256sum "$RELEASE_DIR/SHA256SUMS.txt" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload final verified release payload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: macnu-${{ inputs.tag }}-release
+          path: ${{ runner.temp }}/macnu-release/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          include-hidden-files: false
+
+  create-draft:
+    name: Create byte-verified GitHub draft
+    needs: [build-macos, finalize-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release-draft
+    permissions:
+      contents: write
+
+    steps:
+      - name: Re-resolve protected tag
+        shell: bash
+        env:
+          EXPECTED_TAG_COMMIT: ${{ needs.build-macos.outputs.tag_commit }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_TAG_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          TAG_REFERENCE="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          test "$(jq -r '.object.type' <<< "$TAG_REFERENCE")" = "tag"
+          TAG_OBJECT_SHA="$(jq -r '.object.sha' <<< "$TAG_REFERENCE")"
+          [[ "$TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          TAG_OBJECT="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA")"
+          test "$(jq -r '.object.type' <<< "$TAG_OBJECT")" = "commit"
+          test "$(jq -r '.object.sha' <<< "$TAG_OBJECT")" = "$EXPECTED_TAG_COMMIT"
+
+      - name: Download final verified release payload
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: macnu-${{ inputs.tag }}-release
+          path: ${{ runner.temp }}/macnu-release
+
+      - name: Recheck release payload against independent digests
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_DIR: ${{ runner.temp }}/macnu-release
+          EXPECTED_DMG_SHA256: ${{ needs.finalize-release.outputs.dmg_sha256 }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.finalize-release.outputs.archive_sha256 }}
+          EXPECTED_SIGNATURE_SHA256: ${{ needs.finalize-release.outputs.signature_sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.finalize-release.outputs.manifest_sha256 }}
+          EXPECTED_CHECKSUMS_SHA256: ${{ needs.finalize-release.outputs.checksums_sha256 }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          DMG_NAME="Macnu_${VERSION}_universal.dmg"
+          test "$(find "$RELEASE_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 5
+          verify_digest() {
+            EXPECTED="$1"
+            FILE="$2"
+            [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]
+            test "$(sha256sum "$FILE" | awk '{print $1}')" = "$EXPECTED"
+          }
+          verify_digest "$EXPECTED_DMG_SHA256" "$RELEASE_DIR/$DMG_NAME"
+          verify_digest "$EXPECTED_ARCHIVE_SHA256" "$RELEASE_DIR/Macnu.app.tar.gz"
+          verify_digest "$EXPECTED_SIGNATURE_SHA256" "$RELEASE_DIR/Macnu.app.tar.gz.sig"
+          verify_digest "$EXPECTED_MANIFEST_SHA256" "$RELEASE_DIR/latest.json"
+          verify_digest "$EXPECTED_CHECKSUMS_SHA256" "$RELEASE_DIR/SHA256SUMS.txt"
+          (
+            cd "$RELEASE_DIR"
+            sha256sum --check SHA256SUMS.txt
+          )
+
+          EXPECTED_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/Macnu.app.tar.gz"
+          SIGNATURE="$(tr -d '\r\n' < "$RELEASE_DIR/Macnu.app.tar.gz.sig")"
+          jq --exit-status \
+            --arg version "$VERSION" \
+            --arg url "$EXPECTED_URL" \
+            --arg signature "$SIGNATURE" \
+            '
+              (keys | sort) == ["platforms", "pub_date", "version"] and
+              .version == $version and
+              (.pub_date | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$")) and
+              (.platforms | keys) == ["macos-universal-official-stable"] and
+              (.platforms["macos-universal-official-stable"] | keys | sort) == ["signature", "url"] and
+              .platforms["macos-universal-official-stable"].url == $url and
+              .platforms["macos-universal-official-stable"].signature == $signature
+            ' \
+            "$RELEASE_DIR/latest.json"
+
+      - name: Create and re-download the draft release
+        shell: bash
+        env:
+          EXPECTED_TAG_COMMIT: ${{ needs.build-macos.outputs.tag_commit }}
+          EXPECTED_DMG_SHA256: ${{ needs.finalize-release.outputs.dmg_sha256 }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.finalize-release.outputs.archive_sha256 }}
+          EXPECTED_SIGNATURE_SHA256: ${{ needs.finalize-release.outputs.signature_sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.finalize-release.outputs.manifest_sha256 }}
+          EXPECTED_CHECKSUMS_SHA256: ${{ needs.finalize-release.outputs.checksums_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIR: ${{ runner.temp }}/macnu-release
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          resolve_tag_commit() {
+            TAG_REFERENCE="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+            test "$(jq -r '.object.type' <<< "$TAG_REFERENCE")" = "tag"
+            TAG_OBJECT_SHA="$(jq -r '.object.sha' <<< "$TAG_REFERENCE")"
+            TAG_OBJECT="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA")"
+            test "$(jq -r '.object.type' <<< "$TAG_OBJECT")" = "commit"
+            jq -r '.object.sha' <<< "$TAG_OBJECT"
+          }
+          test "$(resolve_tag_commit)" = "$EXPECTED_TAG_COMMIT"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A GitHub release already exists for $RELEASE_TAG." >&2
+            exit 1
+          fi
+
+          VERSION="${RELEASE_TAG#v}"
+          DMG_NAME="Macnu_${VERSION}_universal.dmg"
+          gh release create "$RELEASE_TAG" \
+            "$RELEASE_DIR/$DMG_NAME" \
+            "$RELEASE_DIR/Macnu.app.tar.gz" \
+            "$RELEASE_DIR/Macnu.app.tar.gz.sig" \
+            "$RELEASE_DIR/latest.json" \
+            "$RELEASE_DIR/SHA256SUMS.txt" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "Macnu $VERSION" \
+            --generate-notes
+
+          RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+          test "$(jq -r '.draft' <<< "$RELEASE_JSON")" = "true"
+          test "$(jq -r '.assets | length' <<< "$RELEASE_JSON")" -eq 5
+          test "$(jq -r '[.assets[].name] | sort | join("|")' <<< "$RELEASE_JSON")" = \
+            "Macnu.app.tar.gz|Macnu.app.tar.gz.sig|$DMG_NAME|SHA256SUMS.txt|latest.json"
+
+          DRAFT_CHECK="$RUNNER_TEMP/macnu-draft-check"
+          mkdir "$DRAFT_CHECK"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$DRAFT_CHECK"
+          test "$(find "$DRAFT_CHECK" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 5
+          test "$(sha256sum "$DRAFT_CHECK/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_DMG_SHA256"
+          test "$(sha256sum "$DRAFT_CHECK/Macnu.app.tar.gz" | awk '{print $1}')" = "$EXPECTED_ARCHIVE_SHA256"
+          test "$(sha256sum "$DRAFT_CHECK/Macnu.app.tar.gz.sig" | awk '{print $1}')" = "$EXPECTED_SIGNATURE_SHA256"
+          test "$(sha256sum "$DRAFT_CHECK/latest.json" | awk '{print $1}')" = "$EXPECTED_MANIFEST_SHA256"
+          test "$(sha256sum "$DRAFT_CHECK/SHA256SUMS.txt" | awk '{print $1}')" = "$EXPECTED_CHECKSUMS_SHA256"
+          test "$(resolve_tag_commit)" = "$EXPECTED_TAG_COMMIT"

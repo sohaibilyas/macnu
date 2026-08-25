@@ -50,18 +50,27 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "img-src": "'self' data:",
+        "style-src": "'self'",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "frame-src": "'none'"
+      }
     }
   },
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
+    "icon": ["icons/icon.icns"],
     "category": "Utility",
     "shortDescription": "A searchable launcher for crowded Mac menu bars",
     "longDescription": "Macnu finds macOS status items—including icons hidden behind the notch—and opens their original menus from a fast search palette.",
     "macOS": {
       "minimumSystemVersion": "14.0",
-      "signingIdentity": "-",
       "infoPlist": "Info.plist"
     }
   }

@@ -15,11 +15,22 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:app": "tauri build --bundles app && ./scripts/sign-app.sh",
-    "tauri": "tauri"
+    "build:app": "./scripts/tauri-source.sh build --bundles app && MACNU_BUILD_MODE=source-build ./scripts/sign-app.sh",
+    "build:official": "./scripts/build-official.sh",
+    "release:preflight": "node ./scripts/release-preflight.mjs",
+    "release:sign-updater": "./scripts/sign-updater.sh",
+    "release:prepare": "./scripts/prepare-release.sh",
+    "test:rust:source": "./scripts/test-rust.sh source-build",
+    "test:rust:official": "./scripts/test-rust.sh official-distribution",
+    "test:release-verifier": "cargo test --locked --manifest-path tools/release-verifier/Cargo.toml",
+    "test:release-shell": "./scripts/verify-official.sh --self-test",
+    "test:vendor-updater": "cargo test --locked --lib --manifest-path vendor/tauri-plugin-updater/Cargo.toml",
+    "verify:official": "./scripts/verify-official.sh",
+    "tauri": "./scripts/tauri-source.sh"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.8.0"
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-opener": "^2.5.4"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.4",

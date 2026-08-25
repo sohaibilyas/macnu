@@ -8,6 +8,23 @@ license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/sohaibilyas/macnu"
 publish = false
 
+[features]
+# Every build must choose exactly one mode. Keeping the default empty makes an
+# omitted mode a compile-time error instead of silently producing an
+# unlicensed distribution build.
+default = []
+source-build = []
+official-distribution = [
+  "dep:base64",
+  "dep:flate2",
+  "dep:minisign-verify",
+  "dep:plist",
+  "dep:semver",
+  "dep:tar",
+  "dep:tempfile",
+  "dep:tauri-plugin-updater",
+]
+
 [lib]
 name = "macnu_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -17,7 +34,18 @@ tauri-build = { version = "2", features = [] }
 swift-rs = { version = "1", features = ["build"] }
 
 [dependencies]
+base64 = { version = "0.22.1", optional = true }
+flate2 = { version = "1", optional = true }
+minisign-verify = { version = "0.2.5", optional = true }
+plist = { version = "1", optional = true }
+semver = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2.5.4"
+tar = { version = "0.4", optional = true }
+tempfile = { version = "3", optional = true }
+tauri-plugin-updater = { path = "../vendor/tauri-plugin-updater", optional = true }

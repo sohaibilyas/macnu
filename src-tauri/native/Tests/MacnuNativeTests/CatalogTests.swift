@@ -156,4 +156,18 @@ final class CatalogTests: XCTestCase {
         XCTAssertEqual(result.count, 2)
         XCTAssertEqual(Set(result.compactMap(\.identifier)), ["first", "second"])
     }
+
+    func testInstallationIdentifierNormalizationRejectsNonUUIDValues() {
+        XCTAssertNil(normalizedInstallationIdentifier(nil))
+        XCTAssertNil(normalizedInstallationIdentifier("not-a-device-identifier"))
+    }
+
+    func testInstallationIdentifierNormalizationIsStableAndLowercase() {
+        let identifier = "47596AD9-A811-4EBF-AC8A-03FC7B6D2A17"
+
+        XCTAssertEqual(
+            normalizedInstallationIdentifier(identifier),
+            "47596ad9-a811-4ebf-ac8a-03fc7b6d2a17"
+        )
+    }
 }

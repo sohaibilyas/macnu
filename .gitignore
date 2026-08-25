@@ -17,3 +17,16 @@ src-tauri/native/.build
 .env
 .env.*
 !.env.example
+
+# Cloudflare Workers local secrets and generated deployment state
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.wrangler/
+
+# Private maintainer release documentation
+/docs/RELEASING.md
+/docs/maintainer/
+
+# Generated profiling output
+*.cpuprofile

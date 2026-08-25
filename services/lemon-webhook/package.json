@@ -1,0 +1,29 @@
+{
+  "name": "@macnu/lemon-webhook",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "types": "wrangler types",
+    "types:check": "wrangler types --check",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p test/tsconfig.json",
+    "lint": "oxlint --deny typescript/no-floating-promises src test",
+    "test": "LEMON_WEBHOOK_SECRET=test-only-secret LEMON_API_KEY=test-only-api-key vitest run",
+    "check": "npm run types:check && npm run typecheck && npm run lint && npm test",
+    "dry-run": "wrangler deploy --dry-run --outdir dist",
+    "check:startup": "wrangler check startup"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "npm@11.12.1",
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.0.0",
+    "@types/node": "26.2.0",
+    "oxlint": "1.79.0",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.125.0"
+  }
+}
