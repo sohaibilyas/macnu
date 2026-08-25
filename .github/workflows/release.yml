@@ -606,9 +606,18 @@ jobs:
             test "$(jq -r '.object.type' <<< "$TAG_OBJECT")" = "commit"
             jq -r '.object.sha' <<< "$TAG_OBJECT"
           }
+          find_releases_for_tag() {
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" | \
+              jq -c --arg tag "$RELEASE_TAG" \
+                '[.[][] | select(.tag_name == $tag)]'
+          }
           test "$(resolve_tag_commit)" = "$EXPECTED_TAG_COMMIT"
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          EXISTING_RELEASES="$(find_releases_for_tag)"
+          if [[ "$(jq 'length' <<< "$EXISTING_RELEASES")" -ne 0 ]]; then
             echo "A GitHub release already exists for $RELEASE_TAG." >&2
+            jq -r '.[] | "\(.html_url) (draft=\(.draft))"' \
+              <<< "$EXISTING_RELEASES" >&2
             exit 1
           fi
 
@@ -626,17 +635,31 @@ jobs:
             --title "Macnu $VERSION" \
             --generate-notes
 
-          RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+          MATCHED_RELEASES="$(find_releases_for_tag)"
+          test "$(jq 'length' <<< "$MATCHED_RELEASES")" -eq 1
+          RELEASE_JSON="$(jq -c '.[0]' <<< "$MATCHED_RELEASES")"
           test "$(jq -r '.draft' <<< "$RELEASE_JSON")" = "true"
+          test "$(jq -r '.tag_name' <<< "$RELEASE_JSON")" = "$RELEASE_TAG"
           test "$(jq -r '.assets | length' <<< "$RELEASE_JSON")" -eq 5
           test "$(jq -r '[.assets[].name] | sort | join("|")' <<< "$RELEASE_JSON")" = \
             "Macnu.app.tar.gz|Macnu.app.tar.gz.sig|$DMG_NAME|SHA256SUMS.txt|latest.json"
 
           DRAFT_CHECK="$RUNNER_TEMP/macnu-draft-check"
           mkdir "$DRAFT_CHECK"
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir "$DRAFT_CHECK"
+          while IFS=$'\t' read -r ASSET_ID ASSET_NAME; do
+            [[ "$ASSET_ID" =~ ^[1-9][0-9]*$ ]]
+            case "$ASSET_NAME" in
+              "$DMG_NAME"|Macnu.app.tar.gz|Macnu.app.tar.gz.sig|latest.json|SHA256SUMS.txt) ;;
+              *)
+                echo "Unexpected draft asset name: $ASSET_NAME" >&2
+                exit 1
+                ;;
+            esac
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID" \
+              > "$DRAFT_CHECK/$ASSET_NAME"
+          done < <(jq -r '.assets[] | [.id, .name] | @tsv' <<< "$RELEASE_JSON")
           test "$(find "$DRAFT_CHECK" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 5
           test "$(sha256sum "$DRAFT_CHECK/$DMG_NAME" | awk '{print $1}')" = "$EXPECTED_DMG_SHA256"
           test "$(sha256sum "$DRAFT_CHECK/Macnu.app.tar.gz" | awk '{print $1}')" = "$EXPECTED_ARCHIVE_SHA256"
@@ -644,3 +667,4 @@ jobs:
           test "$(sha256sum "$DRAFT_CHECK/latest.json" | awk '{print $1}')" = "$EXPECTED_MANIFEST_SHA256"
           test "$(sha256sum "$DRAFT_CHECK/SHA256SUMS.txt" | awk '{print $1}')" = "$EXPECTED_CHECKSUMS_SHA256"
           test "$(resolve_tag_commit)" = "$EXPECTED_TAG_COMMIT"
+          jq -r '.html_url' <<< "$RELEASE_JSON"
