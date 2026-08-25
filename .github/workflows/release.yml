@@ -123,8 +123,21 @@ jobs:
           swift test --package-path src-tauri/native
           npm --prefix services/lemon-webhook run check
           npm --prefix services/lemon-webhook run dry-run
+
+      - name: Restore generated schemas and require a clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git restore --source=HEAD -- \
+            src-tauri/gen/schemas/acl-manifests.json \
+            src-tauri/gen/schemas/desktop-schema.json \
+            src-tauri/gen/schemas/macOS-schema.json
           git diff --check
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          DIRTY_PATHS="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "$DIRTY_PATHS" ]]; then
+            printf '%s\n' "$DIRTY_PATHS" >&2
+            exit 1
+          fi
 
       - name: Import ephemeral Apple signing credentials
         shell: bash
