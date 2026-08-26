@@ -4,10 +4,11 @@
 
 # Macnu
 
-**Search and open macOS menu bar icons from the keyboard.**
+**Search, open, and run macOS menu bar actions from the keyboard.**
 
 Macnu is a fast macOS menu bar manager and keyboard launcher for crowded menu
 bars. Search menu bar icons by name, open their original menus and popovers,
+run standard menu commands without reaching for the mouse,
 and reach items hidden behind a MacBook notch. Macnu works on the display you
 are using, including multi-monitor Mac setups.
 
@@ -15,6 +16,7 @@ are using, including multi-monitor Mac setups.
 
 - Search menu bar apps and system status items from one palette.
 - Open each item's original menu or popover without moving icons.
+- Press Tab or Right Arrow to search exposed standard menu actions without opening the native menu.
 - Find hidden menu bar icons behind the MacBook notch or crowded app menus.
 - Launch Macnu on the active display with a customizable keyboard shortcut.
 - Cache discovered items and refresh the menu bar catalog in the background.
@@ -39,7 +41,13 @@ Click the Macnu menu bar icon or press **Command + Semicolon**.
 1. Type to filter menu bar items.
 2. Use the arrow keys to select a result.
 3. Press Enter to open its menu or popover.
-4. Press Escape, use the shortcut again, or click elsewhere to close Macnu.
+4. Press Tab or Right Arrow to browse that item's standard menu actions.
+5. Press Enter to run an action, or Left Arrow to return to menu bar icons.
+6. Press Escape, use the shortcut again, or click elsewhere to close Macnu.
+
+Macnu never clicks a status item merely to discover its actions. Apps that
+build commands only after a click, including custom popovers, use the original
+menu fallback instead.
 
 Settings lets you change the shortcut and appearance, enable Start at Login,
 manage your license, and check for updates.
@@ -50,6 +58,11 @@ Macnu needs Accessibility permission to discover menu bar items by name and
 open the item you select. Screen Recording permission is optional. It lets
 Macnu capture menu bar artwork; without it, Macnu uses application icons or a
 neutral fallback.
+
+When you open Actions, Macnu briefly inspects only the selected status item.
+It caches action names and descriptive menu paths for a short time, never raw
+Accessibility objects. Before running a command, Macnu resolves the current
+menu again and refuses ambiguous or missing matches.
 
 Macnu processes the menu bar catalog and captured artwork on your Mac. The
 official app contacts the licensing service when you activate a license and

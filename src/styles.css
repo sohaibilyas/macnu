@@ -205,6 +205,46 @@ button:focus-visible {
   gap: 10px;
   padding: 0 18px;
 }
+.search-leading {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+}
+
+.search-leading:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.back-icon {
+  display: none;
+  color: var(--text-secondary);
+  font-size: 27px;
+  font-weight: 300;
+  line-height: 1;
+  transform: translateY(-1px);
+}
+
+.search-row.actions-mode .search-leading {
+  cursor: pointer;
+}
+
+.search-row.actions-mode .search-leading:hover {
+  background: var(--control-hover);
+}
+
+.search-row.actions-mode .search-icon {
+  display: none;
+}
+
+.search-row.actions-mode .back-icon {
+  display: block;
+}
 
 .search-icon {
   position: relative;
@@ -369,6 +409,33 @@ kbd {
 
 .result.selected .open-hint {
   color: var(--text-tertiary);
+}
+.action-tail {
+  overflow: hidden;
+  color: transparent;
+  font-size: 11px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.action-result.selected .action-tail {
+  color: var(--text-tertiary);
+}
+
+.action-result.disabled {
+  opacity: 0.5;
+}
+
+.action-result.disabled .action-tail {
+  color: var(--text-faint);
+}
+
+.state-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
 }
 
 .state,

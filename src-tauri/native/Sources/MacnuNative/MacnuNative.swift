@@ -68,6 +68,45 @@ private struct ActivationRequest: Codable {
     let activationHeight: Double?
     let activationAction: String?
 }
+struct MenuActionPathSegment: Codable, Equatable {
+    let title: String
+    let occurrence: Int
+}
+
+struct MenuActionDescriptor: Codable, Equatable {
+    let id: String
+    let title: String
+    let path: [MenuActionPathSegment]
+    let enabled: Bool
+    let shortcut: String?
+}
+
+struct MenuActionSnapshot: Equatable {
+    let title: String
+    let enabled: Bool
+    let actionable: Bool
+    let shortcut: String?
+    let children: [MenuActionSnapshot]
+}
+
+private struct MenuActionsRequest: Codable {
+    let icon: ActivationRequest
+}
+
+private struct MenuActionsResponse: Codable {
+    let actions: [MenuActionDescriptor]
+    let error: String?
+}
+
+private struct MenuActionActivationRequest: Codable {
+    let icon: ActivationRequest
+    let action: MenuActionDescriptor
+}
+
+private struct LiveMenuAction {
+    let descriptor: MenuActionDescriptor
+    let element: AXUIElement
+}
 
 private struct ActivationSession {
     let menuWindowID: CGWindowID?
@@ -113,8 +152,11 @@ private let iconImageCacheRetention: TimeInterval = 120
 private let activationTargetCacheRetention: TimeInterval = 120
 private let catalogAXMessagingTimeout: Float = 0.35
 private let activationAXMessagingTimeout: Float = 0.9
+private let menuActionAXMessagingTimeout: Float = 0.5
 private let maximumAXNodesPerApplication = 256
 private let maximumAXTraversalDepth = 8
+private let maximumMenuActionNodes = 384
+private let maximumMenuActionDepth = 10
 private let accessibilityCatalogQueue: OperationQueue = {
     let queue = OperationQueue()
     queue.name = "com.qoest.macnu.accessibility-catalog"
@@ -507,6 +549,268 @@ private func descendants(of root: AXUIElement) -> [AXUIElement] {
         }
     }
     return result
+}
+private func normalizedMenuActionTitle(_ title: String) -> String {
+    title.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func menuActionIdentifier(
+    for path: [MenuActionPathSegment]
+) -> String {
+    path.map { segment in
+        "\(segment.title.utf8.count):\(segment.title)#\(segment.occurrence)"
+    }.joined(separator: "|")
+}
+
+func menuActionDescriptors(
+    from snapshots: [MenuActionSnapshot]
+) -> [MenuActionDescriptor] {
+    var descriptors: [MenuActionDescriptor] = []
+
+    func append(
+        _ siblings: [MenuActionSnapshot],
+        parentPath: [MenuActionPathSegment]
+    ) {
+        var occurrences: [String: Int] = [:]
+        for snapshot in siblings {
+            let title = normalizedMenuActionTitle(snapshot.title)
+            guard !title.isEmpty else { continue }
+            let occurrence = occurrences[title, default: 0]
+            occurrences[title] = occurrence + 1
+            let path = parentPath + [
+                MenuActionPathSegment(
+                    title: title,
+                    occurrence: occurrence
+                )
+            ]
+
+            if !snapshot.children.isEmpty {
+                append(snapshot.children, parentPath: path)
+            } else if snapshot.actionable {
+                descriptors.append(MenuActionDescriptor(
+                    id: menuActionIdentifier(for: path),
+                    title: title,
+                    path: path,
+                    enabled: snapshot.enabled,
+                    shortcut: snapshot.shortcut
+                ))
+            }
+        }
+    }
+
+    append(snapshots, parentPath: [])
+    return descriptors
+}
+
+func unambiguousMenuActionDescriptors(
+    _ descriptors: [MenuActionDescriptor]
+) -> [MenuActionDescriptor] {
+    let identityCounts = Dictionary(
+        grouping: descriptors,
+        by: \.id
+    ).mapValues(\.count)
+    return descriptors.filter { identityCounts[$0.id] == 1 }
+}
+
+private func actionAttribute(
+    _ name: String,
+    from element: AXUIElement
+) -> CFTypeRef? {
+    AXUIElementSetMessagingTimeout(element, menuActionAXMessagingTimeout)
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(
+        element,
+        name as CFString,
+        &value
+    ) == .success else {
+        return nil
+    }
+    return value
+}
+
+private func accessibilityElements(
+    from value: CFTypeRef?
+) -> [AXUIElement] {
+    guard let value else { return [] }
+    if CFGetTypeID(value) == AXUIElementGetTypeID() {
+        return [unsafeBitCast(value, to: AXUIElement.self)]
+    }
+    guard CFGetTypeID(value) == CFArrayGetTypeID() else { return [] }
+    return (value as! [AnyObject]).compactMap { item in
+        let rawValue = item as CFTypeRef
+        guard CFGetTypeID(rawValue) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeBitCast(rawValue, to: AXUIElement.self)
+    }
+}
+
+private func menuActionChildren(of element: AXUIElement) -> [AXUIElement] {
+    var children: [AXUIElement] = []
+    for attributeName in [
+        kAXVisibleChildrenAttribute,
+        kAXChildrenAttribute
+    ] {
+        for child in accessibilityElements(
+            from: actionAttribute(attributeName, from: element)
+        ) where !children.contains(where: { CFEqual($0, child) }) {
+            children.append(child)
+        }
+    }
+    return children
+}
+
+private func menuActionRole(of element: AXUIElement) -> String? {
+    actionAttribute(kAXRoleAttribute, from: element) as? String
+}
+
+private func menuActionTitle(of element: AXUIElement) -> String {
+    for attributeName in [
+        kAXTitleAttribute,
+        kAXDescriptionAttribute,
+        kAXValueAttribute,
+        kAXHelpAttribute
+    ] {
+        if let value = actionAttribute(attributeName, from: element) as? String {
+            let title = normalizedMenuActionTitle(value)
+            if !title.isEmpty { return title }
+        }
+    }
+    return ""
+}
+
+private func menuActionEnabled(_ element: AXUIElement) -> Bool {
+    if let enabled = actionAttribute(
+        kAXEnabledAttribute,
+        from: element
+    ) as? Bool {
+        return enabled
+    }
+    return true
+}
+
+private func menuActionShortcut(_ element: AXUIElement) -> String? {
+    guard let rawCharacter = actionAttribute(
+        kAXMenuItemCmdCharAttribute,
+        from: element
+    ) as? String else {
+        return nil
+    }
+    let character = normalizedMenuActionTitle(rawCharacter)
+    guard !character.isEmpty else { return nil }
+
+    // AXMenuItemCmdModifiers uses Control, Option, Shift, and NoCommand bits
+    // 2, 1, 0, and 3 respectively, as documented by ApplicationServices.
+    let modifierMask = (
+        actionAttribute(
+            kAXMenuItemCmdModifiersAttribute,
+            from: element
+        ) as? NSNumber
+    )?.intValue ?? 0
+    var shortcut = ""
+    if modifierMask & (1 << 2) != 0 { shortcut += "⌃" }
+    if modifierMask & (1 << 1) != 0 { shortcut += "⌥" }
+    if modifierMask & (1 << 0) != 0 { shortcut += "⇧" }
+    if modifierMask & (1 << 3) == 0 { shortcut += "⌘" }
+    return shortcut + character.uppercased()
+}
+
+private func semanticMenuItems(
+    beneath roots: [AXUIElement],
+    maximumDepth: Int = maximumMenuActionDepth
+) -> [AXUIElement] {
+    var queue = roots.map { (element: $0, depth: 0) }
+    var cursor = 0
+    var visited: [AXUIElement] = []
+    var items: [AXUIElement] = []
+
+    while cursor < queue.count,
+          visited.count < maximumMenuActionNodes {
+        let current = queue[cursor]
+        cursor += 1
+        guard !visited.contains(where: { CFEqual($0, current.element) }) else {
+            continue
+        }
+        visited.append(current.element)
+
+        if menuActionRole(of: current.element) == kAXMenuItemRole as String {
+            items.append(current.element)
+            continue
+        }
+        guard current.depth < maximumDepth else { continue }
+        for child in menuActionChildren(of: current.element) {
+            queue.append((element: child, depth: current.depth + 1))
+        }
+    }
+    return items
+}
+
+private func liveMenuActions(
+    beneath roots: [AXUIElement]
+) -> [LiveMenuAction] {
+    var actions: [LiveMenuAction] = []
+    var visitedItems: [AXUIElement] = []
+
+    func append(
+        _ siblings: [AXUIElement],
+        parentPath: [MenuActionPathSegment],
+        depth: Int
+    ) {
+        guard depth <= maximumMenuActionDepth,
+              actions.count < maximumMenuActionNodes else {
+            return
+        }
+
+        var occurrences: [String: Int] = [:]
+        for item in siblings {
+            guard !visitedItems.contains(where: { CFEqual($0, item) }) else {
+                continue
+            }
+            visitedItems.append(item)
+
+            let title = menuActionTitle(of: item)
+            guard !title.isEmpty else { continue }
+            let occurrence = occurrences[title, default: 0]
+            occurrences[title] = occurrence + 1
+            let path = parentPath + [
+                MenuActionPathSegment(
+                    title: title,
+                    occurrence: occurrence
+                )
+            ]
+            let nestedItems = semanticMenuItems(
+                beneath: menuActionChildren(of: item),
+                maximumDepth: maximumMenuActionDepth - depth
+            )
+
+            if !nestedItems.isEmpty {
+                append(nestedItems, parentPath: path, depth: depth + 1)
+                continue
+            }
+
+            let itemActions = actionNames(of: item)
+            let actionable = itemActions.contains(kAXPressAction as String)
+                || itemActions.contains(kAXPickAction as String)
+            guard actionable else { continue }
+            actions.append(LiveMenuAction(
+                descriptor: MenuActionDescriptor(
+                    id: menuActionIdentifier(for: path),
+                    title: title,
+                    path: path,
+                    enabled: menuActionEnabled(item),
+                    shortcut: menuActionShortcut(item)
+                ),
+                element: item
+            ))
+        }
+    }
+
+    append(
+        semanticMenuItems(beneath: roots),
+        parentPath: [],
+        depth: 0
+    )
+    return actions
 }
 
 private func samePhysicalStatusRegion(
@@ -1748,6 +2052,121 @@ private func performAccessibilityAction(
     }
     return nil
 }
+private func resolvedStatusItem(
+    for request: ActivationRequest
+) -> (candidate: AccessibilityCandidate, menuWindow: MenuWindow?)? {
+    let displays = activeDisplayBounds()
+    if let cachedTarget = cachedActivationTarget(for: request),
+       let candidate = liveCachedCandidate(cachedTarget.candidate, for: request) {
+        return (
+            candidate,
+            unchangedCachedMenuWindow(
+                cachedTarget.menuWindow,
+                cachedCandidate: cachedTarget.candidate,
+                liveCandidate: candidate,
+                displays: displays
+            )
+        )
+    }
+
+    let candidates = accessibilityCandidates()
+    guard let candidate = cachedActivationCandidate(
+        for: request,
+        in: candidates
+    ) else {
+        return nil
+    }
+    return (
+        candidate,
+        confidentMenuWindow(
+            for: request,
+            candidate: candidate,
+            allCandidates: candidates,
+            displays: displays
+        )
+    )
+}
+
+private func directlyExposedMenuActions(
+    for request: ActivationRequest
+) -> [LiveMenuAction]? {
+    guard let resolved = resolvedStatusItem(for: request) else {
+        return nil
+    }
+
+    // Reading Accessibility attributes is deliberately the only operation
+    // allowed here. Some apps expose their NSMenu tree while closed; apps that
+    // build it lazily after a click return no actions and use the original-menu
+    // fallback. Browsing Actions must never press or click a status item.
+    return liveMenuActions(beneath: [resolved.candidate.element])
+}
+
+private func discoverMenuActions(
+    for request: ActivationRequest
+) -> MenuActionsResponse {
+    guard AXIsProcessTrusted() else {
+        return MenuActionsResponse(
+            actions: [],
+            error: "Accessibility permission is required to read menu actions."
+        )
+    }
+    guard let liveActions = directlyExposedMenuActions(for: request) else {
+        return MenuActionsResponse(
+            actions: [],
+            error: "That menu-bar item is no longer available."
+        )
+    }
+
+    let descriptors = unambiguousMenuActionDescriptors(
+        liveActions.map(\.descriptor)
+    )
+    return MenuActionsResponse(actions: descriptors, error: nil)
+}
+
+private func performDiscoveredMenuAction(
+    _ request: MenuActionActivationRequest
+) -> Int32 {
+    guard AXIsProcessTrusted() else {
+        _ = macnuRequestAccessibility()
+        return 2
+    }
+    guard request.action.path.last?.title == request.action.title,
+          request.action.id == menuActionIdentifier(for: request.action.path)
+    else {
+        return 4
+    }
+    guard let liveActions = directlyExposedMenuActions(for: request.icon) else {
+        return 1
+    }
+
+    let matches = liveActions.filter { live in
+        live.descriptor.path == request.action.path
+            && live.descriptor.id == request.action.id
+    }
+    guard matches.count == 1 else { return 3 }
+
+    let match = matches[0]
+    guard match.descriptor.enabled else { return 5 }
+
+    AXUIElementSetMessagingTimeout(
+        match.element,
+        activationAXMessagingTimeout
+    )
+    let itemActions = actionNames(of: match.element)
+    for actionName in [
+        kAXPressAction as String,
+        kAXPickAction as String
+    ] where itemActions.contains(actionName) {
+        let result = AXUIElementPerformAction(
+            match.element,
+            actionName as CFString
+        )
+        if result == .success || result == .cannotComplete {
+            return 0
+        }
+    }
+    return 6
+}
 
 private func cachedActivationCandidate(
     for request: ActivationRequest,
@@ -2202,6 +2621,48 @@ public func macnuCopyMenuIconsJSON() -> UnsafeMutablePointer<CChar>? {
             error: "Menu capture did not return a result."
         )
     )
+}
+private func encodedJSON<T: Encodable>(
+    _ value: T
+) -> UnsafeMutablePointer<CChar>? {
+    guard let data = try? JSONEncoder().encode(value),
+          let json = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    return strdup(json)
+}
+
+@_cdecl("macnu_copy_menu_actions_json")
+public func macnuCopyMenuActionsJSON(
+    _ requestJSON: UnsafePointer<CChar>?
+) -> UnsafeMutablePointer<CChar>? {
+    guard let requestJSON,
+          let data = String(cString: requestJSON).data(using: .utf8),
+          let request = try? JSONDecoder().decode(
+              MenuActionsRequest.self,
+              from: data
+          ) else {
+        return encodedJSON(MenuActionsResponse(
+            actions: [],
+            error: "The menu action request was invalid."
+        ))
+    }
+    return encodedJSON(discoverMenuActions(for: request.icon))
+}
+
+@_cdecl("macnu_activate_menu_action_json")
+public func macnuActivateMenuActionJSON(
+    _ requestJSON: UnsafePointer<CChar>?
+) -> Int32 {
+    guard let requestJSON,
+          let data = String(cString: requestJSON).data(using: .utf8),
+          let request = try? JSONDecoder().decode(
+              MenuActionActivationRequest.self,
+              from: data
+          ) else {
+        return 4
+    }
+    return performDiscoveredMenuAction(request)
 }
 
 @_cdecl("macnu_free_native_string")

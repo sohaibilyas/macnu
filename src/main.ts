@@ -79,6 +79,24 @@ type ActiveDisplayCache = {
   stale: boolean;
 };
 
+type MenuActionPathSegment = {
+  title: string;
+  occurrence: number;
+};
+
+type MenuAction = {
+  id: string;
+  title: string;
+  path: MenuActionPathSegment[];
+  enabled: boolean;
+  shortcut: string | null;
+};
+
+type MenuActionsResponse = {
+  actions: MenuAction[];
+  error: string | null;
+};
+
 type SettingsResponse = {
   shortcut: string;
   startAtLoginStatus: number;
@@ -1345,7 +1363,16 @@ if (currentWindow.label === "settings") {
 app.innerHTML = `
   <section class="palette" aria-label="Macnu menu search">
     <header class="search-row">
-      <span class="search-icon" aria-hidden="true"></span>
+      <button
+        class="search-leading"
+        type="button"
+        tabindex="-1"
+        aria-label="Back to menu bar icons"
+        disabled
+      >
+        <span class="search-icon"></span>
+        <span class="back-icon">‹</span>
+      </button>
       <input
         class="search-input"
         type="search"
@@ -1359,8 +1386,9 @@ app.innerHTML = `
     <div class="divider"></div>
     <main class="results" role="listbox"></main>
     <footer>
-      <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
-      <span><kbd>↵</kbd> open</span>
+      <span class="footer-navigation"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+      <span class="footer-primary"><kbd>↵</kbd> open</span>
+      <span class="footer-secondary"><kbd>tab</kbd> actions</span>
       <span><kbd>esc</kbd> close</span>
       <button class="settings-button">Settings</button>
       <button class="refresh">Refresh</button>
@@ -1374,6 +1402,11 @@ const input = app.querySelector<HTMLInputElement>(".search-input")!;
 const results = app.querySelector<HTMLElement>(".results")!;
 const refresh = app.querySelector<HTMLButtonElement>(".refresh")!;
 const shortcutDisplay = app.querySelector<HTMLElement>(".current-shortcut")!;
+const searchRow = app.querySelector<HTMLElement>(".search-row")!;
+const searchLeading = app.querySelector<HTMLButtonElement>(".search-leading")!;
+const footerPrimary = app.querySelector<HTMLElement>(".footer-primary")!;
+const footerSecondary = app.querySelector<HTMLElement>(".footer-secondary")!;
+
 let response: MenuResponse | null = null;
 let activeDisplayId: number | null = null;
 let refreshing = false;
@@ -1389,6 +1422,16 @@ let pendingBlur = false;
 let pointerSelectionArmed = false;
 let lastArrowNavigationAt = 0;
 let paletteTestMode = false;
+let actionScope: MenuIcon | null = null;
+let actionResponse: MenuActionsResponse | null = null;
+let actionLoading = false;
+let actionDiscoveryCount = 0;
+let actionRunError: string | null = null;
+const actionCache = new Map<
+  string,
+  { expiresAt: number; response: MenuActionsResponse }
+>();
+const ACTION_CACHE_LIFETIME = 45_000;
 
 void invoke<boolean>("palette_test_mode")
   .then((enabled) => {
@@ -1437,8 +1480,137 @@ function visibleIcons(): MenuIcon[] {
     `${displayLabel(icon)} ${icon.owner}`.toLocaleLowerCase().includes(query),
   );
 }
+function actionCacheKey(icon: MenuIcon): string {
+  return [
+    icon.activationPid ?? "",
+    icon.activationBundleId ?? "",
+    icon.activationIdentifier ?? "",
+    icon.activationX ?? icon.x,
+    icon.activationY ?? icon.y,
+    icon.activationWidth ?? icon.width,
+    icon.activationHeight ?? icon.height,
+  ].join("|");
+}
+
+function visibleActions(): MenuAction[] {
+  const query = input.value.trim().toLocaleLowerCase();
+  const actions = actionResponse?.actions ?? [];
+  if (!query) return actions;
+  return actions.filter((action) => {
+    const path = action.path.map((segment) => segment.title).join(" ");
+    return `${action.title} ${path}`.toLocaleLowerCase().includes(query);
+  });
+}
+
+function actionContext(action: MenuAction): string {
+  const parents = action.path.slice(0, -1).map((segment) => segment.title);
+  return parents.length ? parents.join(" › ") : actionScope?.owner ?? "";
+}
+
+function updatePaletteChrome(): void {
+  const scoped = actionScope !== null;
+  searchRow.classList.toggle("actions-mode", scoped);
+  searchLeading.disabled = !scoped;
+  input.placeholder = scoped
+    ? `Search ${displayLabel(actionScope!)} actions…`
+    : "Search menu bar icons…";
+  input.setAttribute(
+    "aria-label",
+    scoped ? `Search ${displayLabel(actionScope!)} actions` : "Search menu bar icons",
+  );
+  footerPrimary.innerHTML = scoped
+    ? "<kbd>↵</kbd> run"
+    : "<kbd>↵</kbd> open";
+  footerSecondary.innerHTML = scoped
+    ? "<kbd>←</kbd> back"
+    : "<kbd>tab</kbd> actions";
+  refresh.hidden = scoped;
+}
+
+function renderActions(): void {
+  if (!actionScope) return;
+  if (actionLoading) {
+    results.innerHTML = `
+      <div class="state fetching-state" role="status" aria-live="polite">
+        <span class="loader" aria-hidden="true"></span>
+        <strong>Reading ${escapeHtml(displayLabel(actionScope))} actions…</strong>
+        <small>Looking for actions Macnu can show here.</small>
+      </div>
+    `;
+    return;
+  }
+
+  const actionError = actionRunError ?? actionResponse?.error;
+  if (actionError) {
+    results.innerHTML = `
+      <div class="state">
+        <strong>${actionRunError ? "Couldn’t run this action" : "Couldn’t read these actions"}</strong>
+        <small>${escapeHtml(actionError)}</small>
+        <div class="state-actions">
+          <button class="secondary-action retry-actions">Try again</button>
+          <button class="secondary-action open-original">Open menu</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  const actions = visibleActions();
+  selectedIndex = Math.max(0, Math.min(selectedIndex, actions.length - 1));
+  if (!actions.length) {
+    const hasQuery = input.value.trim().length > 0;
+    results.innerHTML = `
+      <div class="state">
+        <span class="empty-symbol">⌕</span>
+        <strong>${hasQuery ? "No matching actions" : "Actions aren’t available here"}</strong>
+        <small>${
+          hasQuery
+            ? "Try another search."
+            : "You can still open and use this menu normally."
+        }</small>
+        ${
+          hasQuery
+            ? ""
+            : '<button class="secondary-action open-original">Open menu</button>'
+        }
+      </div>
+    `;
+    return;
+  }
+
+  results.innerHTML = actions
+    .map(
+      (action, index) => `
+        <button
+          class="result action-result ${index === selectedIndex ? "selected" : ""} ${
+            action.enabled ? "" : "disabled"
+          }"
+          data-index="${index}"
+          role="option"
+          aria-selected="${index === selectedIndex}"
+          aria-disabled="${!action.enabled}"
+        >
+          <span class="icon-frame">
+            <img src="${actionScope!.image}" alt="" draggable="false" />
+          </span>
+          <span class="result-copy">
+            <strong>${escapeHtml(action.title)}</strong>
+            <small>${escapeHtml(actionContext(action))}</small>
+          </span>
+          <span class="action-tail">${escapeHtml(action.shortcut ?? (action.enabled ? "↵" : "—"))}</span>
+        </button>
+      `,
+    )
+    .join("");
+}
 
 function render(): void {
+  updatePaletteChrome();
+  if (actionScope) {
+    renderActions();
+    return;
+  }
+
   if (!response) {
     results.innerHTML = `
       <div class="state fetching-state" role="status" aria-live="polite">
@@ -1608,6 +1780,7 @@ async function refreshIcons(
   promptPermissions = false,
   force = false,
 ): Promise<void> {
+  if (force) actionCache.clear();
   if (refreshing) {
     queuedRefresh = true;
     queuedPermissionPrompt ||= promptPermissions;
@@ -1671,9 +1844,9 @@ async function openPalette(generation: number): Promise<void> {
 }
 
 function updateSelection(next: number): void {
-  const icons = visibleIcons();
-  if (!icons.length) return;
-  selectedIndex = (next + icons.length) % icons.length;
+  const itemCount = actionScope ? visibleActions().length : visibleIcons().length;
+  if (!itemCount) return;
+  selectedIndex = (next + itemCount) % itemCount;
   const items = results.querySelectorAll<HTMLElement>(".result");
   items.forEach((item, index) => {
     const selected = index === selectedIndex;
@@ -1683,6 +1856,107 @@ function updateSelection(next: number): void {
   items[selectedIndex]?.scrollIntoView({
     block: "nearest",
   });
+}
+async function restorePaletteFocus(generation: number): Promise<void> {
+  if (generation !== blurDismissGeneration) return;
+  await currentWindow.show();
+  await currentWindow.setFocus();
+  window.setTimeout(() => {
+    if (generation === blurDismissGeneration) input.focus();
+  }, 20);
+}
+
+function leaveActionScope(): void {
+  const previousScope = actionScope;
+  actionScope = null;
+  actionResponse = null;
+  actionLoading = false;
+  actionRunError = null;
+  input.value = "";
+  const icons = visibleIcons();
+  selectedIndex = Math.max(
+    0,
+    previousScope
+      ? icons.findIndex(
+          (icon) => actionCacheKey(icon) === actionCacheKey(previousScope),
+        )
+      : 0,
+  );
+  render();
+  window.setTimeout(() => input.focus(), 0);
+}
+
+async function openActionScope(
+  icon: MenuIcon,
+  force = false,
+): Promise<void> {
+  if (icon.isMacnu) {
+    await invoke("open_settings");
+    return;
+  }
+
+  actionScope = icon;
+  actionResponse = null;
+  actionRunError = null;
+  actionLoading = true;
+  input.value = "";
+  selectedIndex = 0;
+  pointerSelectionArmed = false;
+  render();
+
+  const key = actionCacheKey(icon);
+  const cached = actionCache.get(key);
+  if (!force && cached && cached.expiresAt > Date.now()) {
+    actionResponse = cached.response;
+    actionLoading = false;
+    render();
+    input.focus();
+    return;
+  }
+
+  const generation = blurDismissGeneration;
+  actionDiscoveryCount += 1;
+  pendingBlur = false;
+  try {
+    const next = await invoke<MenuActionsResponse>("list_menu_actions", {
+      icon,
+    });
+    if (generation !== blurDismissGeneration || actionScope !== icon) return;
+    actionResponse = next;
+    if (!next.error) {
+      actionCache.set(key, {
+        expiresAt: Date.now() + ACTION_CACHE_LIFETIME,
+        response: next,
+      });
+    }
+  } catch (error) {
+    if (generation !== blurDismissGeneration || actionScope !== icon) return;
+    actionResponse = {
+      actions: [],
+      error: String(error),
+    };
+  } finally {
+    actionDiscoveryCount = Math.max(0, actionDiscoveryCount - 1);
+    if (generation === blurDismissGeneration && actionScope === icon) {
+      actionLoading = false;
+      render();
+      await restorePaletteFocus(generation);
+    }
+  }
+}
+
+async function activateScopedAction(action: MenuAction): Promise<void> {
+  const icon = actionScope;
+  if (!icon || !action.enabled) return;
+  actionRunError = null;
+  await currentWindow.hide();
+  try {
+    await invoke("activate_menu_action", { icon, action });
+  } catch (error) {
+    actionRunError = String(error);
+    render();
+    await restorePaletteFocus(blurDismissGeneration);
+  }
 }
 
 async function activate(icon: MenuIcon): Promise<void> {
@@ -1700,6 +1974,11 @@ async function activate(icon: MenuIcon): Promise<void> {
 }
 
 function activateSelected(): void {
+  if (actionScope) {
+    const action = visibleActions()[selectedIndex];
+    if (action) void activateScopedAction(action);
+    return;
+  }
   const icon = visibleIcons()[selectedIndex];
   if (icon) void activate(icon);
 }
@@ -1715,6 +1994,7 @@ window.addEventListener(
     if (event.key !== "Escape") return;
     event.preventDefault();
     event.stopPropagation();
+    blurDismissGeneration += 1;
     void currentWindow.hide();
   },
   { capture: true },
@@ -1737,6 +2017,26 @@ input.addEventListener("keydown", (event) => {
     lastArrowNavigationAt = now;
     pointerSelectionArmed = false;
     updateSelection(selectedIndex - 1);
+  } else if (
+    actionScope &&
+    (event.key === "ArrowLeft" ||
+      (event.key === "Backspace" && input.value.length === 0))
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    leaveActionScope();
+  } else if (
+    !actionScope &&
+    (event.key === "ArrowRight" || event.key === "Tab")
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    const icon = visibleIcons()[selectedIndex];
+    if (icon && !actionLoading) void openActionScope(icon);
+  } else if (actionScope && event.key === "Tab") {
+    // Keep keyboard focus in the search field while action results are open.
+    event.preventDefault();
+    event.stopPropagation();
   } else if (event.key === "Enter") {
     event.preventDefault();
     event.stopPropagation();
@@ -1772,9 +2072,21 @@ results.addEventListener("click", (event) => {
   const target = event.target as HTMLElement;
   const item = target.closest<HTMLButtonElement>(".result");
   if (item) {
-    const icon = visibleIcons()[Number(item.dataset.index)];
-    if (icon) void activate(icon);
+    const index = Number(item.dataset.index);
+    if (actionScope) {
+      const action = visibleActions()[index];
+      if (action) void activateScopedAction(action);
+    } else {
+      const icon = visibleIcons()[index];
+      if (icon) void activate(icon);
+    }
     return;
+  }
+  if (target.closest(".retry-actions") && actionScope) {
+    void openActionScope(actionScope, true);
+  }
+  if (target.closest(".open-original") && actionScope) {
+    void activate(actionScope);
   }
   if (target.closest(".permission-button")) {
     permissionFlowStarted = false;
@@ -1788,6 +2100,9 @@ results.addEventListener("click", (event) => {
 });
 
 refresh.addEventListener("click", () => void refreshIcons(true, true));
+searchLeading.addEventListener("click", () => {
+  if (actionScope) leaveActionScope();
+});
 app.querySelector<HTMLButtonElement>(".settings-button")!.addEventListener(
   "click",
   () => void invoke("open_settings"),
@@ -1798,6 +2113,10 @@ void currentWindow.listen("palette-opened", () => {
   const generation = ++blurDismissGeneration;
   blurDismissArmed = false;
   pendingBlur = false;
+  actionScope = null;
+  actionResponse = null;
+  actionLoading = false;
+  actionRunError = null;
   input.value = "";
   selectedIndex = 0;
   pointerSelectionArmed = false;
@@ -1851,6 +2170,7 @@ void currentWindow.onFocusChanged(({ payload: focused }) => {
     return;
   }
   if (paletteTestMode) return;
+  if (actionDiscoveryCount > 0) return;
   if (!blurDismissArmed) {
     pendingBlur = true;
     return;

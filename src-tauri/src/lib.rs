@@ -106,6 +106,42 @@ impl From<MenuIcon> for ActivationRequest {
         }
     }
 }
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MenuActionPathSegment {
+    title: String,
+    occurrence: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MenuAction {
+    id: String,
+    title: String,
+    path: Vec<MenuActionPathSegment>,
+    enabled: bool,
+    shortcut: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MenuActionsResponse {
+    actions: Vec<MenuAction>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MenuActionsRequest {
+    icon: ActivationRequest,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MenuActionActivationRequest {
+    icon: ActivationRequest,
+    action: MenuAction,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -684,6 +720,8 @@ unsafe extern "C" {
     fn macnu_open_login_items_settings();
     fn macnu_activate_application();
     fn macnu_activate_menu_icon_json(request_json: *const c_char) -> i32;
+    fn macnu_copy_menu_actions_json(request_json: *const c_char) -> *mut c_char;
+    fn macnu_activate_menu_action_json(request_json: *const c_char) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -1659,6 +1697,80 @@ fn active_display_menu_icons(
         stale,
     })
 }
+#[tauri::command]
+async fn list_menu_actions(app: AppHandle, icon: MenuIcon) -> Result<MenuActionsResponse, String> {
+    #[cfg(target_os = "macos")]
+    {
+        require_ready(&app)?;
+        if icon.is_macnu && is_current_process_icon(&icon) {
+            return Ok(MenuActionsResponse {
+                actions: Vec::new(),
+                error: None,
+            });
+        }
+
+        let action_app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            require_ready(&action_app)?;
+            let request = MenuActionsRequest {
+                icon: ActivationRequest::from(icon),
+            };
+            let request_json = serde_json::to_string(&request)
+                .map_err(|error| format!("Could not encode the menu action request: {error}"))?;
+            let request_json = CString::new(request_json)
+                .map_err(|_| "The menu action request contains invalid text.".to_string())?;
+            let response_json = copy_native_owned_string(unsafe {
+                macnu_copy_menu_actions_json(request_json.as_ptr())
+            })
+            .ok_or_else(|| "macOS did not return a menu action response.".to_string())?;
+            serde_json::from_str(&response_json)
+                .map_err(|error| format!("Could not decode the menu actions: {error}"))
+        })
+        .await
+        .map_err(|error| format!("Menu action discovery task failed: {error}"))?
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Err("Macnu only supports macOS.".to_string())
+}
+
+#[tauri::command]
+async fn activate_menu_action(
+    app: AppHandle,
+    icon: MenuIcon,
+    action: MenuAction,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        require_ready(&app)?;
+        let action_app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            require_ready(&action_app)?;
+            let request = MenuActionActivationRequest {
+                icon: ActivationRequest::from(icon),
+                action,
+            };
+            let request_json = serde_json::to_string(&request)
+                .map_err(|error| format!("Could not encode the menu action: {error}"))?;
+            let request_json = CString::new(request_json)
+                .map_err(|_| "The menu action contains invalid text.".to_string())?;
+            match unsafe { macnu_activate_menu_action_json(request_json.as_ptr()) } {
+                0 => Ok(()),
+                1 => Err("That menu-bar item is no longer available.".to_string()),
+                2 => Err("Accessibility permission is required to run menu actions.".to_string()),
+                3 => Err("That menu action changed. Open Actions again to refresh it.".to_string()),
+                4 => Err("The menu action request was invalid.".to_string()),
+                5 => Err("That menu action is currently unavailable.".to_string()),
+                _ => Err("macOS could not run that menu action.".to_string()),
+            }
+        })
+        .await
+        .map_err(|error| format!("Menu action task failed: {error}"))?
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Err("Macnu only supports macOS.".to_string())
+}
 
 #[tauri::command]
 async fn activate_menu_icon(app: AppHandle, icon: MenuIcon) -> Result<(), String> {
@@ -2367,6 +2479,8 @@ pub fn run() {
             list_menu_icons,
             active_display_menu_icons,
             activate_menu_icon,
+            list_menu_actions,
+            activate_menu_action,
             get_license_status,
             activate_license,
             refresh_license,
@@ -2517,6 +2631,35 @@ mod tests {
 
         assert_eq!(json["accessibilityGranted"], true);
         assert_eq!(json["screenCaptureGranted"], false);
+    }
+    #[test]
+    fn menu_action_contract_preserves_paths_and_camel_case() {
+        let action = MenuAction {
+            id: "7:Account#0|8:Sign Out#1".to_string(),
+            title: "Sign Out".to_string(),
+            path: vec![
+                MenuActionPathSegment {
+                    title: "Account".to_string(),
+                    occurrence: 0,
+                },
+                MenuActionPathSegment {
+                    title: "Sign Out".to_string(),
+                    occurrence: 1,
+                },
+            ],
+            enabled: false,
+            shortcut: None,
+        };
+
+        let json = serde_json::to_value(MenuActionsResponse {
+            actions: vec![action],
+            error: None,
+        })
+        .unwrap();
+
+        assert_eq!(json["actions"][0]["path"][1]["occurrence"], 1);
+        assert_eq!(json["actions"][0]["enabled"], false);
+        assert!(json["actions"][0].get("shortcut").is_some());
     }
 
     #[test]

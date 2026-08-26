@@ -28,6 +28,21 @@ final class CatalogTests: XCTestCase {
             actions: actions
         )
     }
+private func action(
+        _ title: String,
+        enabled: Bool = true,
+        actionable: Bool = true,
+        shortcut: String? = nil,
+        children: [MenuActionSnapshot] = []
+    ) -> MenuActionSnapshot {
+        MenuActionSnapshot(
+            title: title,
+            enabled: enabled,
+            actionable: actionable,
+            shortcut: shortcut,
+            children: children
+        )
+    }
 
     func testDistinctItemsWithTheSameLabelArePreserved() {
         let items = [
@@ -155,6 +170,73 @@ final class CatalogTests: XCTestCase {
 
         XCTAssertEqual(result.count, 2)
         XCTAssertEqual(Set(result.compactMap(\.identifier)), ["first", "second"])
+    }
+func testNestedMenuActionsKeepTheirFullPath() {
+        let descriptors = menuActionDescriptors(from: [
+            action(
+                "Preferences",
+                actionable: false,
+                children: [
+                    action("Appearance", actionable: false, children: [
+                        action("Dark")
+                    ])
+                ]
+            )
+        ])
+
+        XCTAssertEqual(descriptors.count, 1)
+        XCTAssertEqual(
+            descriptors[0].path,
+            [
+                MenuActionPathSegment(title: "Preferences", occurrence: 0),
+                MenuActionPathSegment(title: "Appearance", occurrence: 0),
+                MenuActionPathSegment(title: "Dark", occurrence: 0)
+            ]
+        )
+    }
+
+    func testDuplicateMenuTitlesReceiveStableOccurrences() {
+        let descriptors = menuActionDescriptors(from: [
+            action("Connect"),
+            action("Connect"),
+            action("Disconnect")
+        ])
+
+        XCTAssertEqual(descriptors.map(\.path.last?.occurrence), [0, 1, 0])
+        XCTAssertEqual(Set(descriptors.map(\.id)).count, 3)
+    }
+
+    func testSubmenuParentsAreNotExposedAsRunnableActions() {
+        let descriptors = menuActionDescriptors(from: [
+            action(
+                "Account",
+                actionable: true,
+                children: [action("Sign Out")]
+            )
+        ])
+
+        XCTAssertEqual(descriptors.map(\.title), ["Sign Out"])
+    }
+
+    func testDisabledActionsRemainVisibleButDisabled() {
+        let descriptors = menuActionDescriptors(from: [
+            action("Install Update", enabled: false, shortcut: "⌘U")
+        ])
+
+        XCTAssertEqual(descriptors.count, 1)
+        XCTAssertFalse(descriptors[0].enabled)
+        XCTAssertEqual(descriptors[0].shortcut, "⌘U")
+    }
+
+    func testAmbiguousDuplicateActionPathsAreEntirelyOmitted() {
+        let descriptor = menuActionDescriptors(from: [action("Open")])[0]
+
+        XCTAssertTrue(
+            unambiguousMenuActionDescriptors([
+                descriptor,
+                descriptor
+            ]).isEmpty
+        )
     }
 
     func testInstallationIdentifierNormalizationRejectsNonUUIDValues() {
