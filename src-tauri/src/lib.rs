@@ -2019,6 +2019,20 @@ fn position_settings(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
+fn hide_settings_window(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("settings") {
+        window.hide()?;
+    }
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn close_settings(app: AppHandle) -> Result<(), String> {
+    hide_settings_window(&app).map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn open_settings(app: AppHandle) -> Result<(), String> {
     if let Some(palette) = app.get_webview_window("main") {
@@ -2027,9 +2041,19 @@ fn open_settings(app: AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("settings")
         .ok_or_else(|| "The Settings window is unavailable.".to_string())?;
-    position_settings(&window).map_err(|error| error.to_string())?;
-    window.show().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())?;
+    if !window.is_visible().unwrap_or(false) {
+        position_settings(&window).map_err(|error| error.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        app.set_activation_policy(tauri::ActivationPolicy::Regular)
+            .map_err(|error| error.to_string())?;
+        unsafe { macnu_activate_application() };
+    }
+    if let Err(error) = window.show().and_then(|_| window.set_focus()) {
+        let _ = hide_settings_window(&app);
+        return Err(error.to_string());
+    }
     let _ = window.emit("settings-opened", ());
     Ok(())
 }
@@ -2058,9 +2082,7 @@ fn toggle_palette(app: &tauri::AppHandle) {
         return;
     }
 
-    if let Some(settings) = app.get_webview_window("settings") {
-        let _ = settings.hide();
-    }
+    let _ = hide_settings_window(app);
 
     let presentation = app.state::<PresentationState>();
     presentation.suppress_reopen.store(true, Ordering::SeqCst);
@@ -2117,7 +2139,7 @@ pub fn run() {
             if window.label() == "settings" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
-                    let _ = window.hide();
+                    let _ = hide_settings_window(window.app_handle());
                 }
             }
         })
@@ -2340,6 +2362,7 @@ pub fn run() {
             set_start_at_login,
             open_login_items_settings,
             palette_test_mode,
+            close_settings,
             open_settings,
             get_permission_status,
             request_permission,

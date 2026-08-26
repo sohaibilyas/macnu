@@ -868,21 +868,25 @@ footer kbd {
   background: var(--control-surface);
 }
 
-.permission-setting-card > img,
 .permission-preview-icon {
   display: grid;
   width: 40px;
   height: 40px;
   place-items: center;
-  object-fit: contain;
-}
-
-.permission-preview-icon {
   border: 1px solid var(--accent-border);
   border-radius: 12px;
   color: var(--accent-text);
   background: var(--accent-surface);
   font-size: 20px;
+}
+
+.permission-preview-icon svg {
+  width: 22px;
+  height: 22px;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .permission-setting-copy {

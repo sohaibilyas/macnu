@@ -323,24 +323,35 @@ async function initSettings(): Promise<void> {
               </div>
               <div class="permission-settings-list">
                 <article class="permission-setting-card">
-                  <img src="${appIconUrl}" alt="" draggable="false" />
+                  <span class="permission-preview-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none">
+                      <circle cx="12" cy="4.75" r="1.75" fill="currentColor" />
+                      <path d="M5 8.25c2.1.8 4.45 1.2 7 1.2s4.9-.4 7-1.2M12 9.5v4.1m0 0-3.4 6m3.4-6 3.4 6" />
+                    </svg>
+                  </span>
                   <div class="permission-setting-copy">
                     <span class="permission-title-line">
                       <strong>Accessibility</strong>
                       <span class="permission-badge" data-permission-badge="accessibility">Checking…</span>
                     </span>
-                    <small>Required to read item names and open their original menus.</small>
+                    <small>Finds menu-bar items by name and opens the menu you choose.</small>
                   </div>
                   <button class="secondary-action permission-settings-action" data-open-permission="accessibility">Open Settings</button>
                 </article>
                 <article class="permission-setting-card">
-                  <span class="permission-preview-icon" aria-hidden="true">◎</span>
+                  <span class="permission-preview-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none">
+                      <rect x="3" y="4.5" width="18" height="13" rx="2.5" />
+                      <path d="M8.5 20h7M12 17.5V20" />
+                      <circle cx="12" cy="11" r="2.5" />
+                    </svg>
+                  </span>
                   <div class="permission-setting-copy">
                     <span class="permission-title-line">
                       <strong>Screen Recording</strong>
                       <span class="permission-badge optional" data-permission-badge="screen">Optional</span>
                     </span>
-                    <small>Adds exact menu-bar artwork. Search and opening still work without it.</small>
+                    <small>Captures only menu-bar icon images locally. Search and opening work without it.</small>
                   </div>
                   <button class="secondary-action permission-settings-action" data-open-permission="screen">Open Settings</button>
                 </article>
@@ -857,7 +868,7 @@ async function initSettings(): Promise<void> {
     licenseGateError.textContent = "";
     deactivationConfirmation.hidden = true;
     resetBusinessCheckout();
-    void currentWindow.hide();
+    void invoke("close_settings").catch(() => currentWindow.hide());
   }
 
   function updatePermissionStatus(next: PermissionStatus): void {
