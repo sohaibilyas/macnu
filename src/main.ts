@@ -54,6 +54,7 @@ type MenuIcon = {
   width: number;
   height: number;
   image: string;
+  isMacnu: boolean;
   activationPid?: number | null;
   activationBundleId?: string | null;
   activationIdentifier?: string | null;
@@ -1424,12 +1425,16 @@ function escapeHtml(value: string): string {
   );
 }
 
+function displayLabel(icon: MenuIcon): string {
+  return icon.isMacnu ? "Macnu" : icon.label;
+}
+
 function visibleIcons(): MenuIcon[] {
   const query = input.value.trim().toLocaleLowerCase();
   const icons = response?.icons ?? [];
   if (!query) return icons;
   return icons.filter((icon) =>
-    `${icon.label} ${icon.owner}`.toLocaleLowerCase().includes(query),
+    `${displayLabel(icon)} ${icon.owner}`.toLocaleLowerCase().includes(query),
   );
 }
 
@@ -1510,8 +1515,8 @@ function render(): void {
             <img src="${icon.image}" alt="" draggable="false" />
           </span>
           <span class="result-copy">
-            <strong>${escapeHtml(icon.label)}</strong>
-            <small>${escapeHtml(icon.owner)}</small>
+            <strong>${escapeHtml(displayLabel(icon))}</strong>
+            ${icon.isMacnu ? "" : `<small>${escapeHtml(icon.owner)}</small>`}
           </span>
           <span class="open-hint">↵</span>
         </button>
@@ -1573,6 +1578,7 @@ function responsesEqual(
       icon.width === other.width &&
       icon.height === other.height &&
       icon.image === other.image &&
+      icon.isMacnu === other.isMacnu &&
       icon.activationPid === other.activationPid &&
       icon.activationBundleId === other.activationBundleId &&
       icon.activationIdentifier === other.activationIdentifier &&

@@ -46,6 +46,8 @@ struct MenuIcon {
     height: f64,
     image: String,
     #[serde(default)]
+    is_macnu: bool,
+    #[serde(default)]
     activation_pid: Option<i32>,
     #[serde(default)]
     activation_bundle_id: Option<String>,
@@ -1518,6 +1520,18 @@ fn response_is_cacheable(response: &MenuResponse) -> bool {
     !response.accessibility_denied && response.error.is_none()
 }
 
+fn is_current_process_icon(icon: &MenuIcon) -> bool {
+    i32::try_from(std::process::id())
+        .ok()
+        .is_some_and(|pid| icon.activation_pid == Some(pid))
+}
+
+fn identify_macnu_icons(response: &mut MenuResponse) {
+    for icon in &mut response.icons {
+        icon.is_macnu = is_current_process_icon(icon);
+    }
+}
+
 fn refresh_menu_cache(cache: &MenuCache, force: bool) -> Result<CacheRefresh, String> {
     if let Err(error) = require_accessibility() {
         let _ = cache.clear();
@@ -1554,7 +1568,8 @@ fn refresh_menu_cache(cache: &MenuCache, force: bool) -> Result<CacheRefresh, St
         }
     }
 
-    let response = copy_native_menu_icons()?;
+    let mut response = copy_native_menu_icons()?;
+    identify_macnu_icons(&mut response);
     if let Err(error) = require_accessibility() {
         cache
             .responses
@@ -1649,6 +1664,9 @@ fn active_display_menu_icons(
 async fn activate_menu_icon(app: AppHandle, icon: MenuIcon) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
+        if icon.is_macnu && is_current_process_icon(&icon) {
+            return open_settings(app);
+        }
         require_ready(&app)?;
         let activation_app = app.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -2396,6 +2414,7 @@ mod tests {
             width: 24.0,
             height: 24.0,
             image: "data:image/png;base64,test".to_string(),
+            is_macnu: false,
             activation_pid: Some(100),
             activation_bundle_id: Some("example.status".to_string()),
             activation_identifier: Some(identifier.to_string()),
@@ -2903,6 +2922,19 @@ mod tests {
             request.activation_identifier.as_deref(),
             Some("stable-item-id")
         );
+    }
+
+    #[test]
+    fn self_entry_is_identified_by_process_and_keeps_native_activation_label() {
+        let mut catalog = response();
+        catalog.icons[0].activation_pid = i32::try_from(std::process::id()).ok();
+        catalog.icons[0].label = "Macnu — Command+Semicolon".to_string();
+
+        identify_macnu_icons(&mut catalog);
+
+        assert!(catalog.icons[0].is_macnu);
+        assert_eq!(catalog.icons[0].label, "Macnu — Command+Semicolon");
+        assert!(!catalog.icons[1].is_macnu);
     }
 
     #[test]
