@@ -1205,7 +1205,10 @@ async function initSettings(): Promise<void> {
         .finally(() => (confirmDeactivationButton.disabled = false));
       return;
     }
-    const appearance = target.closest<HTMLButtonElement>("[data-appearance]");
+    // The selected theme also lives on <html data-appearance="…">. Keep
+    // delegated clicks scoped to the picker buttons so a click elsewhere in
+    // Settings cannot mistake the document root for an appearance control.
+    const appearance = target.closest<HTMLButtonElement>("button[data-appearance]");
     if (appearance) {
       saveAppearance(appearance.dataset.appearance as Appearance);
       updateAppearanceControls();

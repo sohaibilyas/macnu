@@ -819,10 +819,15 @@ footer kbd {
 }
 
 .settings-message {
+  min-width: 0;
+  max-height: 48px;
+  overflow: auto;
   min-height: 28px;
   padding: 9px 3px 0;
   color: var(--accent-muted);
   font-size: 10.5px;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .settings-message.error {
