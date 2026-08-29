@@ -38,6 +38,21 @@ function packageVersionFromCargo() {
   return version;
 }
 
+function packageVersionFromCargoLock() {
+  const cargoLock = fs.readFileSync(
+    path.join(projectRoot, "src-tauri/Cargo.lock"),
+    "utf8",
+  );
+  const packageBlock = cargoLock
+    .split(/\n\[\[package\]\]\n/)
+    .find((block) => /^name\s*=\s*"macnu"\s*$/m.test(block));
+  const version = packageBlock?.match(/^version\s*=\s*"([^"]+)"\s*$/m)?.[1];
+  if (!version) {
+    fail("src-tauri/Cargo.lock has no macnu package version.");
+  }
+  return version;
+}
+
 const options = {
   printVersion: false,
   requireClean: false,
@@ -79,6 +94,7 @@ const versions = new Map([
   ["package-lock.json", packageLock.version],
   ["package-lock.json root package", packageLock.packages?.[""]?.version],
   ["src-tauri/Cargo.toml", packageVersionFromCargo()],
+  ["src-tauri/Cargo.lock macnu package", packageVersionFromCargoLock()],
   ["src-tauri/tauri.conf.json", tauriConfig.version],
 ]);
 

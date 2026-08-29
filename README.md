@@ -19,6 +19,10 @@ are using, including multi-monitor Mac setups.
 - Press Tab or Right Arrow to search exposed standard menu actions without opening the native menu.
 - Find hidden menu bar icons behind the MacBook notch or crowded app menus.
 - Launch Macnu on the active display with a customizable keyboard shortcut.
+- Pin favorites and add local aliases to menu bar items Macnu can identify reliably.
+- Assign direct global shortcuts when an app exposes a durable menu bar item identifier.
+- Use Smart ordering to bring frequently and recently opened items forward on each display.
+- Switch between Smart, menu bar, and alphabetical ordering or reset local usage history at any time.
 - Cache discovered items and refresh the menu bar catalog in the background.
 - Match macOS light mode, dark mode, or the current system appearance.
 - Start Macnu at login and keep the launcher available from the menu bar.
@@ -43,14 +47,16 @@ Click the Macnu menu bar icon or press **Command + Semicolon**.
 3. Press Enter to open its menu or popover.
 4. Press Tab or Right Arrow to browse that item's standard menu actions.
 5. Press Enter to run an action, or Left Arrow to return to menu bar icons.
-6. Press Escape, use the shortcut again, or click elsewhere to close Macnu.
+6. Press Command + E on a supported result to customize its name, favorite state, or direct shortcut.
+7. Press Escape, use the shortcut again, or click elsewhere to close Macnu.
 
 Macnu never clicks a status item merely to discover its actions. Apps that
 build commands only after a click, including custom popovers, use the original
 menu fallback instead.
 
-Settings lets you change the shortcut and appearance, enable Start at Login,
-manage your license, and check for updates.
+Settings lets you change the launcher shortcut and appearance, choose how
+results are ordered, control per-display personalization, enable Start at
+Login, manage your license, and check for updates.
 
 ## Permissions and privacy
 
@@ -68,6 +74,10 @@ Macnu processes the menu bar catalog and captured artwork on your Mac. The
 official app contacts the licensing service when you activate a license and
 periodically validates it. It checks GitHub for updates automatically and when
 you request a manual check.
+
+Aliases, favorites, direct shortcuts, and Smart ordering history (usage counts
+and last-used times) stay in Macnu's local app data. You can clear Smart
+ordering history from Settings without removing the other customizations.
 
 ## Build from source
 
@@ -95,6 +105,7 @@ Run the main verification commands:
 
 ```sh
 npm run build
+npm run test:ui
 npm run test:rust:source
 swift test --package-path src-tauri/native
 npm --prefix services/lemon-webhook run check
@@ -102,10 +113,10 @@ npm --prefix services/lemon-webhook run check
 
 ## Official releases
 
-GitHub Releases hosts the official universal macOS downloads. Apple signs and
-notarizes each customer build. Macnu verifies the signed update manifest,
-downloaded archive, bundle identity, version, architectures, and Apple
-notarization before it installs an update.
+GitHub Releases hosts the official universal macOS downloads. Macnu’s developer
+signs each customer build with Developer ID, and Apple notarizes it. Macnu
+verifies the updater archive signature, downloaded archive, bundle identity,
+version, architectures, and Apple notarization before it installs an update.
 
 The maintainer keeps signing credentials and private publication instructions
 outside this repository.

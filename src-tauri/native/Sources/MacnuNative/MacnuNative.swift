@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import CryptoKit
 import Foundation
 import ScreenCaptureKit
 import Security
@@ -33,6 +34,7 @@ struct AccessibilityCandidate {
 }
 
 private struct MenuIcon: Codable {
+    let itemId: String?
     let windowId: UInt32
     let owner: String
     let label: String
@@ -273,6 +275,7 @@ private func installationIdentifier() -> String? {
 private struct CaptureResponse: Codable {
     let icons: [MenuIcon]
     let displayId: UInt32
+    let displayKey: String
     let screenCaptureDenied: Bool
     let accessibilityDenied: Bool
     let error: String?
@@ -329,6 +332,64 @@ private func activeDisplayIdUnderPointer() -> CGDirectDisplayID {
         return CGMainDisplayID()
     }
     return displayId
+}
+
+private func hashedStableKeyComponent(_ value: String) -> String {
+    SHA256.hash(data: Data(value.utf8))
+        .map { String(format: "%02x", $0) }
+        .joined()
+}
+
+private func versionedStableKey(
+    namespace: String,
+    components: [String]
+) -> String {
+    (["v1", namespace] + components.map(hashedStableKeyComponent))
+        .joined(separator: ".")
+}
+
+private func stableDisplayMetric(_ value: CGFloat) -> String {
+    guard value.isFinite else { return "unknown" }
+    let normalized = value == 0 ? 0 : Double(value)
+    return String(normalized)
+}
+
+func stableDisplayKey(
+    uuidString: String?,
+    bounds: CGRect
+) -> String {
+    let trimmedUUID = uuidString?.trimmingCharacters(
+        in: .whitespacesAndNewlines
+    )
+    if let trimmedUUID,
+       let uuid = UUID(uuidString: trimmedUUID) {
+        return versionedStableKey(
+            namespace: "display-uuid",
+            components: [uuid.uuidString.lowercased()]
+        )
+    }
+
+    return versionedStableKey(
+        namespace: "display-bounds",
+        components: [
+            stableDisplayMetric(bounds.minX),
+            stableDisplayMetric(bounds.minY),
+            stableDisplayMetric(bounds.width),
+            stableDisplayMetric(bounds.height)
+        ]
+    )
+}
+
+private func stableDisplayKey(for displayId: CGDirectDisplayID) -> String {
+    let uuid = CGDisplayCreateUUIDFromDisplayID(displayId)?
+        .takeRetainedValue()
+    let uuidString = uuid.flatMap {
+        CFUUIDCreateString(kCFAllocatorDefault, $0) as String?
+    }
+    return stableDisplayKey(
+        uuidString: uuidString,
+        bounds: CGDisplayBounds(displayId)
+    )
 }
 
 private func menuWindows(
@@ -1098,6 +1159,92 @@ func catalogCandidates(
     .sorted {
         projectedFrame(for: $0, onto: targetDisplay, displays: displays).minX
             < projectedFrame(for: $1, onto: targetDisplay, displays: displays).minX
+    }
+}
+
+private struct StableMenuItemIdentitySource {
+    let bundleIdentifier: String?
+    let identifier: String?
+    let label: String?
+    let role: String?
+}
+
+private func normalizedStableIdentityComponent(
+    _ value: String?
+) -> String? {
+    guard let value else { return nil }
+    let normalized = value.precomposedStringWithCanonicalMapping
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return normalized.isEmpty ? nil : normalized
+}
+
+private func stableIdentityCounts(
+    _ values: [String?]
+) -> [String: Int] {
+    Dictionary(
+        grouping: values.compactMap { $0 },
+        by: { $0 }
+    ).mapValues(\.count)
+}
+
+func stableMenuItemIdentities(
+    _ candidates: [AccessibilityCandidate]
+) -> [String?] {
+    let sources = candidates.map { candidate in
+        StableMenuItemIdentitySource(
+            bundleIdentifier: normalizedStableIdentityComponent(
+                candidate.bundleIdentifier
+            ),
+            identifier: normalizedStableIdentityComponent(
+                candidate.identifier
+            ),
+            label: normalizedStableIdentityComponent(candidate.label),
+            role: normalizedStableIdentityComponent(candidate.role)
+        )
+    }
+    let identifierKeys = sources.map { source -> String? in
+        guard let bundleIdentifier = source.bundleIdentifier,
+              let identifier = source.identifier else {
+            return nil
+        }
+        return versionedStableKey(
+            namespace: "item-identifier",
+            components: [bundleIdentifier, identifier]
+        )
+    }
+    let identifierCounts = stableIdentityCounts(identifierKeys)
+    let labelRoleKeys = sources.map { source -> String? in
+        guard let bundleIdentifier = source.bundleIdentifier,
+              let label = source.label,
+              let role = source.role else {
+            return nil
+        }
+        return versionedStableKey(
+            namespace: "item-label-role",
+            components: [bundleIdentifier, label, role]
+        )
+    }
+    let labelRoleCounts = stableIdentityCounts(labelRoleKeys)
+
+    return sources.indices.map { index in
+        guard sources[index].bundleIdentifier != nil else {
+            return nil
+        }
+
+        if let identifierKey = identifierKeys[index] {
+            // An identifier is authoritative only when it names exactly one
+            // item from this bundle. A duplicate identifier must not silently
+            // fall back to a label or geometry.
+            return identifierCounts[identifierKey] == 1
+                ? identifierKey
+                : nil
+        }
+
+        guard let labelRoleKey = labelRoleKeys[index],
+              labelRoleCounts[labelRoleKey] == 1 else {
+            return nil
+        }
+        return labelRoleKey
     }
 }
 
@@ -2313,6 +2460,7 @@ private func captureMenuIcons() async -> CaptureResponse {
     let displays = activeDisplayBounds()
     let targetDisplayId = activeDisplayIdUnderPointer()
     let targetDisplay = CGDisplayBounds(targetDisplayId)
+    let targetDisplayKey = stableDisplayKey(for: targetDisplayId)
     let allWindows = menuWindows(in: displays, collapseCopies: false).filter { window in
         return containingDisplay(for: window.bounds, in: displays) == targetDisplay
     }
@@ -2331,6 +2479,7 @@ private func captureMenuIcons() async -> CaptureResponse {
             targetDisplay: targetDisplay,
             displays: displays
         )
+        let catalogItemIds = stableMenuItemIdentities(catalog)
         let confidentMatches = confidentWindowMatches(
             windows: windows,
             candidates: catalog,
@@ -2553,6 +2702,7 @@ private func captureMenuIcons() async -> CaptureResponse {
                 capturedAt: captureTimestamp
             )
             return MenuIcon(
+                itemId: catalogItemIds[index],
                 windowId: menuWindow?.id ?? 0,
                 owner: candidate.appName,
                 label: candidate.label,
@@ -2576,6 +2726,7 @@ private func captureMenuIcons() async -> CaptureResponse {
         return CaptureResponse(
             icons: icons,
             displayId: targetDisplayId,
+            displayKey: targetDisplayKey,
             screenCaptureDenied: screenCaptureDenied,
             accessibilityDenied: accessibilityDenied,
             error: nil
@@ -2584,6 +2735,7 @@ private func captureMenuIcons() async -> CaptureResponse {
         return CaptureResponse(
             icons: [],
             displayId: targetDisplayId,
+            displayKey: targetDisplayKey,
             screenCaptureDenied: screenCaptureDenied,
             accessibilityDenied: accessibilityDenied,
             error: error.localizedDescription
@@ -2612,10 +2764,12 @@ public func macnuCopyMenuIconsJSON() -> UnsafeMutablePointer<CChar>? {
     }
     semaphore.wait()
 
+    let fallbackDisplayId = activeDisplayIdUnderPointer()
     return encodedResponse(
         box.response ?? CaptureResponse(
             icons: [],
-            displayId: activeDisplayIdUnderPointer(),
+            displayId: fallbackDisplayId,
+            displayKey: stableDisplayKey(for: fallbackDisplayId),
             screenCaptureDenied: false,
             accessibilityDenied: !AXIsProcessTrusted(),
             error: "Menu capture did not return a result."

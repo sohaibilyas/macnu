@@ -116,6 +116,7 @@ jobs:
           cargo fmt --manifest-path vendor/tauri-plugin-updater/Cargo.toml -- --check
           npm run build
           npm run test:rust:source
+          npm run test:ui
           npm run test:rust:official
           npm run test:release-verifier
           npm run test:release-shell

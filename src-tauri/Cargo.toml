@@ -1,6 +1,6 @@
 [package]
 name = "macnu"
-version = "0.2.0"
+version = "0.3.0"
 description = "A fast, searchable launcher for crowded macOS menu bars"
 authors = ["Sohaib Ilyas"]
 edition = "2021"

@@ -1,7 +1,7 @@
 {
   "name": "macnu",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "PolyForm-Noncommercial-1.0.0",
   "author": "Sohaib Ilyas",
   "repository": {
@@ -20,6 +20,7 @@
     "release:preflight": "node ./scripts/release-preflight.mjs",
     "release:sign-updater": "./scripts/sign-updater.sh",
     "release:prepare": "./scripts/prepare-release.sh",
+    "test:ui": "vitest run src/*.test.ts",
     "test:rust:source": "./scripts/test-rust.sh source-build",
     "test:rust:official": "./scripts/test-rust.sh official-distribution",
     "test:release-verifier": "cargo test --locked --manifest-path tools/release-verifier/Cargo.toml",
@@ -35,6 +36,7 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.4",
     "typescript": "~5.8.3",
-    "vite": "^7.1.7"
+    "vite": "^7.1.7",
+    "vitest": "^3.2.4"
   }
 }
