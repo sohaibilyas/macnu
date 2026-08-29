@@ -10,3 +10,10 @@ export function itemShortcutErrorKeyAction(
   if (key === "Tab") return "focus-dismiss";
   return "block";
 }
+
+export function paletteResultLabel(
+  isMacnu: boolean,
+  personalizedLabel: string,
+): string {
+  return isMacnu ? "Macnu" : personalizedLabel;
+}

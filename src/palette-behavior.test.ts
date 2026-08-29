@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { itemShortcutErrorKeyAction } from "./palette-behavior";
+import {
+  itemShortcutErrorKeyAction,
+  paletteResultLabel,
+} from "./palette-behavior";
 
 describe("direct-shortcut error keyboard policy", () => {
   it("dismisses on Enter and moves Tab to the visible recovery control", () => {
@@ -13,4 +16,11 @@ describe("direct-shortcut error keyboard policy", () => {
       expect(itemShortcutErrorKeyAction(key)).toBe("block");
     },
   );
+});
+
+describe("palette result labels", () => {
+  it("keeps native activation metadata out of the visible Macnu title", () => {
+    expect(paletteResultLabel(true, "Macnu \u2014 Command+Semicolon")).toBe("Macnu");
+    expect(paletteResultLabel(false, "Work VPN")).toBe("Work VPN");
+  });
 });

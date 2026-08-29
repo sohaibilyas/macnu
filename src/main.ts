@@ -9,7 +9,10 @@ import {
   type PersonalizedMenuItem,
   type RankingMode,
 } from "./personalization";
-import { itemShortcutErrorKeyAction } from "./palette-behavior";
+import {
+  itemShortcutErrorKeyAction,
+  paletteResultLabel,
+} from "./palette-behavior";
 import "./styles.css";
 
 type Appearance = "system" | "light" | "dark";
@@ -2301,6 +2304,7 @@ function render(): void {
               >•••</button>
             `
           : "";
+        const resultLabel = paletteResultLabel(icon.isMacnu, entry.displayLabel);
         return `
         <div
           class="result-row ${index === selectedIndex ? "selected" : ""} ${itemId ? "" : "no-customization"}"
@@ -2323,7 +2327,7 @@ function render(): void {
               <img src="${icon.image}" alt="" draggable="false" />
             </span>
             <span class="result-copy">
-              <strong>${escapeHtml(entry.displayLabel)}</strong>
+              <strong>${escapeHtml(resultLabel)}</strong>
               ${icon.isMacnu || !context ? "" : `<small>${escapeHtml(context)}</small>`}
             </span>
             <span class="result-tail" aria-hidden="true">
