@@ -114,15 +114,17 @@ describe("ranking", () => {
   ];
 
   it.each<RankingMode>(["smart", "menuBar", "alphabetical"])(
-    "puts favorites first for an empty query in %s mode",
+    "puts pins first for empty and whitespace-only queries in %s mode",
     (mode) => {
-      const ranked = rankPersonalizedItems(
-        rows,
-        { third: { favorite: true } },
-        { query: "", mode, now: NOW },
-      );
+      for (const query of ["", "  \t\n  "]) {
+        const ranked = rankPersonalizedItems(
+          rows,
+          { third: { favorite: true } },
+          { query, mode, now: NOW },
+        );
 
-      expect(ranked[0].itemId).toBe("third");
+        expect(ranked[0].itemId, JSON.stringify(query)).toBe("third");
+      }
     },
   );
 
@@ -144,7 +146,7 @@ describe("ranking", () => {
     ).toEqual(["third", "second", "first"]);
   });
 
-  it("sorts exact, prefix, then substring matches before favorites or usage", () => {
+  it("sorts exact, prefix, then substring matches before pins or usage", () => {
     const searchable = [
       item("substring", "Cloud Sync Tool", "Other", 0),
       item("prefix", "Anything", "Other", 1),
@@ -168,6 +170,39 @@ describe("ranking", () => {
       }).map(({ itemId }) => itemId),
     ).toEqual(["exact", "prefix", "substring"]);
   });
+
+  it.each([
+    ["smart", ["plain", "boosted"]],
+    ["menuBar", ["plain", "boosted"]],
+    ["alphabetical", ["boosted", "plain"]],
+  ] as const)(
+    "uses only relevance and the %s tie-breaker for equal search matches",
+    (mode, expected) => {
+      const searchable = [
+        item("plain", "Sync", "Shared Owner", 0),
+        item("boosted", "Sync", "Shared Owner", 1),
+      ];
+      const preferences: ItemPreferenceMap = {
+        boosted: {
+          alias: "Alpha",
+          favorite: true,
+          usageCount: 10_000,
+          lastUsedAt: NOW,
+        },
+      };
+
+      const ranked = rankPersonalizedItems(searchable, preferences, {
+        query: "shared owner",
+        mode,
+        now: NOW,
+      });
+
+      expect(
+        ranked.map((entry) => findSearchMatch(entry, "shared owner")?.relevance),
+      ).toEqual([3, 3]);
+      expect(ranked.map(({ itemId }) => itemId)).toEqual(expected);
+    },
+  );
 
   it("uses bounded frequency and recency for smart mode", () => {
     const active = item("active", "Active", "Owner", 1);

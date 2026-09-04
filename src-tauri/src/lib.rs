@@ -110,14 +110,14 @@ impl From<MenuIcon> for ActivationRequest {
         }
     }
 }
-#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MenuActionPathSegment {
     title: String,
     occurrence: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MenuAction {
     id: String,
@@ -203,13 +203,22 @@ struct ActiveDisplayCache {
 
 const DEFAULT_SHORTCUT: &str = "Command+Semicolon";
 const PREFERENCES_STATE_VERSION: u8 = 1;
-const CATALOG_STATE_VERSION: u8 = 1;
+const CATALOG_STATE_VERSION: u8 = 2;
 const GLOBAL_PERSONALIZATION_SCOPE: &str = "global";
 const MAX_PERSONALIZED_ITEMS: usize = 512;
 const MAX_PERSONALIZED_DISPLAYS: usize = 64;
 const MAX_FAVORITES_PER_SCOPE: usize = 256;
 const MAX_ALIAS_CHARACTERS: usize = 48;
 const MAX_USAGE_COUNT: u64 = 1_000_000;
+const MAX_SAVED_ACTIONS: usize = 256;
+const MAX_SAVED_ACTION_ID_BYTES: usize = 64;
+const MAX_ACTION_PATH_DEPTH: usize = 16;
+const MAX_ACTION_TITLE_CHARACTERS: usize = 128;
+const MAX_ACTION_DESCRIPTOR_ID_BYTES: usize = 4_096;
+const MAX_ACTION_SHORTCUT_CHARACTERS: usize = 64;
+const MAX_SAVED_ACTION_OWNER_CHARACTERS: usize = 128;
+const MAX_SAVED_ACTION_LABEL_CHARACTERS: usize = 256;
+const MAX_ACTION_PATH_OCCURRENCE: usize = 4_096;
 const ACCESSIBILITY_REQUIRED_MESSAGE: &str = "Accessibility permission is required to use Macnu.";
 const SETUP_REQUIRED_MESSAGE: &str = "Complete Macnu setup before using the menu search.";
 // WindowServer signature changes invalidate immediately. The time limit is a
@@ -673,6 +682,8 @@ struct ItemCustomization {
     shortcut: Option<String>,
     #[serde(default)]
     global_usage: UsageStats,
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -682,6 +693,23 @@ struct DisplayCustomization {
     favorites: Vec<String>,
     #[serde(default)]
     usage: HashMap<String, UsageStats>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedAction {
+    parent_item_id: String,
+    owner: String,
+    parent_label: String,
+    action: MenuAction,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    shortcut: Option<String>,
+    #[serde(default)]
+    global_usage: UsageStats,
+    #[serde(default)]
+    display_usage: HashMap<String, UsageStats>,
 }
 
 fn catalog_state_version() -> u8 {
@@ -699,6 +727,8 @@ struct CatalogState {
     global_favorites: Vec<String>,
     #[serde(default)]
     displays: HashMap<String, DisplayCustomization>,
+    #[serde(default)]
+    saved_actions: HashMap<String, SavedAction>,
 }
 
 impl Default for CatalogState {
@@ -708,8 +738,20 @@ impl Default for CatalogState {
             items: HashMap::new(),
             global_favorites: Vec::new(),
             displays: HashMap::new(),
+            saved_actions: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogStateV1 {
+    #[serde(default)]
+    items: HashMap<String, ItemCustomization>,
+    #[serde(default)]
+    global_favorites: Vec<String>,
+    #[serde(default)]
+    displays: HashMap<String, DisplayCustomization>,
 }
 
 #[derive(Clone)]
@@ -728,6 +770,21 @@ struct ItemCustomizationView {
     favorite: bool,
     usage_count: u64,
     last_used_at: Option<u64>,
+    hidden: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedActionView {
+    id: String,
+    parent_item_id: String,
+    owner: String,
+    parent_label: String,
+    action: MenuAction,
+    alias: Option<String>,
+    shortcut: Option<String>,
+    usage_count: u64,
+    last_used_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -737,6 +794,7 @@ struct CatalogCustomizationsResponse {
     personalize_per_display: bool,
     display_key: String,
     items: HashMap<String, ItemCustomizationView>,
+    saved_actions: HashMap<String, SavedActionView>,
 }
 
 #[derive(Clone)]
@@ -2214,6 +2272,16 @@ fn persist_preferences(state: &PreferencesState, preferences: &Preferences) -> R
     fs::rename(&temporary, &state.path).map_err(|error| format!("Could not save settings: {error}"))
 }
 
+fn migrate_catalog_state_v1(state: CatalogStateV1) -> CatalogState {
+    CatalogState {
+        version: CATALOG_STATE_VERSION,
+        items: state.items,
+        global_favorites: state.global_favorites,
+        displays: state.displays,
+        saved_actions: HashMap::new(),
+    }
+}
+
 fn decode_catalog_state(
     json: &str,
     now: u64,
@@ -2225,14 +2293,33 @@ fn decode_catalog_state(
             write_protected: true,
         };
     };
-    if !stored_version_is_supported(&value, CATALOG_STATE_VERSION) {
-        return LoadedPersistentState {
-            value: CatalogState::default(),
-            write_protected: true,
-        };
-    }
 
-    match serde_json::from_value::<CatalogState>(value) {
+    let stored_version = match value.get("version") {
+        None => 1,
+        Some(version) => match version.as_u64() {
+            Some(version) => version,
+            None => {
+                return LoadedPersistentState {
+                    value: CatalogState::default(),
+                    write_protected: true,
+                };
+            }
+        },
+    };
+    let decoded = match stored_version {
+        1 => serde_json::from_value::<CatalogStateV1>(value).map(migrate_catalog_state_v1),
+        version if version == u64::from(CATALOG_STATE_VERSION) => {
+            serde_json::from_value::<CatalogState>(value)
+        }
+        _ => {
+            return LoadedPersistentState {
+                value: CatalogState::default(),
+                write_protected: true,
+            };
+        }
+    };
+
+    match decoded {
         Ok(state) => LoadedPersistentState {
             value: sanitize_catalog_state(state, now, reserved_shortcut_id),
             write_protected: false,
@@ -2332,6 +2419,100 @@ fn valid_display_key(display_key: &str) -> bool {
         || valid_versioned_key(display_key, "display-bounds", 4, 256)
 }
 
+fn valid_saved_action_id(saved_action_id: &str) -> bool {
+    valid_versioned_key(
+        saved_action_id,
+        "saved-action",
+        1,
+        MAX_SAVED_ACTION_ID_BYTES,
+    )
+}
+
+fn normalized_saved_text(
+    value: String,
+    maximum_characters: usize,
+    field: &str,
+) -> Result<String, String> {
+    let value = value.trim().to_string();
+    if value.is_empty()
+        || value.chars().count() > maximum_characters
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "Saved action {field} must contain 1 to {maximum_characters} visible characters."
+        ));
+    }
+    Ok(value)
+}
+
+fn menu_action_identifier(path: &[MenuActionPathSegment]) -> String {
+    path.iter()
+        .map(|segment| {
+            format!(
+                "{}:{}#{}",
+                segment.title.len(),
+                segment.title,
+                segment.occurrence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn validate_menu_action(action: &MenuAction) -> Result<(), String> {
+    if action.path.is_empty() || action.path.len() > MAX_ACTION_PATH_DEPTH {
+        return Err(format!(
+            "Saved actions support menu paths between 1 and {MAX_ACTION_PATH_DEPTH} levels."
+        ));
+    }
+    for segment in &action.path {
+        if segment.title.trim() != segment.title
+            || segment.title.is_empty()
+            || segment.title.chars().count() > MAX_ACTION_TITLE_CHARACTERS
+            || segment.title.chars().any(char::is_control)
+            || segment.occurrence > MAX_ACTION_PATH_OCCURRENCE
+        {
+            return Err("That menu action contains invalid or oversized path data.".to_string());
+        }
+    }
+    if action.title
+        != action
+            .path
+            .last()
+            .map(|segment| segment.title.as_str())
+            .unwrap_or("")
+        || action.id.is_empty()
+        || action.id.len() > MAX_ACTION_DESCRIPTOR_ID_BYTES
+        || action.id.chars().any(char::is_control)
+        || action.id != menu_action_identifier(&action.path)
+    {
+        return Err("That menu action descriptor is invalid or has changed.".to_string());
+    }
+    if action.shortcut.as_ref().is_some_and(|shortcut| {
+        shortcut.chars().count() > MAX_ACTION_SHORTCUT_CHARACTERS
+            || shortcut.chars().any(char::is_control)
+    }) {
+        return Err("That menu action contains invalid shortcut metadata.".to_string());
+    }
+    Ok(())
+}
+
+fn stable_hash64(bytes: &[u8], seed: u64) -> u64 {
+    bytes.iter().fold(seed, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn saved_action_id(parent_item_id: &str, action: &MenuAction) -> String {
+    let mut identity = Vec::with_capacity(parent_item_id.len() + action.id.len() + 1);
+    identity.extend_from_slice(parent_item_id.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(action.id.as_bytes());
+    let first = stable_hash64(&identity, 0xcbf29ce484222325);
+    let second = stable_hash64(&identity, 0x84222325cbf29ce4);
+    format!("v1.saved-action.{first:016x}{second:016x}")
+}
+
 fn normalized_alias(alias: Option<String>) -> Result<Option<String>, String> {
     let alias = alias
         .map(|value| value.trim().to_string())
@@ -2382,6 +2563,96 @@ fn sanitize_usage(usage: &mut UsageStats, now: u64) {
     };
 }
 
+fn sanitize_saved_action(
+    saved_action_id_value: &str,
+    mut saved_action: SavedAction,
+    now: u64,
+) -> Option<SavedAction> {
+    if !valid_saved_action_id(saved_action_id_value)
+        || !valid_item_id(&saved_action.parent_item_id)
+        || saved_action_id(&saved_action.parent_item_id, &saved_action.action)
+            != saved_action_id_value
+        || validate_menu_action(&saved_action.action).is_err()
+    {
+        return None;
+    }
+    saved_action.owner = normalized_saved_text(
+        saved_action.owner,
+        MAX_SAVED_ACTION_OWNER_CHARACTERS,
+        "owner",
+    )
+    .ok()?;
+    saved_action.parent_label = normalized_saved_text(
+        saved_action.parent_label,
+        MAX_SAVED_ACTION_LABEL_CHARACTERS,
+        "parent label",
+    )
+    .ok()?;
+    saved_action.alias = normalized_alias(saved_action.alias).ok().flatten();
+    saved_action.shortcut = if valid_item_shortcut_id(&saved_action.parent_item_id) {
+        normalized_item_shortcut(saved_action.shortcut)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    sanitize_usage(&mut saved_action.global_usage, now);
+
+    let mut display_usage: Vec<_> = saved_action
+        .display_usage
+        .into_iter()
+        .filter(|(display_key, _)| valid_display_key(display_key))
+        .collect();
+    display_usage.sort_by(|left, right| left.0.cmp(&right.0));
+    display_usage.truncate(MAX_PERSONALIZED_DISPLAYS);
+    saved_action.display_usage = display_usage
+        .into_iter()
+        .filter_map(|(display_key, mut usage)| {
+            sanitize_usage(&mut usage, now);
+            (usage != UsageStats::default()).then_some((display_key, usage))
+        })
+        .collect();
+    Some(saved_action)
+}
+
+fn sanitize_direct_shortcut_collisions(
+    items: &mut HashMap<String, ItemCustomization>,
+    saved_actions: &mut HashMap<String, SavedAction>,
+    reserved_shortcut_id: Option<u32>,
+) {
+    let mut counts = HashMap::new();
+    for id in items
+        .values()
+        .filter_map(|item| item.shortcut.as_deref())
+        .chain(
+            saved_actions
+                .values()
+                .filter_map(|action| action.shortcut.as_deref()),
+        )
+        .filter_map(|shortcut| shortcut_id(shortcut).ok())
+    {
+        *counts.entry(id).or_insert(0usize) += 1;
+    }
+    let keep = |shortcut: &Option<String>| {
+        shortcut
+            .as_deref()
+            .and_then(|value| shortcut_id(value).ok())
+            .is_some_and(|id| {
+                counts.get(&id).copied() == Some(1) && reserved_shortcut_id != Some(id)
+            })
+    };
+    for item in items.values_mut() {
+        if item.shortcut.is_some() && !keep(&item.shortcut) {
+            item.shortcut = None;
+        }
+    }
+    for action in saved_actions.values_mut() {
+        if action.shortcut.is_some() && !keep(&action.shortcut) {
+            action.shortcut = None;
+        }
+    }
+}
+
 fn sanitize_item_references(references: Vec<String>, item_ids: &HashSet<String>) -> Vec<String> {
     let mut references: Vec<_> = references
         .into_iter()
@@ -2408,6 +2679,7 @@ fn item_customization_is_empty(customization: &ItemCustomization) -> bool {
     customization.alias.is_none()
         && customization.shortcut.is_none()
         && customization.global_usage == UsageStats::default()
+        && !customization.hidden
 }
 
 fn item_is_favorite(catalog: &CatalogState, item_id: &str) -> bool {
@@ -2439,7 +2711,10 @@ fn evict_oldest_usage_only_item(catalog: &mut CatalogState) -> Option<String> {
         .items
         .iter()
         .filter(|(item_id, item)| {
-            item.alias.is_none() && item.shortcut.is_none() && !item_is_favorite(catalog, item_id)
+            item.alias.is_none()
+                && item.shortcut.is_none()
+                && !item.hidden
+                && !item_is_favorite(catalog, item_id)
         })
         .map(|(item_id, _)| (latest_item_usage(catalog, item_id), item_id.clone()))
         .min()
@@ -2469,7 +2744,10 @@ fn retain_catalog_items_within_limit(catalog: &mut CatalogState) {
         .items
         .iter()
         .filter(|(item_id, item)| {
-            item.alias.is_some() || item.shortcut.is_some() || item_is_favorite(catalog, item_id)
+            item.alias.is_some()
+                || item.shortcut.is_some()
+                || item.hidden
+                || item_is_favorite(catalog, item_id)
         })
         .map(|(item_id, _)| item_id.clone())
         .collect();
@@ -2551,26 +2829,16 @@ fn sanitize_catalog_state(
         items.insert(item_id, customization);
     }
 
-    let mut shortcut_counts = HashMap::new();
-    for id in items
-        .values()
-        .filter_map(|item| item.shortcut.as_deref())
-        .filter_map(|shortcut| shortcut_id(shortcut).ok())
-    {
-        *shortcut_counts.entry(id).or_insert(0usize) += 1;
-    }
-    for item in items.values_mut() {
-        let Some(id) = item
-            .shortcut
-            .as_deref()
-            .and_then(|shortcut| shortcut_id(shortcut).ok())
-        else {
-            continue;
-        };
-        if shortcut_counts.get(&id).copied() != Some(1) || reserved_shortcut_id == Some(id) {
-            item.shortcut = None;
-        }
-    }
+    let mut raw_saved_actions: Vec<_> = state.saved_actions.into_iter().collect();
+    raw_saved_actions.sort_by(|left, right| left.0.cmp(&right.0));
+    raw_saved_actions.truncate(MAX_SAVED_ACTIONS);
+    let mut saved_actions: HashMap<_, _> = raw_saved_actions
+        .into_iter()
+        .filter_map(|(id, saved_action)| {
+            sanitize_saved_action(&id, saved_action, now).map(|saved_action| (id, saved_action))
+        })
+        .collect();
+    sanitize_direct_shortcut_collisions(&mut items, &mut saved_actions, reserved_shortcut_id);
 
     let item_ids: HashSet<_> = items.keys().cloned().collect();
     let global_favorites = sanitize_item_references(state.global_favorites, &item_ids);
@@ -2607,6 +2875,7 @@ fn sanitize_catalog_state(
         items,
         global_favorites,
         displays,
+        saved_actions,
     };
     prune_catalog_state(&mut sanitized);
     retain_catalog_items_within_limit(&mut sanitized);
@@ -2655,6 +2924,36 @@ fn resolved_customizations(
                     favorite: favorites.contains(item_id),
                     usage_count: usage.count,
                     last_used_at: usage.last_used_at,
+                    hidden: customization.hidden,
+                },
+            )
+        })
+        .collect();
+
+    let saved_actions = catalog
+        .saved_actions
+        .iter()
+        .map(|(id, saved_action)| {
+            let usage = if scope == GLOBAL_PERSONALIZATION_SCOPE {
+                &saved_action.global_usage
+            } else {
+                saved_action
+                    .display_usage
+                    .get(scope)
+                    .unwrap_or(&saved_action.global_usage)
+            };
+            (
+                id.clone(),
+                SavedActionView {
+                    id: id.clone(),
+                    parent_item_id: saved_action.parent_item_id.clone(),
+                    owner: saved_action.owner.clone(),
+                    parent_label: saved_action.parent_label.clone(),
+                    action: saved_action.action.clone(),
+                    alias: saved_action.alias.clone(),
+                    shortcut: saved_action.shortcut.clone(),
+                    usage_count: usage.count,
+                    last_used_at: usage.last_used_at,
                 },
             )
         })
@@ -2665,6 +2964,7 @@ fn resolved_customizations(
         personalize_per_display: preferences.personalize_per_display,
         display_key: display_key.to_string(),
         items,
+        saved_actions,
     }
 }
 
@@ -2696,7 +2996,7 @@ fn update_favorite_list(
 ) -> Result<(), String> {
     let already_favorite = favorites.iter().any(|existing| existing == item_id);
     if favorite && !already_favorite && favorites.len() >= MAX_FAVORITES_PER_SCOPE {
-        return Err("Macnu has reached the favorites limit for this display.".to_string());
+        return Err("Macnu has reached the pins limit for this display.".to_string());
     }
     favorites.retain(|existing| existing != item_id);
     if favorite {
@@ -2781,18 +3081,46 @@ fn menu_cache_contains_item(
     display_key: &str,
     item_id: &str,
 ) -> Result<bool, String> {
+    Ok(menu_cache_item(cache, display_key, item_id)?.is_some())
+}
+
+fn menu_cache_item(
+    cache: &MenuCache,
+    display_key: &str,
+    item_id: &str,
+) -> Result<Option<MenuIcon>, String> {
     let responses = cache
         .responses
         .lock()
         .map_err(|_| "The menu cache is unavailable.".to_string())?;
-    Ok(responses.values().any(|entry| {
-        entry.response.display_key == display_key
-            && entry
-                .response
-                .icons
-                .iter()
-                .any(|icon| !icon.is_macnu && icon.item_id.as_deref() == Some(item_id))
-    }))
+    Ok(responses
+        .values()
+        .filter(|entry| entry.response.display_key == display_key)
+        .flat_map(|entry| entry.response.icons.iter())
+        .find(|icon| !icon.is_macnu && icon.item_id.as_deref() == Some(item_id))
+        .cloned())
+}
+
+fn resolve_saved_action_parent_with_refresh<Lookup>(
+    display_key: &str,
+    item_id: &str,
+    mut lookup: Lookup,
+) -> Result<MenuIcon, String>
+where
+    Lookup: FnMut(bool) -> Result<Option<MenuIcon>, String>,
+{
+    for force in [false, true] {
+        if let Some(icon) = lookup(force)? {
+            if !icon.is_macnu
+                && icon.item_id.as_deref() == Some(item_id)
+                && icon.display_key.as_deref() == Some(display_key)
+            {
+                return Ok(icon);
+            }
+        }
+    }
+
+    Err("That menu-bar item is no longer available on this display.".to_string())
 }
 
 fn restore_released_shortcuts<Restore>(shortcuts: &[String], restore: &mut Restore) -> Vec<String>
@@ -2881,6 +3209,106 @@ where
     Ok(())
 }
 
+fn direct_shortcut_conflicts(
+    catalog: &CatalogState,
+    desired_id: u32,
+    excluded_item_id: Option<&str>,
+    excluded_saved_action_id: Option<&str>,
+) -> bool {
+    catalog.items.iter().any(|(item_id, item)| {
+        Some(item_id.as_str()) != excluded_item_id
+            && item
+                .shortcut
+                .as_deref()
+                .and_then(|shortcut| shortcut_id(shortcut).ok())
+                == Some(desired_id)
+    }) || catalog
+        .saved_actions
+        .iter()
+        .any(|(saved_action_id, action)| {
+            Some(saved_action_id.as_str()) != excluded_saved_action_id
+                && action
+                    .shortcut
+                    .as_deref()
+                    .and_then(|shortcut| shortcut_id(shortcut).ok())
+                    == Some(desired_id)
+        })
+}
+
+fn persist_catalog_with_shortcut_change(
+    app: &AppHandle,
+    store: &CatalogStateStore,
+    updated: CatalogState,
+    old_shortcut: Option<String>,
+    new_shortcut: Option<String>,
+) -> Result<(), String> {
+    let old_id = old_shortcut
+        .as_deref()
+        .and_then(|shortcut| shortcut_id(shortcut).ok());
+    let new_id = new_shortcut.as_deref().map(shortcut_id).transpose()?;
+    let registration_changed = old_id != new_id;
+    let old_registered: Vec<_> = old_shortcut
+        .filter(|shortcut| shortcut_id(shortcut).is_ok())
+        .into_iter()
+        .collect();
+    let mut released_old = Vec::new();
+    let mut registered_new = false;
+
+    if registration_changed {
+        released_old = release_shortcuts_atomically(
+            &old_registered,
+            |shortcut| {
+                app.global_shortcut()
+                    .unregister(shortcut)
+                    .map_err(|error| error.to_string())
+            },
+            |shortcut| {
+                app.global_shortcut()
+                    .register(shortcut)
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+        if let Some(shortcut) = new_shortcut.as_deref() {
+            if let Err(error) = app.global_shortcut().register(shortcut) {
+                let rollback_errors = restore_released_shortcuts(&released_old, &mut |old| {
+                    app.global_shortcut()
+                        .register(old)
+                        .map_err(|error| error.to_string())
+                });
+                return Err(error_with_rollback_details(
+                    format!("That shortcut is already in use or unavailable: {error}"),
+                    rollback_errors,
+                ));
+            }
+            registered_new = true;
+        }
+    }
+
+    if let Err(error) = persist_catalog_state(store, &updated) {
+        let mut rollback_errors = Vec::new();
+        if registered_new {
+            if let Some(shortcut) = new_shortcut.as_deref() {
+                if let Err(rollback_error) = app.global_shortcut().unregister(shortcut) {
+                    rollback_errors.push(format!(
+                        "Could not release the new shortcut {shortcut}: {rollback_error}"
+                    ));
+                }
+            }
+        }
+        rollback_errors.extend(restore_released_shortcuts(&released_old, &mut |old| {
+            app.global_shortcut()
+                .register(old)
+                .map_err(|error| error.to_string())
+        }));
+        return Err(error_with_rollback_details(error, rollback_errors));
+    }
+    *store
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.".to_string())? = updated;
+    Ok(())
+}
+
 // Tauri exposes command inputs and managed state as separate parameters.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
@@ -2891,6 +3319,7 @@ fn set_item_customization(
     alias: Option<String>,
     favorite: bool,
     shortcut: Option<String>,
+    hidden: bool,
     menu_cache: State<'_, MenuCache>,
     catalog: State<'_, CatalogStateStore>,
     preferences: State<'_, PreferencesState>,
@@ -2929,7 +3358,7 @@ fn set_item_customization(
         .map_err(|_| "The personalization data is unavailable.".to_string())?
         .clone();
 
-    let creates_item = alias.is_some() || shortcut.is_some() || favorite;
+    let creates_item = alias.is_some() || shortcut.is_some() || favorite || hidden;
     if !updated.items.contains_key(&item_id)
         && creates_item
         && !ensure_catalog_item_capacity(&mut updated)
@@ -2941,24 +3370,13 @@ fn set_item_customization(
         .items
         .get(&item_id)
         .and_then(|item| item.shortcut.clone());
-    let old_shortcut_id = old_shortcut
-        .as_deref()
-        .and_then(|value| shortcut_id(value).ok());
     let new_shortcut_id = shortcut.as_deref().map(shortcut_id).transpose()?;
     if let Some(new_id) = new_shortcut_id {
         if shortcut_id(&current_preferences.shortcut)? == new_id {
             return Err("That shortcut already opens Macnu.".to_string());
         }
-        let duplicate = updated.items.iter().any(|(existing_id, item)| {
-            existing_id != &item_id
-                && item
-                    .shortcut
-                    .as_deref()
-                    .and_then(|value| shortcut_id(value).ok())
-                    == Some(new_id)
-        });
-        if duplicate {
-            return Err("That shortcut is already assigned to another menu-bar item.".to_string());
+        if direct_shortcut_conflicts(&updated, new_id, Some(&item_id), None) {
+            return Err("That shortcut is already assigned to another direct command.".to_string());
         }
     }
 
@@ -2966,6 +3384,7 @@ fn set_item_customization(
         let item = updated.items.entry(item_id.clone()).or_default();
         item.alias = alias;
         item.shortcut = shortcut.clone();
+        item.hidden = hidden;
     }
 
     let scope = customization_scope(&current_preferences, &display_key);
@@ -2976,66 +3395,231 @@ fn set_item_customization(
     }
     prune_catalog_state(&mut updated);
 
-    let shortcut_registration_changed = old_shortcut_id != new_shortcut_id;
-    let old_registered_shortcuts: Vec<String> = old_shortcut
-        .filter(|value| shortcut_id(value).is_ok())
-        .into_iter()
-        .collect();
-    let mut released_old = Vec::new();
-    let mut registered_new = false;
-    if shortcut_registration_changed {
-        released_old = release_shortcuts_atomically(
-            &old_registered_shortcuts,
-            |old| {
-                app.global_shortcut()
-                    .unregister(old)
-                    .map_err(|error| error.to_string())
-            },
-            |old| {
-                app.global_shortcut()
-                    .register(old)
-                    .map_err(|error| error.to_string())
-            },
-        )?;
-        if let Some(new) = shortcut.as_deref() {
-            if let Err(error) = app.global_shortcut().register(new) {
-                let rollback_errors = restore_released_shortcuts(&released_old, &mut |old| {
-                    app.global_shortcut()
-                        .register(old)
-                        .map_err(|error| error.to_string())
-                });
-                return Err(error_with_rollback_details(
-                    format!("That shortcut is already in use or unavailable: {error}"),
-                    rollback_errors,
-                ));
-            }
-            registered_new = true;
-        }
-    }
+    let response = resolved_customizations(&updated, &current_preferences, &display_key);
+    persist_catalog_with_shortcut_change(&app, catalog.inner(), updated, old_shortcut, shortcut)?;
+    let _ = app.emit("catalog-customizations-changed", response.clone());
+    Ok(response)
+}
 
-    if let Err(error) = persist_catalog_state(catalog.inner(), &updated) {
-        let mut rollback_errors = Vec::new();
-        if registered_new {
-            if let Some(new) = shortcut.as_deref() {
-                if let Err(rollback_error) = app.global_shortcut().unregister(new) {
-                    rollback_errors.push(format!(
-                        "Could not release the new shortcut {new}: {rollback_error}"
-                    ));
-                }
-            }
-        }
-        rollback_errors.extend(restore_released_shortcuts(&released_old, &mut |old| {
-            app.global_shortcut()
-                .register(old)
-                .map_err(|rollback_error| rollback_error.to_string())
-        }));
-        return Err(error_with_rollback_details(error, rollback_errors));
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn save_saved_action(
+    app: AppHandle,
+    display_key: String,
+    icon: MenuIcon,
+    action: MenuAction,
+    alias: Option<String>,
+    shortcut: Option<String>,
+    menu_cache: State<'_, MenuCache>,
+    catalog: State<'_, CatalogStateStore>,
+    preferences: State<'_, PreferencesState>,
+) -> Result<CatalogCustomizationsResponse, String> {
+    require_ready(&app)?;
+    if !valid_display_key(&display_key) || icon.display_key.as_deref() != Some(display_key.as_str())
+    {
+        return Err("That display is no longer available.".to_string());
     }
-    *catalog
+    let parent_item_id = icon
+        .item_id
+        .as_deref()
+        .filter(|item_id| valid_item_id(item_id))
+        .ok_or_else(|| "This menu-bar item does not expose a stable identity.".to_string())?
+        .to_string();
+    let live_icon =
+        resolve_saved_action_parent_with_refresh(&display_key, &parent_item_id, |force| {
+            if !force {
+                return menu_cache_item(menu_cache.inner(), &display_key, &parent_item_id);
+            }
+
+            let refreshed = refresh_menu_cache(menu_cache.inner(), true)?.response;
+            Ok((refreshed.display_key == display_key)
+                .then(|| {
+                    refreshed
+                        .icons
+                        .into_iter()
+                        .find(|candidate| candidate.item_id.as_deref() == Some(&parent_item_id))
+                })
+                .flatten())
+        })?;
+    validate_menu_action(&action)?;
+    let owner = normalized_saved_text(live_icon.owner, MAX_SAVED_ACTION_OWNER_CHARACTERS, "owner")?;
+    let parent_label = normalized_saved_text(
+        live_icon.label,
+        MAX_SAVED_ACTION_LABEL_CHARACTERS,
+        "parent label",
+    )?;
+    let alias = normalized_alias(alias)?;
+    let shortcut = normalized_item_shortcut(shortcut)?;
+    if shortcut.is_some() && !valid_item_shortcut_id(&parent_item_id) {
+        return Err(
+            "A saved-action shortcut requires an identity supplied by the original app."
+                .to_string(),
+        );
+    }
+    let id = saved_action_id(&parent_item_id, &action);
+
+    let _write_guard = catalog
+        .write_lock
+        .lock()
+        .map_err(|_| "The personalization writer is unavailable.".to_string())?;
+    let current_preferences = preferences
+        .preferences
+        .lock()
+        .map_err(|_| "The settings are unavailable.".to_string())?
+        .clone();
+    let mut updated = catalog
         .state
         .lock()
-        .map_err(|_| "The personalization data is unavailable.".to_string())? = updated.clone();
+        .map_err(|_| "The personalization data is unavailable.".to_string())?
+        .clone();
+    if !updated.saved_actions.contains_key(&id) && updated.saved_actions.len() >= MAX_SAVED_ACTIONS
+    {
+        return Err("Macnu has reached the saved-actions limit.".to_string());
+    }
+    if updated.saved_actions.get(&id).is_some_and(|existing| {
+        existing.parent_item_id != parent_item_id
+            || existing.action.id != action.id
+            || existing.action.path != action.path
+    }) {
+        return Err("That saved action identity conflicts with another command.".to_string());
+    }
+    let old = updated.saved_actions.get(&id).cloned();
+    let old_shortcut = old.as_ref().and_then(|existing| existing.shortcut.clone());
+    if let Some(new_id) = shortcut.as_deref().map(shortcut_id).transpose()? {
+        if shortcut_id(&current_preferences.shortcut)? == new_id {
+            return Err("That shortcut already opens Macnu.".to_string());
+        }
+        if direct_shortcut_conflicts(&updated, new_id, None, Some(&id)) {
+            return Err("That shortcut is already assigned to another direct command.".to_string());
+        }
+    }
+    let global_usage = old
+        .as_ref()
+        .map(|existing| existing.global_usage.clone())
+        .unwrap_or_default();
+    let display_usage = old
+        .map(|existing| existing.display_usage)
+        .unwrap_or_default();
+    updated.saved_actions.insert(
+        id,
+        SavedAction {
+            parent_item_id,
+            owner,
+            parent_label,
+            action,
+            alias,
+            shortcut: shortcut.clone(),
+            global_usage,
+            display_usage,
+        },
+    );
     let response = resolved_customizations(&updated, &current_preferences, &display_key);
+    persist_catalog_with_shortcut_change(&app, catalog.inner(), updated, old_shortcut, shortcut)?;
+    let _ = app.emit("catalog-customizations-changed", response.clone());
+    Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn update_saved_action(
+    app: AppHandle,
+    display_key: String,
+    saved_action_id: String,
+    alias: Option<String>,
+    shortcut: Option<String>,
+    catalog: State<'_, CatalogStateStore>,
+    preferences: State<'_, PreferencesState>,
+) -> Result<CatalogCustomizationsResponse, String> {
+    require_ready(&app)?;
+    if !valid_display_key(&display_key) {
+        return Err("That display is no longer available.".to_string());
+    }
+    if !valid_saved_action_id(&saved_action_id) {
+        return Err("That saved action identity is invalid.".to_string());
+    }
+    let alias = normalized_alias(alias)?;
+    let shortcut = normalized_item_shortcut(shortcut)?;
+
+    let _write_guard = catalog
+        .write_lock
+        .lock()
+        .map_err(|_| "The personalization writer is unavailable.".to_string())?;
+    let current_preferences = preferences
+        .preferences
+        .lock()
+        .map_err(|_| "The settings are unavailable.".to_string())?
+        .clone();
+    let mut updated = catalog
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.".to_string())?
+        .clone();
+    let parent_item_id = updated
+        .saved_actions
+        .get(&saved_action_id)
+        .ok_or_else(|| "That saved action no longer exists.".to_string())?
+        .parent_item_id
+        .clone();
+    if shortcut.is_some() && !valid_item_shortcut_id(&parent_item_id) {
+        return Err(
+            "A saved-action shortcut requires an identity supplied by the original app."
+                .to_string(),
+        );
+    }
+    if let Some(new_id) = shortcut.as_deref().map(shortcut_id).transpose()? {
+        if shortcut_id(&current_preferences.shortcut)? == new_id {
+            return Err("That shortcut already opens Macnu.".to_string());
+        }
+        if direct_shortcut_conflicts(&updated, new_id, None, Some(&saved_action_id)) {
+            return Err("That shortcut is already assigned to another direct command.".to_string());
+        }
+    }
+    let saved_action = updated.saved_actions.get_mut(&saved_action_id).unwrap();
+    let old_shortcut = saved_action.shortcut.clone();
+    saved_action.alias = alias;
+    saved_action.shortcut = shortcut.clone();
+    let response = resolved_customizations(&updated, &current_preferences, &display_key);
+    persist_catalog_with_shortcut_change(&app, catalog.inner(), updated, old_shortcut, shortcut)?;
+    let _ = app.emit("catalog-customizations-changed", response.clone());
+    Ok(response)
+}
+
+#[tauri::command]
+fn remove_saved_action(
+    app: AppHandle,
+    display_key: String,
+    saved_action_id: String,
+    catalog: State<'_, CatalogStateStore>,
+    preferences: State<'_, PreferencesState>,
+) -> Result<CatalogCustomizationsResponse, String> {
+    require_ready(&app)?;
+    if !valid_display_key(&display_key) {
+        return Err("That display is no longer available.".to_string());
+    }
+    if !valid_saved_action_id(&saved_action_id) {
+        return Err("That saved action identity is invalid.".to_string());
+    }
+    let _write_guard = catalog
+        .write_lock
+        .lock()
+        .map_err(|_| "The personalization writer is unavailable.".to_string())?;
+    let current_preferences = preferences
+        .preferences
+        .lock()
+        .map_err(|_| "The settings are unavailable.".to_string())?
+        .clone();
+    let mut updated = catalog
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.".to_string())?
+        .clone();
+    let removed = updated
+        .saved_actions
+        .remove(&saved_action_id)
+        .ok_or_else(|| "That saved action no longer exists.".to_string())?;
+    let old_shortcut = removed.shortcut;
+    let response = resolved_customizations(&updated, &current_preferences, &display_key);
+    persist_catalog_with_shortcut_change(&app, catalog.inner(), updated, old_shortcut, None)?;
     let _ = app.emit("catalog-customizations-changed", response.clone());
     Ok(response)
 }
@@ -3089,6 +3673,10 @@ fn reset_personalization_history(
     for display in updated.displays.values_mut() {
         display.usage.clear();
     }
+    for saved_action in updated.saved_actions.values_mut() {
+        saved_action.global_usage = UsageStats::default();
+        saved_action.display_usage.clear();
+    }
     prune_catalog_state(&mut updated);
     persist_catalog_state(catalog.inner(), &updated)?;
     *catalog
@@ -3117,7 +3705,12 @@ fn clear_all_item_shortcuts(
         .items
         .values()
         .filter(|item| item.shortcut.is_some())
-        .count();
+        .count()
+        + updated
+            .saved_actions
+            .values()
+            .filter(|action| action.shortcut.is_some())
+            .count();
     if cleared == 0 {
         return Ok(0);
     }
@@ -3127,6 +3720,12 @@ fn clear_all_item_shortcuts(
         .items
         .values()
         .filter_map(|item| item.shortcut.as_deref())
+        .chain(
+            updated
+                .saved_actions
+                .values()
+                .filter_map(|action| action.shortcut.as_deref()),
+        )
     {
         if let Ok(id) = shortcut_id(shortcut) {
             registered_by_id
@@ -3143,6 +3742,9 @@ fn clear_all_item_shortcuts(
 
     for item in updated.items.values_mut() {
         item.shortcut = None;
+    }
+    for saved_action in updated.saved_actions.values_mut() {
+        saved_action.shortcut = None;
     }
     prune_catalog_state(&mut updated);
 
@@ -3173,6 +3775,38 @@ fn clear_all_item_shortcuts(
         .lock()
         .map_err(|_| "The personalization data is unavailable.".to_string())? = updated;
     let _ = app.emit("item-shortcuts-cleared", cleared);
+    let _ = app.emit("catalog-customizations-invalidated", ());
+    Ok(cleared)
+}
+
+#[tauri::command]
+fn clear_hidden_items(
+    app: AppHandle,
+    catalog: State<'_, CatalogStateStore>,
+) -> Result<usize, String> {
+    let _write_guard = catalog
+        .write_lock
+        .lock()
+        .map_err(|_| "The personalization writer is unavailable.".to_string())?;
+    let mut updated = catalog
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.".to_string())?
+        .clone();
+    let cleared = updated.items.values().filter(|item| item.hidden).count();
+    if cleared == 0 {
+        return Ok(0);
+    }
+    for item in updated.items.values_mut() {
+        item.hidden = false;
+    }
+    prune_catalog_state(&mut updated);
+    persist_catalog_state(catalog.inner(), &updated)?;
+    *catalog
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.".to_string())? = updated;
+    let _ = app.emit("hidden-items-cleared", cleared);
     let _ = app.emit("catalog-customizations-invalidated", ());
     Ok(cleared)
 }
@@ -3229,10 +3863,88 @@ fn record_successful_usage(
     Ok(())
 }
 
+fn increment_usage(usage: &mut UsageStats, now: u64) {
+    usage.count = usage.count.saturating_add(1).min(MAX_USAGE_COUNT);
+    usage.last_used_at = Some(now);
+}
+
+fn record_successful_saved_action_usage(
+    catalog: &CatalogStateStore,
+    preferences: &PreferencesState,
+    icon: &MenuIcon,
+    saved_action_id: &str,
+) -> Result<(), String> {
+    let (Some(item_id), Some(display_key)) = (icon.item_id.as_deref(), icon.display_key.as_deref())
+    else {
+        return Ok(());
+    };
+    if icon.is_macnu || !valid_item_id(item_id) || !valid_display_key(display_key) {
+        return Ok(());
+    }
+    let _write_guard = catalog
+        .write_lock
+        .lock()
+        .map_err(|_| "The personalization writer is unavailable.".to_string())?;
+    let current_preferences = preferences
+        .preferences
+        .lock()
+        .map_err(|_| "The settings are unavailable.".to_string())?
+        .clone();
+    let mut updated = catalog
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.".to_string())?
+        .clone();
+    if updated
+        .saved_actions
+        .get(saved_action_id)
+        .is_none_or(|saved_action| saved_action.parent_item_id != item_id)
+    {
+        return Ok(());
+    }
+    let now = unix_timestamp();
+    if updated.items.contains_key(item_id) || ensure_catalog_item_capacity(&mut updated) {
+        increment_usage(
+            &mut updated
+                .items
+                .entry(item_id.to_string())
+                .or_default()
+                .global_usage,
+            now,
+        );
+        if current_preferences.personalize_per_display {
+            if let Ok(display) = ensure_display_customization(&mut updated, display_key) {
+                increment_usage(display.usage.entry(item_id.to_string()).or_default(), now);
+            }
+        }
+    }
+    let saved_action = updated.saved_actions.get_mut(saved_action_id).unwrap();
+    increment_usage(&mut saved_action.global_usage, now);
+    if current_preferences.personalize_per_display
+        && (saved_action.display_usage.contains_key(display_key)
+            || saved_action.display_usage.len() < MAX_PERSONALIZED_DISPLAYS)
+    {
+        increment_usage(
+            saved_action
+                .display_usage
+                .entry(display_key.to_string())
+                .or_default(),
+            now,
+        );
+    }
+    persist_catalog_state(catalog, &updated)?;
+    *catalog
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.".to_string())? = updated;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GlobalShortcutRoute {
     Palette,
     Item(String),
+    SavedAction(String),
     None,
 }
 
@@ -3245,7 +3957,7 @@ fn global_shortcut_route(
         return GlobalShortcutRoute::Palette;
     }
 
-    let mut matches = catalog
+    let item_matches = catalog
         .items
         .iter()
         .filter(|(item_id, item)| {
@@ -3256,67 +3968,131 @@ fn global_shortcut_route(
                     .and_then(|shortcut| shortcut_id(shortcut).ok())
                     == Some(pressed_id)
         })
-        .map(|(item_id, _)| item_id.clone());
+        .map(|(item_id, _)| GlobalShortcutRoute::Item(item_id.clone()));
+    let action_matches = catalog
+        .saved_actions
+        .iter()
+        .filter(|(_, action)| {
+            valid_item_shortcut_id(&action.parent_item_id)
+                && action
+                    .shortcut
+                    .as_deref()
+                    .and_then(|shortcut| shortcut_id(shortcut).ok())
+                    == Some(pressed_id)
+        })
+        .map(|(saved_action_id, _)| GlobalShortcutRoute::SavedAction(saved_action_id.clone()));
+    let mut matches = item_matches.chain(action_matches);
     match (matches.next(), matches.next()) {
-        (Some(item_id), None) => GlobalShortcutRoute::Item(item_id),
+        (Some(route), None) => route,
         _ => GlobalShortcutRoute::None,
     }
 }
 
-fn persisted_item_shortcut_assignments(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectShortcutTarget {
+    Item(String),
+    SavedAction(String),
+}
+
+impl DirectShortcutTarget {
+    fn sort_key(&self) -> (u8, &str) {
+        match self {
+            Self::Item(id) => (0, id),
+            Self::SavedAction(id) => (1, id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectShortcutAssignment {
+    target: DirectShortcutTarget,
+    shortcut: String,
+    id: u32,
+}
+
+fn persisted_direct_shortcut_assignments(
     preferences: &Preferences,
     catalog: &CatalogState,
-) -> Vec<(String, String, u32)> {
-    let mut shortcuts: Vec<_> = catalog
-        .items
+) -> Vec<DirectShortcutAssignment> {
+    let item_shortcuts = catalog.items.iter().filter_map(|(item_id, item)| {
+        valid_item_shortcut_id(item_id)
+            .then_some(item.shortcut.as_deref())
+            .flatten()
+            .and_then(|shortcut| {
+                shortcut_id(shortcut)
+                    .ok()
+                    .map(|id| DirectShortcutAssignment {
+                        target: DirectShortcutTarget::Item(item_id.clone()),
+                        shortcut: shortcut.to_string(),
+                        id,
+                    })
+            })
+    });
+    let action_shortcuts = catalog
+        .saved_actions
         .iter()
-        .filter_map(|(item_id, item)| {
-            valid_item_shortcut_id(item_id)
-                .then_some(item.shortcut.as_deref())
+        .filter_map(|(saved_action_id, action)| {
+            valid_item_shortcut_id(&action.parent_item_id)
+                .then_some(action.shortcut.as_deref())
                 .flatten()
                 .and_then(|shortcut| {
                     shortcut_id(shortcut)
                         .ok()
-                        .map(|id| (item_id.clone(), shortcut.to_string(), id))
+                        .map(|id| DirectShortcutAssignment {
+                            target: DirectShortcutTarget::SavedAction(saved_action_id.clone()),
+                            shortcut: shortcut.to_string(),
+                            id,
+                        })
                 })
-        })
-        .collect();
-    shortcuts.sort_by(|left, right| left.0.cmp(&right.0));
+        });
+    let mut shortcuts: Vec<_> = item_shortcuts.chain(action_shortcuts).collect();
+    shortcuts.sort_by(|left, right| left.target.sort_key().cmp(&right.target.sort_key()));
 
     let mut counts = HashMap::new();
-    for (_, _, id) in &shortcuts {
-        *counts.entry(*id).or_insert(0usize) += 1;
+    for assignment in &shortcuts {
+        *counts.entry(assignment.id).or_insert(0usize) += 1;
     }
     let launcher_id = shortcut_id(&preferences.shortcut).ok();
-    shortcuts.retain(|(_, _, id)| counts.get(id).copied() == Some(1) && launcher_id != Some(*id));
+    shortcuts.retain(|assignment| {
+        counts.get(&assignment.id).copied() == Some(1) && launcher_id != Some(assignment.id)
+    });
     shortcuts
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ItemShortcutRegistrationFailure {
-    item_id: String,
+struct DirectShortcutRegistrationFailure {
+    target: DirectShortcutTarget,
     shortcut: String,
     error: String,
 }
 
-fn reconcile_persisted_item_shortcuts<Register>(
+fn reconcile_persisted_direct_shortcuts<Register>(
     preferences: &Preferences,
     catalog: &CatalogState,
     mut register: Register,
-) -> (CatalogState, Vec<ItemShortcutRegistrationFailure>)
+) -> (CatalogState, Vec<DirectShortcutRegistrationFailure>)
 where
     Register: FnMut(&str) -> Result<(), String>,
 {
     let mut updated = catalog.clone();
     let mut failures = Vec::new();
-    for (item_id, shortcut, _) in persisted_item_shortcut_assignments(preferences, catalog) {
-        if let Err(error) = register(&shortcut) {
-            if let Some(item) = updated.items.get_mut(&item_id) {
-                item.shortcut = None;
+    for assignment in persisted_direct_shortcut_assignments(preferences, catalog) {
+        if let Err(error) = register(&assignment.shortcut) {
+            match &assignment.target {
+                DirectShortcutTarget::Item(item_id) => {
+                    if let Some(item) = updated.items.get_mut(item_id) {
+                        item.shortcut = None;
+                    }
+                }
+                DirectShortcutTarget::SavedAction(saved_action_id) => {
+                    if let Some(action) = updated.saved_actions.get_mut(saved_action_id) {
+                        action.shortcut = None;
+                    }
+                }
             }
-            failures.push(ItemShortcutRegistrationFailure {
-                item_id,
-                shortcut,
+            failures.push(DirectShortcutRegistrationFailure {
+                target: assignment.target,
+                shortcut: assignment.shortcut,
                 error,
             });
         }
@@ -3327,7 +4103,7 @@ where
     (updated, failures)
 }
 
-fn register_persisted_item_shortcuts(
+fn register_persisted_direct_shortcuts(
     app: &AppHandle,
     preferences: &Preferences,
     store: &CatalogStateStore,
@@ -3342,7 +4118,7 @@ fn register_persisted_item_shortcuts(
         .map_err(|_| "The personalization data is unavailable.".to_string())?
         .clone();
     let (updated, failures) =
-        reconcile_persisted_item_shortcuts(preferences, &current, |shortcut| {
+        reconcile_persisted_direct_shortcuts(preferences, &current, |shortcut| {
             app.global_shortcut()
                 .register(shortcut)
                 .map_err(|error| error.to_string())
@@ -3359,11 +4135,28 @@ fn register_persisted_item_shortcuts(
         .map_err(|_| "The personalization data is unavailable.".to_string())? = updated;
     for failure in failures {
         eprintln!(
-            "Macnu removed unavailable item shortcut {} for {}: {}",
-            failure.shortcut, failure.item_id, failure.error
+            "Macnu removed unavailable direct shortcut {} for {:?}: {}",
+            failure.shortcut, failure.target, failure.error
         );
     }
     Ok(())
+}
+
+fn resolve_parent_icon_with_refresh<Lookup>(
+    parent_item_id: &str,
+    mut lookup: Lookup,
+) -> Result<MenuIcon, String>
+where
+    Lookup: FnMut(bool) -> Result<Option<MenuIcon>, String>,
+{
+    for force in [false, true] {
+        if let Some(icon) = lookup(force)? {
+            if !icon.is_macnu && icon.item_id.as_deref() == Some(parent_item_id) {
+                return Ok(icon);
+            }
+        }
+    }
+    Err("That menu-bar item is not available on this display.".to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -3393,19 +4186,108 @@ fn activate_item_shortcut(app: &AppHandle, item_id: String) {
         tauri::async_runtime::spawn_blocking(move || {
             let result = (|| {
                 require_ready(&shortcut_app)?;
-                let icon = match catalog_icon_for_item(&cache, &item_id, false)? {
-                    Some(icon) => icon,
-                    None => catalog_icon_for_item(&cache, &item_id, true)?.ok_or_else(|| {
-                        "That personalized menu-bar item is not available on this display."
-                            .to_string()
-                    })?,
-                };
+                let icon = resolve_parent_icon_with_refresh(&item_id, |force| {
+                    catalog_icon_for_item(&cache, &item_id, force)
+                })?;
                 run_native_menu_icon(&shortcut_app, icon.clone())?;
                 let _ = record_successful_usage(&catalog, &preferences, &icon);
                 Ok::<(), String>(())
             })();
             if let Err(error) = result {
                 let _ = shortcut_app.emit("item-shortcut-error", error);
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_saved_action_by_id(
+    app: &AppHandle,
+    cache: &MenuCache,
+    catalog: &CatalogStateStore,
+    preferences: &PreferencesState,
+    saved_action_id_value: &str,
+) -> Result<(), String> {
+    if !valid_saved_action_id(saved_action_id_value) {
+        return Err("That saved action identity is invalid.".to_string());
+    }
+    let saved_action = catalog
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.".to_string())?
+        .saved_actions
+        .get(saved_action_id_value)
+        .cloned()
+        .ok_or_else(|| "That saved action no longer exists.".to_string())?;
+    validate_menu_action(&saved_action.action)?;
+    let icon = resolve_parent_icon_with_refresh(&saved_action.parent_item_id, |force| {
+        catalog_icon_for_item(cache, &saved_action.parent_item_id, force)
+    })?;
+    run_native_menu_action(app, icon.clone(), saved_action.action)?;
+    let _ =
+        record_successful_saved_action_usage(catalog, preferences, &icon, saved_action_id_value);
+    Ok(())
+}
+
+#[tauri::command]
+async fn activate_saved_action(
+    app: AppHandle,
+    saved_action_id: String,
+    menu_cache: State<'_, MenuCache>,
+    catalog: State<'_, CatalogStateStore>,
+    preferences: State<'_, PreferencesState>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        require_ready(&app)?;
+        let action_app = app.clone();
+        let cache = menu_cache.inner().clone();
+        let catalog = catalog.inner().clone();
+        let preferences = preferences.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            run_saved_action_by_id(
+                &action_app,
+                &cache,
+                &catalog,
+                &preferences,
+                &saved_action_id,
+            )
+        })
+        .await
+        .map_err(|error| format!("Saved action task failed: {error}"))?
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, saved_action_id, menu_cache, catalog, preferences);
+        Err("Macnu only supports macOS.".to_string())
+    }
+}
+
+fn activate_saved_action_shortcut(app: &AppHandle, saved_action_id: String) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let shortcut_app = app.clone();
+        let cache = app.state::<MenuCache>().inner().clone();
+        let catalog = app.state::<CatalogStateStore>().inner().clone();
+        let preferences = app.state::<PreferencesState>().inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let result = (|| {
+                require_ready(&shortcut_app)?;
+                run_saved_action_by_id(
+                    &shortcut_app,
+                    &cache,
+                    &catalog,
+                    &preferences,
+                    &saved_action_id,
+                )
+            })();
+            if let Err(error) = result {
+                let _ = shortcut_app.emit("saved-action-shortcut-error", error);
             }
         });
     }
@@ -3484,17 +4366,13 @@ fn update_shortcut(
         .lock()
         .map_err(|_| "The settings writer is unavailable.".to_string())?;
 
-    let conflicts_with_item = catalog
+    let catalog = catalog
         .state
         .lock()
         .map_err(|_| "The personalization data is unavailable.".to_string())?
-        .items
-        .values()
-        .filter_map(|item| item.shortcut.as_deref())
-        .filter_map(|item_shortcut| shortcut_id(item_shortcut).ok())
-        .any(|item_id| item_id == parsed.id());
-    if conflicts_with_item {
-        return Err("That shortcut is already assigned to a menu-bar item.".to_string());
+        .clone();
+    if direct_shortcut_conflicts(&catalog, parsed.id(), None, None) {
+        return Err("That shortcut is already assigned to another direct command.".to_string());
     }
 
     let current_preferences = state
@@ -3740,6 +4618,9 @@ pub fn run() {
                             GlobalShortcutRoute::Item(item_id) => {
                                 activate_item_shortcut(app, item_id)
                             }
+                            GlobalShortcutRoute::SavedAction(saved_action_id) => {
+                                activate_saved_action_shortcut(app, saved_action_id)
+                            }
                             GlobalShortcutRoute::None => {}
                         }
                     }
@@ -3912,7 +4793,7 @@ pub fn run() {
 
             app.global_shortcut()
                 .register(configured_shortcut.as_str())?;
-            register_persisted_item_shortcuts(
+            register_persisted_direct_shortcuts(
                 app.handle(),
                 &preferences,
                 app.state::<CatalogStateStore>().inner(),
@@ -3992,9 +4873,14 @@ pub fn run() {
             get_settings,
             get_catalog_customizations,
             set_item_customization,
+            save_saved_action,
+            update_saved_action,
+            remove_saved_action,
+            activate_saved_action,
             update_personalization_settings,
             reset_personalization_history,
             clear_all_item_shortcuts,
+            clear_hidden_items,
             complete_onboarding,
             reset_onboarding,
             update_shortcut,
@@ -4060,6 +4946,38 @@ mod tests {
             accessibility_denied: false,
             error: None,
         }
+    }
+
+    fn action(title: &str) -> MenuAction {
+        let path = vec![MenuActionPathSegment {
+            title: title.to_string(),
+            occurrence: 0,
+        }];
+        MenuAction {
+            id: menu_action_identifier(&path),
+            title: title.to_string(),
+            path,
+            enabled: true,
+            shortcut: None,
+        }
+    }
+
+    fn saved_action(parent_item_id: &str, title: &str) -> (String, SavedAction) {
+        let action = action(title);
+        let id = saved_action_id(parent_item_id, &action);
+        (
+            id,
+            SavedAction {
+                parent_item_id: parent_item_id.to_string(),
+                owner: "Example App".to_string(),
+                parent_label: "Example".to_string(),
+                action,
+                alias: None,
+                shortcut: None,
+                global_usage: UsageStats::default(),
+                display_usage: HashMap::new(),
+            },
+        )
     }
 
     fn licensed_status(can_use_app: bool) -> LicenseStatus {
@@ -4197,15 +5115,60 @@ mod tests {
         };
         let error = persist_catalog_state(&store, &loaded.value).unwrap_err();
         assert!(error.contains("Upgrade Macnu"));
+
+        for malformed in [
+            r#"{"version":"99"}"#,
+            r#"{"version":null}"#,
+            r#"{"version":1.5}"#,
+        ] {
+            let loaded = decode_catalog_state(malformed, 500, None);
+            assert!(
+                loaded.write_protected,
+                "explicit malformed version was treated as writable: {malformed}"
+            );
+        }
     }
 
     #[test]
     fn legacy_catalog_state_migrates_to_the_current_version() {
-        let state: CatalogState =
-            serde_json::from_str(r#"{"items":{},"globalFavorites":[],"displays":{}}"#).unwrap();
+        let item_id = "v1.item-identifier.Y29tLmV4YW1wbGU.Zmlyc3Q";
+        let display_key = "v1.display-uuid.ZGlzcGxheQ";
+        let loaded = decode_catalog_state(
+            &format!(
+                r#"{{
+                    "version":1,
+                    "items":{{"{item_id}":{{
+                        "alias":"Work VPN",
+                        "shortcut":"Command+Period",
+                        "globalUsage":{{"count":7,"lastUsedAt":100}}
+                    }}}},
+                    "globalFavorites":["{item_id}"],
+                    "displays":{{"{display_key}":{{
+                        "favorites":["{item_id}"],
+                        "usage":{{"{item_id}":{{"count":3,"lastUsedAt":90}}}}
+                    }}}}
+                }}"#
+            ),
+            500,
+            None,
+        );
 
-        assert_eq!(state.version, CATALOG_STATE_VERSION);
-        assert!(state.items.is_empty());
+        assert!(!loaded.write_protected);
+        assert_eq!(loaded.value.version, CATALOG_STATE_VERSION);
+        assert_eq!(
+            loaded.value.items[item_id].alias.as_deref(),
+            Some("Work VPN")
+        );
+        assert_eq!(
+            loaded.value.items[item_id].shortcut.as_deref(),
+            Some("Command+Period")
+        );
+        assert_eq!(loaded.value.items[item_id].global_usage.count, 7);
+        assert!(!loaded.value.items[item_id].hidden);
+        assert_eq!(loaded.value.global_favorites, vec![item_id]);
+        assert_eq!(loaded.value.displays[display_key].favorites, vec![item_id]);
+        assert_eq!(loaded.value.displays[display_key].usage[item_id].count, 3);
+        assert!(loaded.value.saved_actions.is_empty());
     }
 
     #[test]
@@ -4222,6 +5185,7 @@ mod tests {
                     count: 3,
                     last_used_at: Some(100),
                 },
+                hidden: false,
             },
         );
         catalog
@@ -4313,6 +5277,317 @@ mod tests {
         assert!(!valid_item_id("legacy-item"));
         assert!(!valid_display_key("42"));
     }
+
+    #[test]
+    fn saved_action_descriptors_and_metadata_are_strictly_validated() {
+        let parent = "v1.item-identifier.Y29tLmV4YW1wbGU.aXRlbQ";
+        let valid = action("Disconnect");
+        assert!(validate_menu_action(&valid).is_ok());
+        let id = saved_action_id(parent, &valid);
+        assert!(valid_saved_action_id(&id));
+        assert_eq!(id, saved_action_id(parent, &valid));
+
+        let ellipsis = action("Account Settings…");
+        assert_eq!(ellipsis.id, "19:Account Settings…#0");
+        assert!(validate_menu_action(&ellipsis).is_ok());
+
+        let mut controlled = action("Disconnect");
+        controlled.path[0].title = "Dis\nconnect".to_string();
+        controlled.id = menu_action_identifier(&controlled.path);
+        controlled.title = controlled.path[0].title.clone();
+        assert!(validate_menu_action(&controlled).is_err());
+
+        let mut deep = action("Leaf");
+        deep.path = (0..=MAX_ACTION_PATH_DEPTH)
+            .map(|index| MenuActionPathSegment {
+                title: format!("Level {index}"),
+                occurrence: 0,
+            })
+            .collect();
+        deep.title = deep.path.last().unwrap().title.clone();
+        deep.id = menu_action_identifier(&deep.path);
+        assert!(validate_menu_action(&deep).is_err());
+        assert!(normalized_saved_text(
+            "Bad\nOwner".to_string(),
+            MAX_SAVED_ACTION_OWNER_CHARACTERS,
+            "owner"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn saved_action_parent_retries_one_forced_refresh_after_cache_miss() {
+        let expected = icon("target");
+        let display_key = expected.display_key.clone().unwrap();
+        let item_id = expected.item_id.clone().unwrap();
+        let mut attempts = Vec::new();
+
+        let resolved = resolve_saved_action_parent_with_refresh(&display_key, &item_id, |force| {
+            attempts.push(force);
+            Ok(force.then(|| expected.clone()))
+        })
+        .unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_eq!(attempts, vec![false, true]);
+    }
+
+    #[test]
+    fn saved_action_parent_rejects_a_refreshed_icon_from_another_display() {
+        let expected = icon("target");
+        let display_key = expected.display_key.clone().unwrap();
+        let item_id = expected.item_id.clone().unwrap();
+        let mut mismatched = expected;
+        mismatched.display_key = Some("v1.display-uuid.b3RoZXI".to_string());
+        let mut attempts = Vec::new();
+
+        let error = resolve_saved_action_parent_with_refresh(&display_key, &item_id, |force| {
+            attempts.push(force);
+            Ok(force.then(|| mismatched.clone()))
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, vec![false, true]);
+        assert_eq!(
+            error,
+            "That menu-bar item is no longer available on this display."
+        );
+    }
+
+    #[test]
+    fn saved_action_parent_fails_closed_when_the_parent_remains_missing() {
+        let expected = icon("target");
+        let display_key = expected.display_key.unwrap();
+        let item_id = expected.item_id.unwrap();
+        let mut attempts = Vec::new();
+
+        let error = resolve_saved_action_parent_with_refresh(&display_key, &item_id, |force| {
+            attempts.push(force);
+            Ok(None)
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, vec![false, true]);
+        assert_eq!(
+            error,
+            "That menu-bar item is no longer available on this display."
+        );
+    }
+
+    #[test]
+    fn saved_action_parent_never_accepts_macnu_itself() {
+        let mut macnu = icon("target");
+        let display_key = macnu.display_key.clone().unwrap();
+        let item_id = macnu.item_id.clone().unwrap();
+        macnu.is_macnu = true;
+
+        assert!(
+            resolve_saved_action_parent_with_refresh(&display_key, &item_id, |_| {
+                Ok(Some(macnu.clone()))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn saved_action_sanitization_enforces_limits_and_shortcut_parent_confidence() {
+        let low_confidence_parent = "v1.item-single.Y29tLmV4YW1wbGU";
+        let (low_id, mut low) = saved_action(low_confidence_parent, "Open");
+        low.shortcut = Some("Command+Period".to_string());
+        let mut state = CatalogState::default();
+        state.saved_actions.insert(low_id.clone(), low);
+        let sanitized = sanitize_catalog_state(state, 500, None);
+        assert!(sanitized.saved_actions.contains_key(&low_id));
+        assert!(sanitized.saved_actions[&low_id].shortcut.is_none());
+
+        let parent = "v1.item-identifier.Y29tLmV4YW1wbGU.aXRlbQ";
+        let mut oversized = CatalogState::default();
+        for index in 0..(MAX_SAVED_ACTIONS + 5) {
+            let (id, saved) = saved_action(parent, &format!("Action {index}"));
+            oversized.saved_actions.insert(id, saved);
+        }
+        let sanitized = sanitize_catalog_state(oversized, 500, None);
+        assert_eq!(sanitized.saved_actions.len(), MAX_SAVED_ACTIONS);
+
+        let (bad_id, mut bad) = saved_action(parent, "Invalid owner");
+        bad.owner = "Bad\nOwner".to_string();
+        let mut invalid = CatalogState::default();
+        invalid.saved_actions.insert(bad_id, bad);
+        assert!(sanitize_catalog_state(invalid, 500, None)
+            .saved_actions
+            .is_empty());
+    }
+
+    #[test]
+    fn item_and_saved_action_shortcuts_collide_and_route_fail_closed() {
+        let preferences = Preferences::default();
+        let parent = "v1.item-identifier.Y29tLmV4YW1wbGU.aXRlbQ".to_string();
+        let mut catalog = CatalogState::default();
+        catalog.items.insert(
+            parent.clone(),
+            ItemCustomization {
+                shortcut: Some("Command+Period".to_string()),
+                hidden: true,
+                ..ItemCustomization::default()
+            },
+        );
+        let (saved_id, mut saved) = saved_action(&parent, "Disconnect");
+        saved.shortcut = Some("Command+Period".to_string());
+        catalog.saved_actions.insert(saved_id.clone(), saved);
+        let pressed = shortcut_id("Command+Period").unwrap();
+        assert_eq!(
+            global_shortcut_route(pressed, &preferences, &catalog),
+            GlobalShortcutRoute::None
+        );
+        let sanitized = sanitize_catalog_state(catalog.clone(), 500, None);
+        assert!(sanitized.items[&parent].shortcut.is_none());
+        assert!(sanitized.saved_actions[&saved_id].shortcut.is_none());
+
+        catalog.items.get_mut(&parent).unwrap().shortcut = Some("Command+Comma".to_string());
+        assert_eq!(
+            global_shortcut_route(pressed, &preferences, &catalog),
+            GlobalShortcutRoute::SavedAction(saved_id)
+        );
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_the_unavailable_saved_action_shortcut() {
+        let preferences = Preferences::default();
+        let parent = "v1.item-identifier.Y29tLmV4YW1wbGU.aXRlbQ";
+        let (saved_id, mut saved) = saved_action(parent, "Disconnect");
+        saved.shortcut = Some("Command+Period".to_string());
+        let mut catalog = CatalogState::default();
+        catalog.saved_actions.insert(saved_id.clone(), saved);
+
+        let (reconciled, failures) =
+            reconcile_persisted_direct_shortcuts(&preferences, &catalog, |_| {
+                Err("occupied".to_string())
+            });
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].target,
+            DirectShortcutTarget::SavedAction(saved_id.clone())
+        );
+        assert!(reconciled.saved_actions[&saved_id].shortcut.is_none());
+    }
+
+    #[test]
+    fn parent_resolution_retries_stale_data_and_missing_parents_fail_closed() {
+        let parent = icon("first").item_id.unwrap();
+        let mut calls = Vec::new();
+        let resolved = resolve_parent_icon_with_refresh(&parent, |force| {
+            calls.push(force);
+            Ok(force.then(|| icon("first")))
+        })
+        .unwrap();
+        assert_eq!(resolved.item_id.as_deref(), Some(parent.as_str()));
+        assert_eq!(calls, vec![false, true]);
+
+        let mut missing_calls = 0;
+        let error = resolve_parent_icon_with_refresh(&parent, |_| {
+            missing_calls += 1;
+            Ok(None)
+        })
+        .unwrap_err();
+        assert_eq!(missing_calls, 2);
+        assert!(error.contains("not available"));
+    }
+
+    #[test]
+    fn successful_saved_action_usage_updates_parent_and_action_scopes() {
+        let icon = icon("first");
+        let parent = icon.item_id.clone().unwrap();
+        let display = icon.display_key.clone().unwrap();
+        let (saved_id, saved) = saved_action(&parent, "Disconnect");
+        let mut state = CatalogState::default();
+        state.saved_actions.insert(saved_id.clone(), saved);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "macnu-saved-action-test-{}-{unique}",
+            std::process::id()
+        ));
+        let store = CatalogStateStore {
+            state: Arc::new(Mutex::new(state)),
+            write_lock: Arc::new(Mutex::new(())),
+            path: directory.join("catalog-state.json"),
+            write_protected: false,
+        };
+        let preferences = PreferencesState {
+            preferences: Arc::new(Mutex::new(Preferences::default())),
+            write_lock: Arc::new(Mutex::new(())),
+            path: directory.join("settings.json"),
+            write_protected: false,
+        };
+
+        record_successful_saved_action_usage(&store, &preferences, &icon, &saved_id).unwrap();
+        let updated = store.state.lock().unwrap().clone();
+        assert_eq!(updated.items[&parent].global_usage.count, 1);
+        assert_eq!(updated.displays[&display].usage[&parent].count, 1);
+        assert_eq!(updated.saved_actions[&saved_id].global_usage.count, 1);
+        assert_eq!(
+            updated.saved_actions[&saved_id].display_usage[&display].count,
+            1
+        );
+        let _ = fs::remove_file(&store.path);
+        let _ = fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn hidden_defaults_false_and_does_not_disable_direct_commands() {
+        let preferences = Preferences::default();
+        let item_id = "v1.item-identifier.Y29tLmV4YW1wbGU.aXRlbQ".to_string();
+        let mut catalog = CatalogState::default();
+        catalog
+            .items
+            .insert(item_id.clone(), ItemCustomization::default());
+        let view = resolved_customizations(&catalog, &preferences, "v1.display-uuid.dGVzdA");
+        assert!(!view.items[&item_id].hidden);
+
+        let item = catalog.items.get_mut(&item_id).unwrap();
+        item.hidden = true;
+        item.shortcut = Some("Command+Period".to_string());
+        prune_catalog_state(&mut catalog);
+        assert!(catalog.items.contains_key(&item_id));
+        assert_eq!(
+            global_shortcut_route(
+                shortcut_id("Command+Period").unwrap(),
+                &preferences,
+                &catalog
+            ),
+            GlobalShortcutRoute::Item(item_id)
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_never_removes_hidden_only_customizations() {
+        let hidden = "v1.item-identifier.Y29tLmV4YW1wbGU.aGlkZGVu".to_string();
+        let usage_only = "v1.item-identifier.Y29tLmV4YW1wbGU.dXNhZ2U".to_string();
+        let mut catalog = CatalogState::default();
+        catalog.items.insert(
+            hidden.clone(),
+            ItemCustomization {
+                hidden: true,
+                ..ItemCustomization::default()
+            },
+        );
+        catalog.items.insert(
+            usage_only.clone(),
+            ItemCustomization {
+                global_usage: UsageStats {
+                    count: 1,
+                    last_used_at: Some(10),
+                },
+                ..ItemCustomization::default()
+            },
+        );
+
+        assert_eq!(evict_oldest_usage_only_item(&mut catalog), Some(usage_only));
+        assert!(catalog.items.contains_key(&hidden));
+    }
+
     #[test]
     fn loaded_catalog_is_sanitized_and_shortcut_collisions_fail_closed() {
         let first = "v1.item-identifier.Y29tLmV4YW1wbGU.Zmlyc3Q".to_string();
@@ -4330,6 +5605,7 @@ mod tests {
                     count: u64::MAX,
                     last_used_at: Some(900),
                 },
+                hidden: false,
             },
         );
         state.items.insert(
@@ -4751,8 +6027,12 @@ mod tests {
     #[test]
     fn customization_requires_an_exact_cached_display_and_item_pair() {
         let cache = MenuCache::default();
-        let response = response();
+        let mut response = response();
         let item_id = response.icons[0].item_id.clone().unwrap();
+        let mut self_icon = icon("self");
+        self_icon.is_macnu = true;
+        let self_id = self_icon.item_id.clone().unwrap();
+        response.icons.push(self_icon);
         cache.responses.lock().unwrap().insert(
             response.display_id,
             MenuCacheEntry {
@@ -4763,6 +6043,7 @@ mod tests {
         );
 
         assert!(menu_cache_contains_item(&cache, &response.display_key, &item_id).unwrap());
+        assert!(!menu_cache_contains_item(&cache, &response.display_key, &self_id).unwrap());
         assert!(!menu_cache_contains_item(&cache, "v1.display-uuid.b3RoZXI", &item_id).unwrap());
         assert!(
             !menu_cache_contains_item(&cache, &response.display_key, "v1.item-single.b3RoZXI")
@@ -4802,13 +6083,13 @@ mod tests {
             },
         );
 
-        assert!(persisted_item_shortcut_assignments(&preferences, &catalog).is_empty());
+        assert!(persisted_direct_shortcut_assignments(&preferences, &catalog).is_empty());
 
         catalog.items.get_mut(&second).unwrap().shortcut = Some("Command+Comma".to_string());
-        let assignments = persisted_item_shortcut_assignments(&preferences, &catalog);
+        let assignments = persisted_direct_shortcut_assignments(&preferences, &catalog);
         assert_eq!(assignments.len(), 2);
-        assert_eq!(assignments[0].0, first);
-        assert_eq!(assignments[1].0, second);
+        assert_eq!(assignments[0].target, DirectShortcutTarget::Item(first));
+        assert_eq!(assignments[1].target, DirectShortcutTarget::Item(second));
     }
 
     #[test]
@@ -4835,7 +6116,7 @@ mod tests {
         let attempted = std::cell::RefCell::new(Vec::new());
 
         let (reconciled, failures) =
-            reconcile_persisted_item_shortcuts(&preferences, &catalog, |shortcut| {
+            reconcile_persisted_direct_shortcuts(&preferences, &catalog, |shortcut| {
                 attempted.borrow_mut().push(shortcut.to_string());
                 if shortcut == "Command+Period" {
                     Err("occupied".to_string())
@@ -4846,8 +6127,8 @@ mod tests {
 
         assert_eq!(
             failures,
-            vec![ItemShortcutRegistrationFailure {
-                item_id: failed.clone(),
+            vec![DirectShortcutRegistrationFailure {
+                target: DirectShortcutTarget::Item(failed.clone()),
                 shortcut: "Command+Period".to_string(),
                 error: "occupied".to_string(),
             }]

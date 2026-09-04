@@ -270,15 +270,20 @@ export function rankPersonalizedItems<T extends PersonalizableMenuItem>(
       if (relevanceDifference !== 0) return relevanceDifference;
     }
 
-    const favoriteDifference = Number(right.item.favorite) - Number(left.item.favorite);
-    if (favoriteDifference !== 0) return favoriteDifference;
+    if (!query) {
+      const favoriteDifference =
+        Number(right.item.favorite) - Number(left.item.favorite);
+      if (favoriteDifference !== 0) return favoriteDifference;
 
-    if (options.mode === "smart") {
-      const smartDifference =
-        smartUsageScore(right.item, options.now) -
-        smartUsageScore(left.item, options.now);
-      if (smartDifference !== 0) return smartDifference;
-    } else if (options.mode === "alphabetical") {
+      if (options.mode === "smart") {
+        const smartDifference =
+          smartUsageScore(right.item, options.now) -
+          smartUsageScore(left.item, options.now);
+        if (smartDifference !== 0) return smartDifference;
+      }
+    }
+
+    if (options.mode === "alphabetical") {
       const alphabeticalDifference = alphabeticalCollator.compare(
         left.item.displayLabel,
         right.item.displayLabel,

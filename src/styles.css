@@ -150,6 +150,18 @@
   display: none !important;
 }
 
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  border: 0;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
 html,
 body,
 #app {
@@ -377,6 +389,10 @@ kbd {
   grid-template-columns: minmax(0, 1fr);
 }
 
+.result-row.has-pin {
+  grid-template-columns: minmax(0, 1fr) 34px 34px;
+}
+
 .result-row.selected {
   border-color: var(--selection-border);
   background: linear-gradient(90deg, var(--selection-start), var(--selection-end));
@@ -384,16 +400,96 @@ kbd {
 
 .result-row .result {
   min-height: 56px;
-  grid-template-columns: 44px minmax(0, 1fr) minmax(28px, auto);
+  grid-template-columns: 44px minmax(0, 1fr);
   padding-right: 8px;
   border: 0;
   border-radius: 14px;
   background: transparent;
 }
 
+.result-row .result.has-tail {
+  grid-template-columns: 44px minmax(0, 1fr) minmax(28px, auto);
+}
+
 .result-row .result.selected {
   border-color: transparent;
   background: transparent;
+}
+
+.action-result-row {
+  display: grid;
+  width: 100%;
+  min-height: 58px;
+  flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  align-items: stretch;
+  gap: 2px;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: 15px;
+  background: transparent;
+}
+
+.action-result-row.selected {
+  border-color: var(--selection-border);
+  background: linear-gradient(90deg, var(--selection-start), var(--selection-end));
+}
+
+.action-result-row .action-result,
+.action-result-row .action-result.selected {
+  min-height: 56px;
+  grid-template-columns: 44px minmax(0, 1fr);
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
+}
+
+.action-result-row .action-result.has-tail {
+  grid-template-columns: 44px minmax(0, 1fr) minmax(28px, auto);
+}
+
+.pin-action {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  align-self: center;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 9px;
+  color: var(--text-faint);
+  background: transparent;
+  cursor: pointer;
+}
+
+.pin-action svg {
+  width: 15px;
+  height: 15px;
+  overflow: visible;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.pin-action:hover,
+.pin-action:focus-visible {
+  color: var(--accent-text);
+  background: var(--control-hover);
+}
+
+.pin-action.pinned {
+  color: var(--accent-text);
+}
+
+.pin-action.pinned svg {
+  fill: currentColor;
+}
+
+.pin-action:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
 }
 
 .customize-item {
@@ -425,11 +521,6 @@ kbd {
   align-items: center;
   justify-content: flex-end;
   gap: 5px;
-}
-
-.favorite-mark {
-  color: var(--accent-text);
-  font-size: 11px;
 }
 
 .item-shortcut-mark {
@@ -585,7 +676,8 @@ kbd {
 }
 
 .item-customization-actions .primary-action,
-.item-customization-actions .secondary-action {
+.item-customization-actions .secondary-action,
+.item-customization-actions .danger-action {
   margin: 0;
 }
 
@@ -597,7 +689,8 @@ kbd {
   overflow-wrap: anywhere;
 }
 
-.item-shortcut-error-state .empty-symbol {
+.item-shortcut-error-state .empty-symbol,
+.saved-action-error-state .empty-symbol {
   color: var(--accent-text);
 }
 
@@ -646,14 +739,6 @@ kbd {
   line-height: 1.2;
 }
 
-.open-hint {
-  color: transparent;
-  font-size: 15px;
-}
-
-.result.selected .open-hint {
-  color: var(--text-tertiary);
-}
 .action-tail {
   overflow: hidden;
   color: transparent;
@@ -673,6 +758,99 @@ kbd {
 
 .action-result.disabled .action-tail {
   color: var(--text-faint);
+}
+
+.action-pin-error {
+  display: flex;
+  min-height: 34px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  margin: 0 2px 3px;
+  padding: 7px 8px 7px 11px;
+  border: 1px solid color-mix(in srgb, var(--danger-text) 28%, transparent);
+  border-radius: 11px;
+  color: var(--danger-text);
+  background: color-mix(in srgb, var(--danger-text) 8%, transparent);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
+.action-pin-error span {
+  min-width: 0;
+  flex: 1;
+}
+
+.action-pin-error button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.action-pin-error button:hover {
+  background: var(--control-hover);
+}
+
+.action-unpin-confirmation {
+  display: grid;
+  min-height: 46px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 12px;
+  margin: 0 2px 4px;
+  padding: 8px 9px 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger-text) 28%, transparent);
+  border-radius: 11px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--danger-text) 7%, transparent);
+  font-size: 9.5px;
+  line-height: 1.4;
+}
+
+.action-unpin-confirmation > span:first-child {
+  min-width: 0;
+}
+
+.action-unpin-confirmation strong {
+  color: var(--text-primary);
+}
+
+.action-unpin-confirmation-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.action-unpin-confirmation-controls button {
+  min-height: 28px;
+  margin: 0;
+  padding: 5px 8px;
+  border-radius: 8px;
+  font-size: 9px;
+}
+
+.action-unpin-confirmation kbd,
+.saved-action-removal-warning kbd {
+  min-width: 17px;
+  height: 17px;
+  padding: 0 3px;
+  font-size: 8px;
+}
+
+.saved-action-removal-warning {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--danger-text);
 }
 
 .state-actions {
@@ -753,10 +931,29 @@ footer {
   font-size: 10.5px;
 }
 
-footer span {
+footer > span,
+footer .footer-key-group,
+footer .footer-key-cluster {
   display: flex;
   align-items: center;
   gap: 4px;
+  white-space: nowrap;
+}
+
+footer .footer-key-groups {
+  gap: 12px;
+}
+
+footer .footer-key-cluster {
+  gap: 3px;
+}
+
+footer .footer-key-label {
+  line-height: 1;
+}
+
+footer [hidden] {
+  display: none;
 }
 
 footer kbd {
@@ -940,6 +1137,125 @@ footer kbd {
   font-size: 10px;
   line-height: 1.4;
   overflow-wrap: anywhere;
+}
+
+.personalization-manager-group {
+  overflow: visible;
+}
+
+.personalization-manager-heading {
+  display: grid;
+  min-height: 62px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 14px;
+}
+
+.personalization-manager-heading > .secondary-action {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.personalization-manager-list {
+  border-top: 1px solid var(--divider);
+}
+
+.personalization-manager-row {
+  display: grid;
+  min-height: 54px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px 9px 14px;
+}
+
+.personalization-manager-row:has(.manager-removal-warning) {
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 0.8fr) auto;
+}
+
+.manager-removal-warning {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+  color: var(--danger-text);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
+.manager-removal-warning kbd {
+  min-width: 17px;
+  height: 17px;
+  padding: 0 3px;
+  font-size: 8px;
+}
+
+.manager-confirm-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.manager-confirm-actions button {
+  min-height: 29px;
+  margin: 0;
+  padding: 5px 8px;
+  border-radius: 8px;
+  font-size: 9px;
+}
+
+.personalization-manager-row + .personalization-manager-row {
+  border-top: 1px solid var(--divider);
+}
+
+.personalization-manager-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.personalization-manager-copy strong,
+.personalization-manager-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.personalization-manager-copy strong {
+  color: var(--text-primary);
+  font-size: 10.5px;
+  font-weight: 590;
+}
+
+.personalization-manager-copy small,
+.personalization-manager-empty {
+  color: var(--text-tertiary);
+  font-size: 9.5px;
+}
+
+.personalization-manager-empty {
+  padding: 14px;
+  line-height: 1.4;
+}
+
+.manager-row-action {
+  min-width: 58px;
+  margin: 0;
+}
+
+.manager-shortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.manager-shortcut kbd {
+  min-width: 17px;
+  height: 17px;
+  padding: 0 3px;
+  font-size: 8px;
 }
 
 .settings-nav span {

@@ -3,16 +3,22 @@ import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
-  getSecondaryContext,
-  rankPersonalizedItems,
-  type ItemPreferenceMap,
-  type PersonalizedMenuItem,
   type RankingMode,
 } from "./personalization";
 import {
   itemShortcutErrorKeyAction,
+  isPinShortcut,
   paletteResultLabel,
+  pinnedFirstWhenIdle,
+  pointerPositionChanged,
+  type PointerPosition,
 } from "./palette-behavior";
+import {
+  buildPaletteResults,
+  type PaletteResult,
+  type SavedActionView,
+} from "./instant-commands";
+import { friendlyPinActionError } from "./saved-command-errors";
 import "./styles.css";
 
 type Appearance = "system" | "light" | "dark";
@@ -127,6 +133,7 @@ type ItemCustomization = {
   favorite: boolean;
   usageCount: number;
   lastUsedAt: number | null;
+  hidden: boolean;
 };
 
 type CatalogCustomizationsResponse = {
@@ -134,6 +141,16 @@ type CatalogCustomizationsResponse = {
   personalizePerDisplay: boolean;
   displayKey: string;
   items: Record<string, ItemCustomization | undefined>;
+  savedActions: Record<string, SavedActionView | undefined>;
+};
+
+type PaletteMenuIcon = MenuIcon & {
+  alias: string | null;
+  hidden: boolean;
+  favorite: boolean;
+  usageCount: number;
+  lastUsedAt: number | null;
+  nativeOrder: number;
 };
 
 type PermissionStatus = Pick<
@@ -254,6 +271,14 @@ function shortcutMarkup(shortcut: string): string {
   return shortcutParts(shortcut)
     .map((part) => `<kbd>${escapeHtml(part)}</kbd>`)
     .join("");
+}
+
+
+function bookmarkIconMarkup(): string {
+  return `<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4.25 2.25h7.5v11L8 10.85l-3.75 2.4v-11Z"></path></svg>`;
+}
+function footerKeyGroup(key: string, label: string): string {
+  return `<span class="footer-key-group"><kbd>${escapeHtml(key)}</kbd><span class="footer-key-label">${escapeHtml(label)}</span></span>`;
 }
 
 function eventShortcut(event: KeyboardEvent): string | null {
@@ -409,7 +434,7 @@ async function initSettings(): Promise<void> {
                 <div class="setting-row compact-setting-row">
                   <div class="setting-label">
                     <strong>Search order</strong>
-                    <small>Smart learns locally from the items you open.</small>
+                    <small>Smart orders the empty palette from the items you open.</small>
                   </div>
                   <div class="appearance-picker personalization-ranking" role="group" aria-label="Search order">
                     <button data-ranking-mode="smart" aria-pressed="true">Smart</button>
@@ -420,7 +445,7 @@ async function initSettings(): Promise<void> {
                 <div class="setting-row compact-setting-row">
                   <div class="setting-label">
                     <strong>Learn per display</strong>
-                    <small>Keep favorites and smart ordering separate on each display.</small>
+                    <small>Keep pins and smart ordering separate on each display.</small>
                   </div>
                   <label class="switch">
                     <input class="display-learning-toggle" type="checkbox" aria-label="Learn separately on each display" />
@@ -430,19 +455,42 @@ async function initSettings(): Promise<void> {
                 <div class="setting-row compact-setting-row personalization-reset-row">
                   <div class="setting-label">
                     <strong>Smart ordering history</strong>
-                    <small>Clear usage history without removing favorites, aliases, or shortcuts.</small>
+                    <small>Clear usage history without removing pins, aliases, or shortcuts.</small>
                   </div>
                   <button class="secondary-action personalization-reset" data-reset-personalization-history>Reset History</button>
                 </div>
                 <div class="setting-row compact-setting-row personalization-shortcuts-row">
                   <div class="setting-label">
                     <strong>Direct shortcuts</strong>
-                    <small>Remove every per-item shortcut. Favorites and aliases stay unchanged.</small>
+                    <small>Remove shortcuts from menu items and pinned actions. Pins and aliases stay unchanged.</small>
                   </div>
                   <button class="secondary-action personalization-clear-shortcuts" data-clear-all-item-shortcuts>Clear All</button>
                 </div>
               </section>
-              <p class="personalization-help">Tip: use an item’s ••• button to add a favorite or alias. Direct shortcuts appear only when that item can be identified reliably across launches.</p>
+              <section class="settings-group personalization-manager-group" aria-labelledby="instant-commands-heading">
+                <div class="personalization-manager-heading">
+                  <div class="setting-label">
+                    <strong id="instant-commands-heading">Pinned actions</strong>
+                    <small>Actions pinned inside their app’s Actions view.</small>
+                  </div>
+                </div>
+                <div class="personalization-manager-list" data-saved-actions-manager>
+                  <div class="personalization-manager-empty">Open this panel to load pinned actions.</div>
+                </div>
+              </section>
+              <section class="settings-group personalization-manager-group" aria-labelledby="hidden-items-heading">
+                <div class="personalization-manager-heading">
+                  <div class="setting-label">
+                    <strong id="hidden-items-heading">Hidden from search</strong>
+                    <small>Items hidden from the main Macnu results on this Mac.</small>
+                  </div>
+                  <button class="secondary-action" type="button" data-restore-all-hidden hidden>Restore All</button>
+                </div>
+                <div class="personalization-manager-list" data-hidden-items-manager>
+                  <div class="personalization-manager-empty">Open this panel to load hidden items.</div>
+                </div>
+              </section>
+              <p class="personalization-help">Tip: pin menu-bar icons directly from search. Use ••• for aliases, shortcuts, visibility, and per-display pin settings.</p>
               <div class="personalization-status" data-personalization-status role="status" aria-live="polite"></div>
             </section>
 
@@ -696,6 +744,12 @@ async function initSettings(): Promise<void> {
   const rankingButtons = Array.from(
     app.querySelectorAll<HTMLButtonElement>("[data-ranking-mode]"),
   );
+  const savedActionsManager =
+    app.querySelector<HTMLElement>("[data-saved-actions-manager]")!;
+  const hiddenItemsManager =
+    app.querySelector<HTMLElement>("[data-hidden-items-manager]")!;
+  const restoreAllHiddenButton =
+    app.querySelector<HTMLButtonElement>("[data-restore-all-hidden]")!;
   let appVersion = "";
   let pendingUpdateVersion: string | null = null;
   let automaticUpdateCheckStarted = false;
@@ -710,6 +764,12 @@ async function initSettings(): Promise<void> {
   let permissionGuardVisible = false;
   let permissionSettingsOpened = false;
   let clearItemShortcutsArmed = false;
+  let personalizationCatalog: CatalogCustomizationsResponse | null = null;
+  let personalizationIcons: MenuIcon[] = [];
+  let personalizationManagersLoading = false;
+  let personalizationManagerRequest = 0;
+  let pendingSettingsSavedActionRemoval: string | null = null;
+  let settingsSavedActionRemovalBusy: string | null = null;
 
   function setMessage(text = "", kind: "info" | "error" = "info"): void {
     message.className = `settings-message ${kind}`;
@@ -905,6 +965,169 @@ async function initSettings(): Promise<void> {
       settingsVersion.textContent = "Macnu";
     });
 
+  function renderPersonalizationManagers(): void {
+    if (personalizationManagersLoading) {
+      if (!settingsSavedActionRemovalBusy) pendingSettingsSavedActionRemoval = null;
+      savedActionsManager.innerHTML =
+        '<div class="personalization-manager-empty">Loading pinned actions…</div>';
+      hiddenItemsManager.innerHTML =
+        '<div class="personalization-manager-empty">Loading hidden items…</div>';
+      restoreAllHiddenButton.hidden = true;
+      return;
+    }
+
+    if (
+      pendingSettingsSavedActionRemoval &&
+      !personalizationCatalog?.savedActions[pendingSettingsSavedActionRemoval]
+    ) {
+      pendingSettingsSavedActionRemoval = null;
+    }
+    const savedActions = Object.values(personalizationCatalog?.savedActions ?? {})
+      .filter((action): action is SavedActionView => Boolean(action))
+      .sort((left, right) =>
+        (left.alias?.trim() || left.action.title).localeCompare(
+          right.alias?.trim() || right.action.title,
+          undefined,
+          { sensitivity: "base" },
+        ),
+      );
+    savedActionsManager.innerHTML = savedActions.length
+      ? savedActions
+          .map((action) => {
+            const label = action.alias?.trim() || action.action.title;
+            const confirmingRemoval =
+              pendingSettingsSavedActionRemoval === action.id &&
+              Boolean(action.shortcut);
+            const removalBusy = settingsSavedActionRemovalBusy === action.id;
+            const context = [action.parentLabel, action.owner]
+              .filter((value, index, values) =>
+                value.trim() && values.indexOf(value) === index && value !== label,
+              )
+              .join(" · ");
+            return `
+              <div class="personalization-manager-row">
+                <span class="personalization-manager-copy">
+                  <strong>${escapeHtml(label)}</strong>
+                  <small>${escapeHtml(context)}</small>
+                </span>
+                ${
+                  confirmingRemoval
+                    ? `
+                      <span class="manager-removal-warning" role="alert">
+                        Unpin this action and remove its ${shortcutMarkup(action.shortcut!)} shortcut?
+                      </span>
+                      <span class="manager-confirm-actions">
+                        <button
+                          type="button"
+                          class="secondary-action"
+                          data-settings-cancel-remove-action="${escapeHtml(action.id)}"
+                          ${removalBusy ? "disabled" : ""}
+                        >Keep</button>
+                        <button
+                          type="button"
+                          class="danger-action"
+                          data-settings-confirm-remove-action="${escapeHtml(action.id)}"
+                          ${removalBusy ? "disabled" : ""}
+                        >${removalBusy ? "Unpinning…" : "Unpin"}</button>
+                      </span>
+                    `
+                    : action.shortcut
+                    ? `<span class="manager-shortcut" aria-label="Shortcut ${escapeHtml(action.shortcut)}">${shortcutMarkup(action.shortcut)}</span>`
+                    : ""
+                }
+                ${
+                  confirmingRemoval
+                    ? ""
+                    : `
+                      <button
+                        type="button"
+                        class="secondary-action manager-row-action"
+                        data-settings-remove-action="${escapeHtml(action.id)}"
+                        aria-label="Unpin action ${escapeHtml(label)}"
+                      >Unpin</button>
+                    `
+                }
+              </div>
+            `;
+          })
+          .join("")
+      : '<div class="personalization-manager-empty">No pinned actions yet. Pin one from an app’s Actions view.</div>';
+
+    const liveById = new Map(
+      personalizationIcons.flatMap((icon) => {
+        const itemId = !icon.isMacnu && typeof icon.itemId === "string"
+          ? icon.itemId.trim()
+          : "";
+        return itemId ? [[itemId, icon] as const] : [];
+      }),
+    );
+    const hiddenItems = Object.entries(personalizationCatalog?.items ?? {})
+      .flatMap(([itemId, customization]) => {
+        const icon = liveById.get(itemId);
+        return customization?.hidden && icon ? [{ itemId, customization, icon }] : [];
+      })
+      .sort((left, right) =>
+        (left.customization.alias?.trim() || left.icon.label).localeCompare(
+          right.customization.alias?.trim() || right.icon.label,
+          undefined,
+          { sensitivity: "base" },
+        ),
+      );
+    const hiddenCustomizationCount = Object.values(
+      personalizationCatalog?.items ?? {},
+    ).filter((customization) => customization?.hidden).length;
+    restoreAllHiddenButton.hidden = hiddenCustomizationCount === 0;
+    hiddenItemsManager.innerHTML = hiddenItems.length
+      ? hiddenItems
+          .map(({ itemId, customization, icon }) => {
+            const label = customization.alias?.trim() || icon.label;
+            return `
+              <div class="personalization-manager-row">
+                <span class="personalization-manager-copy">
+                  <strong>${escapeHtml(label)}</strong>
+                  <small>${escapeHtml(icon.owner)}</small>
+                </span>
+                <button
+                  type="button"
+                  class="secondary-action manager-row-action"
+                  data-settings-unhide-item="${escapeHtml(itemId)}"
+                  aria-label="Show ${escapeHtml(label)} in search"
+                >Show</button>
+              </div>
+            `;
+          })
+          .join("")
+      : hiddenCustomizationCount > 0
+        ? '<div class="personalization-manager-empty">Hidden items aren’t available right now. Restore All will show them the next time they appear.</div>'
+        : '<div class="personalization-manager-empty">No items are hidden.</div>';
+  }
+
+  async function refreshPersonalizationManagers(): Promise<void> {
+    const request = ++personalizationManagerRequest;
+    if (!settingsSavedActionRemovalBusy) pendingSettingsSavedActionRemoval = null;
+    personalizationManagersLoading = true;
+    renderPersonalizationManagers();
+    try {
+      const menu = await invoke<MenuResponse>("list_menu_icons", { force: false });
+      const catalog = await invoke<CatalogCustomizationsResponse>(
+        "get_catalog_customizations",
+        { displayKey: menu.displayKey },
+      );
+      if (request !== personalizationManagerRequest) return;
+      personalizationIcons = menu.icons;
+      personalizationCatalog = catalog;
+      personalizationStatus.textContent = "";
+    } catch (error) {
+      if (request !== personalizationManagerRequest) return;
+      personalizationStatus.textContent = String(error);
+    } finally {
+      if (request === personalizationManagerRequest) {
+        personalizationManagersLoading = false;
+        renderPersonalizationManagers();
+      }
+    }
+  }
+
   function showSettingsView(view: SettingsView): void {
     resetClearItemShortcutsConfirmation();
     app.querySelectorAll<HTMLButtonElement>("[data-settings-view]").forEach((button) => {
@@ -916,6 +1139,9 @@ async function initSettings(): Promise<void> {
     app.querySelectorAll<HTMLElement>("[data-settings-panel]").forEach((panel) => {
       panel.hidden = panel.dataset.settingsPanel !== view;
     });
+    if (view === "personalization") {
+      void refreshPersonalizationManagers();
+    }
   }
 
   function syncVisibleSurface(): void {
@@ -1348,10 +1574,83 @@ async function initSettings(): Promise<void> {
     void savePersonalizationSettings(rankingMode, displayLearningToggle.checked);
   });
 
+  function focusSettingsRemovalControl(
+    savedActionId: string,
+    confirmation = false,
+  ): void {
+    window.setTimeout(() => {
+      const selector = confirmation
+        ? "[data-settings-cancel-remove-action]"
+        : "[data-settings-remove-action]";
+      Array.from(savedActionsManager.querySelectorAll<HTMLButtonElement>(selector))
+        .find((button) =>
+          confirmation
+            ? button.dataset.settingsCancelRemoveAction === savedActionId
+            : button.dataset.settingsRemoveAction === savedActionId,
+        )
+        ?.focus();
+    });
+  }
+
+  async function removeSettingsSavedAction(
+    savedActionId: string,
+    trigger: HTMLButtonElement,
+  ): Promise<void> {
+    const catalog = personalizationCatalog;
+    const savedAction = catalog?.savedActions[savedActionId];
+    if (!catalog || !savedAction || settingsSavedActionRemovalBusy) return;
+    settingsSavedActionRemovalBusy = savedActionId;
+    if (savedAction.shortcut) {
+      pendingSettingsSavedActionRemoval = savedActionId;
+      renderPersonalizationManagers();
+    } else {
+      trigger.disabled = true;
+    }
+    personalizationStatus.textContent = "Unpinning action…";
+    try {
+      const next = await invoke<CatalogCustomizationsResponse>(
+        "remove_saved_action",
+        {
+          displayKey: catalog.displayKey,
+          savedActionId,
+        },
+      );
+      if (personalizationCatalog?.displayKey !== catalog.displayKey) return;
+      settingsSavedActionRemovalBusy = null;
+      pendingSettingsSavedActionRemoval = null;
+      personalizationCatalog = next;
+      personalizationStatus.textContent = "Action unpinned.";
+      renderPersonalizationManagers();
+    } catch (error) {
+      if (personalizationCatalog?.displayKey !== catalog.displayKey) return;
+      settingsSavedActionRemovalBusy = null;
+      pendingSettingsSavedActionRemoval = null;
+      personalizationStatus.textContent =
+        "Macnu couldn’t unpin that action. Nothing was changed; please try again.";
+      console.error("Could not unpin action from Settings.", error);
+      renderPersonalizationManagers();
+      focusSettingsRemovalControl(savedActionId);
+    } finally {
+      if (settingsSavedActionRemovalBusy === savedActionId) {
+        settingsSavedActionRemovalBusy = null;
+      }
+    }
+  }
+
   app.addEventListener("click", (event) => {
     const target = event.target as HTMLElement;
     if (clearItemShortcutsArmed && !target.closest("[data-clear-all-item-shortcuts]")) {
       resetClearItemShortcutsConfirmation();
+    }
+    if (
+      !settingsSavedActionRemovalBusy &&
+      pendingSettingsSavedActionRemoval &&
+      !target.closest(
+        "[data-settings-remove-action], [data-settings-confirm-remove-action], [data-settings-cancel-remove-action]",
+      )
+    ) {
+      pendingSettingsSavedActionRemoval = null;
+      renderPersonalizationManagers();
     }
     const disabledLicenseLink = target.closest<HTMLAnchorElement>("[data-license-link][aria-disabled='true']");
     if (disabledLicenseLink) {
@@ -1376,13 +1675,104 @@ async function initSettings(): Promise<void> {
       );
       return;
     }
+    const cancelSavedActionRemoval = target.closest<HTMLButtonElement>(
+      "[data-settings-cancel-remove-action]",
+    );
+    if (cancelSavedActionRemoval) {
+      if (settingsSavedActionRemovalBusy) return;
+      const savedActionId =
+        cancelSavedActionRemoval.dataset.settingsCancelRemoveAction;
+      pendingSettingsSavedActionRemoval = null;
+      personalizationStatus.textContent = "Pinned action kept.";
+      renderPersonalizationManagers();
+      if (savedActionId) focusSettingsRemovalControl(savedActionId);
+      return;
+    }
+    const confirmSavedActionRemoval = target.closest<HTMLButtonElement>(
+      "[data-settings-confirm-remove-action]",
+    );
+    if (confirmSavedActionRemoval && personalizationCatalog) {
+      if (settingsSavedActionRemovalBusy) return;
+      const savedActionId =
+        confirmSavedActionRemoval.dataset.settingsConfirmRemoveAction;
+      if (!savedActionId) return;
+      void removeSettingsSavedAction(savedActionId, confirmSavedActionRemoval);
+      return;
+    }
+    const removeSavedActionButton = target.closest<HTMLButtonElement>(
+      "[data-settings-remove-action]",
+    );
+    if (removeSavedActionButton && personalizationCatalog) {
+      const savedActionId = removeSavedActionButton.dataset.settingsRemoveAction;
+      if (!savedActionId) return;
+      const savedAction = personalizationCatalog.savedActions[savedActionId];
+      if (!savedAction) return;
+      if (savedAction.shortcut) {
+        pendingSettingsSavedActionRemoval = savedActionId;
+        personalizationStatus.textContent =
+          "Confirm removal. Its direct shortcut will be removed too.";
+        renderPersonalizationManagers();
+        focusSettingsRemovalControl(savedActionId, true);
+      } else {
+        void removeSettingsSavedAction(savedActionId, removeSavedActionButton);
+      }
+      return;
+    }
+    const unhideItemButton = target.closest<HTMLButtonElement>(
+      "[data-settings-unhide-item]",
+    );
+    if (unhideItemButton && personalizationCatalog) {
+      const itemId = unhideItemButton.dataset.settingsUnhideItem;
+      const current = itemId ? personalizationCatalog.items[itemId] : undefined;
+      if (!itemId || !current) return;
+      unhideItemButton.disabled = true;
+      personalizationStatus.textContent = "Restoring item…";
+      void invoke<CatalogCustomizationsResponse>("set_item_customization", {
+        displayKey: personalizationCatalog.displayKey,
+        itemId,
+        alias: current.alias,
+        favorite: current.favorite,
+        shortcut: current.shortcut,
+        hidden: false,
+      })
+        .then((next) => {
+          personalizationCatalog = next;
+          personalizationStatus.textContent = "Item restored to search.";
+          renderPersonalizationManagers();
+        })
+        .catch((error) => {
+          personalizationStatus.textContent = String(error);
+          unhideItemButton.disabled = false;
+        });
+      return;
+    }
+    if (target.closest("[data-restore-all-hidden]")) {
+      restoreAllHiddenButton.disabled = true;
+      personalizationStatus.textContent = "Restoring hidden items…";
+      void invoke<number>("clear_hidden_items")
+        .then(async (restored) => {
+          await refreshPersonalizationManagers();
+          personalizationStatus.textContent = restored === 0
+            ? "No hidden items needed restoring."
+            : restored === 1
+              ? "1 item restored to search."
+              : `${restored} items restored to search.`;
+        })
+        .catch((error) => {
+          personalizationStatus.textContent = String(error);
+        })
+        .finally(() => {
+          restoreAllHiddenButton.disabled = false;
+        });
+      return;
+    }
     if (target.closest("[data-reset-personalization-history]")) {
       setPersonalizationBusy(true);
       personalizationStatus.textContent = "Clearing smart ordering history…";
       void invoke("reset_personalization_history")
         .then(() => {
           personalizationStatus.textContent =
-            "History cleared. Favorites, aliases, and shortcuts were kept.";
+            "History cleared. Pins, aliases, and shortcuts were kept.";
         })
         .catch((error) => {
           personalizationStatus.textContent = String(error);
@@ -1404,12 +1794,13 @@ async function initSettings(): Promise<void> {
       setPersonalizationBusy(true);
       personalizationStatus.textContent = "Removing direct shortcuts…";
       void invoke<number>("clear_all_item_shortcuts")
-        .then((cleared) => {
+        .then(async (cleared) => {
+          await refreshPersonalizationManagers();
           personalizationStatus.textContent = cleared === 0
             ? "No direct shortcuts were set."
             : cleared === 1
-              ? "1 direct shortcut was removed. Favorites and aliases were kept."
-              : `${cleared} direct shortcuts were removed. Favorites and aliases were kept.`;
+              ? "1 direct shortcut was removed. Saved items and aliases were kept."
+              : `${cleared} direct shortcuts were removed. Saved items and aliases were kept.`;
         })
         .catch((error) => {
           personalizationStatus.textContent = String(error);
@@ -1594,9 +1985,25 @@ async function initSettings(): Promise<void> {
     "personalization-settings-changed",
     ({ payload }) => applySettings(payload),
   );
+  void currentWindow.listen<CatalogCustomizationsResponse>(
+    "catalog-customizations-changed",
+    ({ payload }) => {
+      if (payload.displayKey === personalizationCatalog?.displayKey) {
+        personalizationCatalog = payload;
+        renderPersonalizationManagers();
+      } else if (
+        app.querySelector("[data-settings-view='personalization'].selected")
+      ) {
+        void refreshPersonalizationManagers();
+      }
+    },
+  );
+  void currentWindow.listen("catalog-customizations-invalidated", () => {
+    void refreshPersonalizationManagers();
+  });
   void currentWindow.listen("personalization-history-reset", () => {
     personalizationStatus.textContent =
-      "History cleared. Favorites, aliases, and shortcuts were kept.";
+      "History cleared. Pins, aliases, and shortcuts were kept.";
   });
   updateAppearanceControls();
   await refreshAppState();
@@ -1631,11 +2038,12 @@ app.innerHTML = `
     </header>
     <div class="divider"></div>
     <main class="results"></main>
+    <div class="visually-hidden" data-selection-announcer role="status" aria-live="polite" aria-atomic="true"></div>
     <footer>
-      <span class="footer-navigation"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
-      <span class="footer-primary"><kbd>↵</kbd> open</span>
-      <span class="footer-secondary"><kbd>tab</kbd> actions</span>
-      <span><kbd>esc</kbd> close</span>
+      <span class="footer-navigation footer-key-group"><span class="footer-key-cluster"><kbd>↑</kbd><kbd>↓</kbd></span><span class="footer-key-label">navigate</span></span>
+      <span class="footer-primary footer-key-group"><kbd>↵</kbd><span class="footer-key-label">open</span></span>
+      <span class="footer-secondary footer-key-groups">${footerKeyGroup("tab", "actions")}</span>
+      <span class="footer-close footer-key-group"><kbd>esc</kbd><span class="footer-key-label">close</span></span>
       <button class="settings-button">Settings</button>
       <button class="refresh">Refresh</button>
     </footer>
@@ -1646,6 +2054,8 @@ enableWindowDragging(".search-row");
 
 const input = app.querySelector<HTMLInputElement>(".search-input")!;
 const results = app.querySelector<HTMLElement>(".results")!;
+const selectionAnnouncer =
+  app.querySelector<HTMLElement>("[data-selection-announcer]")!;
 const refresh = app.querySelector<HTMLButtonElement>(".refresh")!;
 const shortcutDisplay = app.querySelector<HTMLElement>(".current-shortcut")!;
 const searchRow = app.querySelector<HTMLElement>(".search-row")!;
@@ -1666,6 +2076,7 @@ let blurDismissGeneration = 0;
 let blurDismissArmed = false;
 let pendingBlur = false;
 let pointerSelectionArmed = false;
+let lastPointerPosition: PointerPosition | null = null;
 let lastArrowNavigationAt = 0;
 let paletteTestMode = false;
 let actionScope: MenuIcon | null = null;
@@ -1673,6 +2084,11 @@ let actionResponse: MenuActionsResponse | null = null;
 let actionLoading = false;
 let actionDiscoveryCount = 0;
 let actionRunError: string | null = null;
+let actionPinError: string | null = null;
+let actionPinSaving = false;
+let itemPinSavingId: string | null = null;
+let itemPinError: string | null = null;
+let pendingActionUnpinId: string | null = null;
 let paletteRankingMode: RankingMode = "smart";
 let palettePersonalizePerDisplay = true;
 let customizations: CatalogCustomizationsResponse | null = null;
@@ -1686,12 +2102,30 @@ let customizationDraft: {
   alias: string;
   favorite: boolean;
   shortcut: string;
+  hidden: boolean;
 } | null = null;
 let customizationEditSession = 0;
 let itemShortcutRecording = false;
 let customizationMessage = "";
 let customizationSaving = false;
 let itemShortcutError: string | null = null;
+let savedActionDraft: {
+  session: number;
+  displayKey: string;
+  savedActionId: string;
+  alias: string;
+  shortcut: string;
+} | null = null;
+let savedActionEditSession = 0;
+let savedActionShortcutRecording = false;
+let savedActionSaving = false;
+let savedActionMessage = "";
+let savedActionError: string | null = null;
+let savedActionErrorTitle = "That pinned action isn’t available right now";
+let savedActionErrorTarget: SavedActionView | null = null;
+let savedActionErrorOpenSettings = false;
+let savedActionErrorOpeningSettings = false;
+let savedActionRemoveArmed = false;
 const actionCache = new Map<
   string,
   { expiresAt: number; response: MenuActionsResponse }
@@ -1757,6 +2191,12 @@ function resetCustomizationState(): void {
   itemShortcutRecording = false;
   customizationMessage = "";
   customizationSaving = false;
+  savedActionEditSession += 1;
+  savedActionDraft = null;
+  savedActionShortcutRecording = false;
+  savedActionSaving = false;
+  savedActionMessage = "";
+  savedActionRemoveArmed = false;
 }
 
 function iconIdentity(icon: MenuIcon): string {
@@ -1785,61 +2225,82 @@ function displayLabel(icon: MenuIcon): string {
   return customizationFor(icon)?.alias?.trim() || icon.label;
 }
 
-function personalizationPreferences(): ItemPreferenceMap {
-  if (!customizations || customizations.displayKey !== response?.displayKey) {
-    return {};
-  }
-  return Object.fromEntries(
-    Object.entries(customizations.items).flatMap(([itemId, customization]) => {
-      if (
-        response?.icons.some((icon) => icon.isMacnu && icon.itemId === itemId)
-      ) {
-        return [];
-      }
-      if (!customization) return [];
-      return [[
-        itemId,
-        {
-          alias: customization.alias,
-          favorite: customization.favorite,
-          usageCount: customization.usageCount,
-          lastUsedAt:
-            customization.lastUsedAt === null
-              ? null
-              : customization.lastUsedAt * 1_000,
-        },
-      ]];
-    }),
-  );
-}
-
-function visibleIconEntries(): PersonalizedMenuItem<MenuIcon>[] {
-  const icons = response?.icons ?? [];
-  return rankPersonalizedItems(icons, personalizationPreferences(), {
-    query: input.value,
-    mode: customizations?.rankingMode ?? paletteRankingMode,
-    now: rankingNow,
+function paletteLiveItems(): PaletteMenuIcon[] {
+  const catalogReady = customizations?.displayKey === response?.displayKey;
+  return (response?.icons ?? []).map((icon, nativeOrder) => {
+    const customization = catalogReady ? customizationFor(icon) : undefined;
+    return {
+      ...icon,
+      alias: customization?.alias ?? null,
+      hidden: icon.isMacnu ? false : customization?.hidden ?? false,
+      favorite: customization?.favorite ?? false,
+      usageCount: customization?.usageCount ?? 0,
+      lastUsedAt: customization?.lastUsedAt ?? null,
+      nativeOrder,
+    };
   });
 }
 
-function visibleIcons(): MenuIcon[] {
-  return visibleIconEntries().map(({ item }) => item);
+function visiblePaletteResults(): PaletteResult<PaletteMenuIcon>[] {
+  const activeCatalog = customizations?.displayKey === response?.displayKey
+    ? customizations
+    : null;
+  return buildPaletteResults(
+    paletteLiveItems(),
+    activeCatalog?.savedActions ?? {},
+    {
+      query: input.value,
+      mode: activeCatalog?.rankingMode ?? paletteRankingMode,
+      now: rankingNow,
+    },
+  );
+}
+
+function selectedPaletteResult(): PaletteResult<PaletteMenuIcon> | null {
+  return visiblePaletteResults()[selectedIndex] ?? null;
+}
+
+function resultParent(result: PaletteResult<PaletteMenuIcon>): MenuIcon {
+  return result.kind === "item" ? result.item : result.parent;
+}
+
+function savedActionFor(action: MenuAction): SavedActionView | null {
+  const parentItemId = actionScope ? stableItemId(actionScope) : null;
+  if (!parentItemId || !customizations) return null;
+  return Object.values(customizations.savedActions).find(
+    (saved): saved is SavedActionView =>
+      Boolean(
+        saved &&
+          saved.parentItemId === parentItemId &&
+          saved.action.id === action.id,
+      ),
+  ) ?? null;
 }
 
 function preserveSelectedIdentity(): void {
   if (actionScope) return;
-  const selected = visibleIconEntries()[selectedIndex];
-  if (selected) selectedItemIdentity = iconIdentity(selected.item);
+  const selected = visiblePaletteResults()[selectedIndex];
+  if (selected) selectedItemIdentity = selected.id;
 }
 
-function applyCustomizations(next: CatalogCustomizationsResponse): void {
+function renderPreservingScroll(): void {
+  const scrollTop = results.scrollTop;
+  render();
+  results.scrollTop = scrollTop;
+}
+
+function applyCustomizations(
+  next: CatalogCustomizationsResponse,
+  preferredSelection: string | null = null,
+): void {
   if (!response || next.displayKey !== response.displayKey) return;
   preserveSelectedIdentity();
+  if (preferredSelection) selectedItemIdentity = preferredSelection;
   customizations = next;
   paletteRankingMode = next.rankingMode;
   palettePersonalizePerDisplay = next.personalizePerDisplay;
   rankingNow = Date.now();
-  render();
+  renderPreservingScroll();
 }
 
 async function loadCustomizations(displayKey: string): Promise<void> {
@@ -1885,6 +2346,7 @@ function openCustomization(icon: MenuIcon): void {
     alias: current?.alias ?? "",
     favorite: current?.favorite ?? false,
     shortcut: current?.shortcut ?? "",
+    hidden: current?.hidden ?? false,
   };
   itemShortcutRecording = false;
   customizationMessage = "";
@@ -1919,6 +2381,95 @@ function dismissItemShortcutError(): void {
   armBlurDismissAfterDelay(generation);
 }
 
+function dismissSavedActionError(): void {
+  if (!savedActionError) return;
+  const generation = ++blurDismissGeneration;
+  blurDismissArmed = false;
+  pendingBlur = false;
+  savedActionError = null;
+  savedActionErrorTitle = "That pinned action isn’t available right now";
+  savedActionErrorTarget = null;
+  savedActionErrorOpenSettings = false;
+  savedActionErrorOpeningSettings = false;
+  selectedIndex = 0;
+  selectedItemIdentity = null;
+  input.value = "";
+  activeDisplayId = null;
+  applyResponse(null);
+  render();
+  input.focus();
+  void openPalette(generation);
+  armBlurDismissAfterDelay(generation);
+}
+
+async function toggleItemPin(icon: MenuIcon): Promise<void> {
+  const itemId = stableItemId(icon);
+  const displayKey = response?.displayKey?.trim();
+  if (
+    !itemId ||
+    !displayKey ||
+    customizations?.displayKey !== displayKey ||
+    !responseContainsItem(response, itemId) ||
+    itemPinSavingId
+  ) {
+    return;
+  }
+
+  const current = customizationFor(icon);
+  const nextPinned = !(current?.favorite ?? false);
+  itemPinSavingId = itemId;
+  itemPinError = null;
+  const pinnedItemIdentity = visiblePaletteResults().find(
+    (entry) => entry.kind === "item" && entry.itemId === itemId,
+  )?.id ?? null;
+  selectedItemIdentity = pinnedItemIdentity;
+  pointerSelectionArmed = false;
+  renderPreservingScroll();
+
+  try {
+    const next = await invoke<CatalogCustomizationsResponse>(
+      "set_item_customization",
+      {
+        displayKey,
+        itemId,
+        alias: current?.alias ?? null,
+        favorite: nextPinned,
+        shortcut: current?.shortcut ?? null,
+        hidden: current?.hidden ?? false,
+      },
+    );
+    if (
+      response?.displayKey !== displayKey ||
+      !responseContainsItem(response, itemId)
+    ) {
+      return;
+    }
+    itemPinSavingId = null;
+    pointerSelectionArmed = false;
+    applyCustomizations(next, pinnedItemIdentity);
+    const nextIndex = visiblePaletteResults().findIndex(
+      (entry) => entry.kind === "item" && entry.itemId === itemId,
+    );
+    if (nextIndex >= 0) updateSelection(nextIndex, false, false);
+  } catch (error) {
+    if (response?.displayKey !== displayKey) return;
+    itemPinError = nextPinned
+      ? "Macnu couldn’t pin that icon. Nothing was changed; please try again."
+      : "Macnu couldn’t unpin that icon. Nothing was changed; please try again.";
+    console.error(
+      nextPinned ? "Could not pin menu-bar icon." : "Could not unpin menu-bar icon.",
+      error,
+    );
+    renderPreservingScroll();
+  } finally {
+    if (itemPinSavingId === itemId) {
+      itemPinSavingId = null;
+      renderPreservingScroll();
+    }
+    window.setTimeout(() => input.focus({ preventScroll: true }));
+  }
+}
+
 async function saveCustomization(): Promise<void> {
   if (!customizationDraft || customizationSaving) return;
   const draft = { ...customizationDraft };
@@ -1947,6 +2498,7 @@ async function saveCustomization(): Promise<void> {
         shortcut: supportsDirectShortcut(draft.itemId)
           ? draft.shortcut || null
           : null,
+        hidden: draft.hidden,
       },
     );
     if (
@@ -1980,6 +2532,225 @@ async function saveCustomization(): Promise<void> {
   }
 }
 
+function describeSavedActionError(
+  error: unknown,
+  savedAction: SavedActionView | null = null,
+): { title: string; message: string; openSettings?: boolean } {
+  const detail = String(error).toLocaleLowerCase();
+  const owner =
+    savedAction?.owner.trim() || savedAction?.parentLabel.trim() || "the app";
+  if (
+    detail.includes("valid macnu license") ||
+    detail.includes("license is required")
+  ) {
+    return {
+      title: "A Macnu license is required",
+      message: "Open Settings to activate or review your license.",
+      openSettings: true,
+    };
+  }
+  if (detail.includes("complete macnu setup")) {
+    return {
+      title: "Finish setting up Macnu",
+      message: "Open Settings to complete permissions and setup.",
+      openSettings: true,
+    };
+  }
+  if (
+    detail.includes("shortcut") ||
+    detail.includes("already in use") ||
+    detail.includes("key combination")
+  ) {
+    return {
+      title: "That shortcut can’t be used",
+      message: "Try a different key combination.",
+    };
+  }
+  if (detail.includes("saved action no longer exists")) {
+    return {
+      title: "This pinned action was removed",
+      message: "Return to search to refresh your pinned actions.",
+    };
+  }
+  if (detail.includes("action changed") || detail.includes("invalid or has changed")) {
+    return {
+      title: "This pinned action changed",
+      message: `Review ${owner}’s current Actions, then pin the action you want.`,
+    };
+  }
+  if (detail.includes("currently unavailable")) {
+    return {
+      title: "This command is disabled right now",
+      message: `Change its state in ${owner}, then try again.`,
+    };
+  }
+  if (
+    detail.includes("personalization") ||
+    detail.includes("menu cache") ||
+    detail.includes("settings are unavailable")
+  ) {
+    return {
+      title: "Macnu couldn’t load pinned actions",
+      message: "Nothing was changed. Please try again.",
+    };
+  }
+  if (
+    detail.includes("menu-bar item") ||
+    detail.includes("menu item") ||
+    detail.includes("display is no longer") ||
+    detail.includes("not running") ||
+    detail.includes("not available")
+  ) {
+    return {
+      title: `${owner} isn’t available on this display`,
+      message: "Restore its menu-bar item, then try again.",
+    };
+  }
+  if (detail.includes("accessibility")) {
+    return {
+      title: "Accessibility permission is required",
+      message: "Review Macnu’s Permissions, then try the pinned action again.",
+      openSettings: true,
+    };
+  }
+  return {
+    title: "Macnu couldn’t run that pinned action",
+    message: "The command was not changed. Please try again.",
+  };
+}
+
+function friendlySavedActionError(error: unknown): string {
+  return describeSavedActionError(error).message;
+}
+
+function openSavedActionCustomization(savedAction: SavedActionView): void {
+  const displayKey = response?.displayKey;
+  if (!displayKey || customizations?.displayKey !== displayKey) return;
+  const session = ++savedActionEditSession;
+  customizationDraft = null;
+  itemShortcutRecording = false;
+  selectedItemIdentity = `action:${encodeURIComponent(savedAction.parentItemId)}:${encodeURIComponent(savedAction.id)}`;
+  savedActionDraft = {
+    session,
+    displayKey,
+    savedActionId: savedAction.id,
+    alias: savedAction.alias ?? "",
+    shortcut: savedAction.shortcut ?? "",
+  };
+  savedActionShortcutRecording = false;
+  savedActionSaving = false;
+  savedActionMessage = "";
+  savedActionRemoveArmed = false;
+  render();
+  window.setTimeout(() => {
+    if (savedActionDraft?.session === session) {
+      results.querySelector<HTMLInputElement>("[data-saved-action-alias]")?.focus();
+    }
+  });
+}
+
+async function saveSavedActionCustomization(): Promise<void> {
+  if (!savedActionDraft || savedActionSaving) return;
+  const draft = { ...savedActionDraft };
+  if (
+    draft.session !== savedActionEditSession ||
+    customizations?.displayKey !== draft.displayKey ||
+    !customizations.savedActions[draft.savedActionId]
+  ) {
+    resetCustomizationState();
+    render();
+    return;
+  }
+  savedActionSaving = true;
+  savedActionMessage = "Saving…";
+  render();
+  try {
+    const next = await invoke<CatalogCustomizationsResponse>(
+      "update_saved_action",
+      {
+        displayKey: draft.displayKey,
+        savedActionId: draft.savedActionId,
+        alias: draft.alias.trim() || null,
+        shortcut: draft.shortcut || null,
+      },
+    );
+    if (
+      savedActionEditSession !== draft.session ||
+      savedActionDraft?.session !== draft.session ||
+      response?.displayKey !== draft.displayKey
+    ) {
+      return;
+    }
+    resetCustomizationState();
+    applyCustomizations(next);
+    window.setTimeout(() => input.focus());
+  } catch (error) {
+    if (savedActionEditSession !== draft.session) return;
+    savedActionSaving = false;
+    savedActionMessage = friendlySavedActionError(error);
+    render();
+    window.setTimeout(() => {
+      if (savedActionDraft?.session === draft.session) {
+        results.querySelector<HTMLInputElement>("[data-saved-action-alias]")?.focus();
+      }
+    });
+  }
+}
+
+async function removeSavedAction(savedActionId: string): Promise<void> {
+  const draft = savedActionDraft ? { ...savedActionDraft } : null;
+  if (
+    !draft ||
+    draft.savedActionId !== savedActionId ||
+    savedActionSaving ||
+    response?.displayKey !== draft.displayKey ||
+    !customizations?.savedActions[savedActionId]
+  ) {
+    return;
+  }
+  savedActionRemoveArmed = false;
+  savedActionShortcutRecording = false;
+  savedActionSaving = true;
+  savedActionMessage = "Unpinning…";
+  render();
+  try {
+    const next = await invoke<CatalogCustomizationsResponse>(
+      "remove_saved_action",
+      { displayKey: draft.displayKey, savedActionId },
+    );
+    const sameEditor =
+      savedActionEditSession === draft.session &&
+      savedActionDraft?.session === draft.session &&
+      savedActionDraft.savedActionId === savedActionId &&
+      response?.displayKey === draft.displayKey;
+    if (response?.displayKey === draft.displayKey) {
+      applyCustomizations(next);
+    }
+    if (!sameEditor) return;
+    resetCustomizationState();
+    render();
+    window.setTimeout(() => input.focus());
+  } catch (error) {
+    if (
+      savedActionEditSession !== draft.session ||
+      savedActionDraft?.session !== draft.session ||
+      savedActionDraft.savedActionId !== savedActionId ||
+      response?.displayKey !== draft.displayKey
+    ) {
+      return;
+    }
+    savedActionSaving = false;
+    savedActionMessage = "Macnu couldn’t unpin that action. Nothing was changed; please try again.";
+    console.error("Could not unpin action.", error);
+    render();
+    window.setTimeout(() => {
+      if (savedActionDraft?.session === draft.session) {
+        results.querySelector<HTMLButtonElement>("[data-remove-saved-action]")?.focus();
+      }
+    });
+  }
+}
+
 function actionCacheKey(icon: MenuIcon): string {
   return [
     icon.activationPid ?? "",
@@ -1995,7 +2766,13 @@ function actionCacheKey(icon: MenuIcon): string {
 function visibleActions(): MenuAction[] {
   const query = input.value.trim().toLocaleLowerCase();
   const actions = actionResponse?.actions ?? [];
-  if (!query) return actions;
+  if (!query) {
+    return pinnedFirstWhenIdle(
+      actions,
+      (action) => Boolean(savedActionFor(action)),
+      false,
+    );
+  }
   return actions.filter((action) => {
     const path = action.path.map((segment) => segment.title).join(" ");
     return `${action.title} ${path}`.toLocaleLowerCase().includes(query);
@@ -2009,6 +2786,22 @@ function actionContext(action: MenuAction): string {
 
 function updatePaletteChrome(): void {
   const scoped = actionScope !== null;
+  const selectedRoot = scoped ? null : selectedPaletteResult();
+  const selectedAction = scoped ? visibleActions()[selectedIndex] : null;
+  const selectedRootPinnable = Boolean(
+    selectedRoot?.kind === "item" &&
+      selectedRoot.itemId &&
+      !selectedRoot.item.isMacnu,
+  );
+  const selectedRootPinned =
+    selectedRoot?.kind === "item" && selectedRoot.favorite;
+  const selectedSavedAction = selectedAction
+    ? savedActionFor(selectedAction)
+    : null;
+  const selectedActionPinned = Boolean(selectedSavedAction);
+  const confirmingSelectedUnpin = Boolean(
+    selectedSavedAction?.id === pendingActionUnpinId,
+  );
   searchRow.classList.toggle("actions-mode", scoped);
   searchLeading.disabled = !scoped;
   input.placeholder = scoped
@@ -2016,14 +2809,46 @@ function updatePaletteChrome(): void {
     : "Search menu bar icons…";
   input.setAttribute(
     "aria-label",
-    scoped ? `Search ${displayLabel(actionScope!)} actions` : "Search menu bar icons",
+    scoped
+      ? `Search ${displayLabel(actionScope!)} actions`
+      : "Search menu bar icons",
   );
-  footerPrimary.innerHTML = scoped
-    ? "<kbd>↵</kbd> run"
-    : "<kbd>↵</kbd> open";
-  footerSecondary.innerHTML = scoped
-    ? "<kbd>←</kbd> back"
-    : "<kbd>tab</kbd> actions";
+  const primaryMarkup = scoped
+    ? selectedAction
+      ? '<kbd>↵</kbd><span class="footer-key-label">run</span>'
+      : ""
+    : selectedRoot
+      ? `<kbd>↵</kbd><span class="footer-key-label">${selectedRoot.kind === "action" ? "run" : "open"}</span>`
+      : "";
+  footerPrimary.innerHTML = primaryMarkup;
+  footerPrimary.hidden = !primaryMarkup;
+
+  const secondaryGroups: string[] = [];
+  if (scoped) {
+    if (selectedAction && confirmingSelectedUnpin) {
+      secondaryGroups.push(footerKeyGroup("tab", "choose"));
+      secondaryGroups.push(footerKeyGroup("esc", "keep"));
+    } else {
+      if (selectedAction) {
+        secondaryGroups.push(
+          footerKeyGroup("⌘P", selectedActionPinned ? "unpin" : "pin"),
+        );
+      }
+      secondaryGroups.push(footerKeyGroup("←", "back"));
+    }
+  } else if (selectedRoot) {
+    if (selectedRootPinnable) {
+      secondaryGroups.push(
+        footerKeyGroup("⌘P", selectedRootPinned ? "unpin" : "pin"),
+      );
+    }
+    secondaryGroups.push(footerKeyGroup("tab", "actions"));
+    if (selectedRoot.kind === "item" && selectedRoot.itemId) {
+      secondaryGroups.push(footerKeyGroup("⌘E", "edit"));
+    }
+  }
+  footerSecondary.innerHTML = secondaryGroups.join("");
+  footerSecondary.hidden = secondaryGroups.length === 0;
   refresh.hidden = scoped;
 }
 
@@ -2078,34 +2903,161 @@ function renderActions(): void {
     return;
   }
 
-  results.innerHTML = actions
-    .map(
-      (action, index) => `
-        <button
-          type="button"
-          class="result action-result ${index === selectedIndex ? "selected" : ""} ${
-            action.enabled ? "" : "disabled"
-          }"
-          data-index="${index}"
-          tabindex="-1"
-          aria-disabled="${!action.enabled}"
+  const pinErrorMarkup = actionPinError
+    ? `
+        <div class="action-pin-error" role="alert">
+          <span>${escapeHtml(actionPinError)}</span>
+          <button type="button" data-dismiss-action-pin-error aria-label="Dismiss pin error">×</button>
+        </div>
+      `
+    : "";
+  const pendingSavedAction = pendingActionUnpinId
+    ? customizations?.savedActions[pendingActionUnpinId]
+    : undefined;
+  const pendingAction = pendingSavedAction
+    ? actions.find((action) => savedActionFor(action)?.id === pendingSavedAction.id)
+    : undefined;
+  if (
+    pendingActionUnpinId &&
+    (!pendingSavedAction?.shortcut || !pendingAction)
+  ) {
+    pendingActionUnpinId = null;
+  }
+  const unpinConfirmationMarkup = pendingSavedAction?.shortcut && pendingAction
+    ? `
+        <div
+          class="action-unpin-confirmation"
+          role="alertdialog"
+          aria-label="Confirm unpinning action"
         >
-          <span class="icon-frame">
-            <img src="${actionScope!.image}" alt="" draggable="false" />
+          <span>
+            Unpin <strong>${escapeHtml(pendingSavedAction.alias?.trim() || pendingAction.title)}</strong>
+            and remove its ${shortcutMarkup(pendingSavedAction.shortcut)} shortcut?
           </span>
-          <span class="result-copy">
-            <strong>${escapeHtml(action.title)}</strong>
-            <small>${escapeHtml(actionContext(action))}</small>
+          <span class="action-unpin-confirmation-controls">
+            <button type="button" class="secondary-action" data-cancel-action-unpin ${actionPinSaving ? "disabled" : ""}>Keep</button>
+            <button type="button" class="danger-action" data-confirm-action-unpin ${actionPinSaving ? "disabled" : ""}>${actionPinSaving ? "Unpinning…" : "Unpin"}</button>
           </span>
-          <span class="action-tail">${escapeHtml(action.shortcut ?? (action.enabled ? "↵" : "—"))}</span>
-        </button>
-      `,
+        </div>
+      `
+    : "";
+  results.innerHTML = pinErrorMarkup + unpinConfirmationMarkup + actions
+    .map(
+      (action, index) => {
+        const savedAction = savedActionFor(action);
+        const pinned = Boolean(savedAction);
+        const actionShortcut = action.shortcut?.trim() ?? "";
+        return `
+        <div
+          class="action-result-row ${index === selectedIndex ? "selected" : ""}"
+          data-result-row
+          data-index="${index}"
+        >
+          <button
+            type="button"
+            class="result action-result ${actionShortcut ? "has-tail" : ""} ${index === selectedIndex ? "selected" : ""} ${
+              action.enabled ? "" : "disabled"
+            }"
+            data-index="${index}"
+            tabindex="-1"
+            aria-disabled="${!action.enabled}"
+            aria-label="${escapeHtml(`${action.title}${pinned ? ", pinned" : ""}`)}"
+          >
+            <span class="icon-frame">
+              <img src="${actionScope!.image}" alt="" draggable="false" />
+            </span>
+            <span class="result-copy">
+              <strong>${escapeHtml(action.title)}</strong>
+              <small>${escapeHtml(actionContext(action))}</small>
+            </span>
+            ${actionShortcut ? `<span class="action-tail">${escapeHtml(actionShortcut)}</span>` : ""}
+          </button>
+          <button
+            type="button"
+            class="pin-action ${pinned ? "pinned" : ""}"
+            data-pin-action="${escapeHtml(action.id)}"
+            data-index="${index}"
+            aria-pressed="${pinned}"
+            aria-keyshortcuts="Meta+P"
+            aria-label="${pinned ? "Unpin" : "Pin"} ${escapeHtml(action.title)}"
+            title="${pinned ? "Unpin action" : "Pin action"} (⌘P)"
+          >
+            ${bookmarkIconMarkup()}
+          </button>
+        </div>
+      `;
+      },
     )
     .join("");
 }
 
+async function toggleSavedAction(action: MenuAction): Promise<void> {
+  const icon = actionScope;
+  const displayKey = icon?.displayKey?.trim();
+  if (!icon || !displayKey || actionPinSaving) return;
+  actionPinError = null;
+  const existing = savedActionFor(action);
+  if (existing?.shortcut && pendingActionUnpinId !== existing.id) {
+    pendingActionUnpinId = existing.id;
+    render();
+    window.setTimeout(() => {
+      results.querySelector<HTMLButtonElement>("[data-cancel-action-unpin]")?.focus();
+    });
+    return;
+  }
+  actionPinSaving = true;
+  input.readOnly = true;
+  if (existing?.shortcut) {
+    pendingActionUnpinId = existing.id;
+    render();
+  } else {
+    pendingActionUnpinId = null;
+  }
+  try {
+    const next = existing
+      ? await invoke<CatalogCustomizationsResponse>("remove_saved_action", {
+          displayKey,
+          savedActionId: existing.id,
+        })
+      : await invoke<CatalogCustomizationsResponse>("save_saved_action", {
+          displayKey,
+          icon,
+          action,
+          alias: null,
+          shortcut: null,
+        });
+    actionPinSaving = false;
+    pendingActionUnpinId = null;
+    applyCustomizations(next);
+    const nextIndex = visibleActions().findIndex(
+      (candidate) => candidate.id === action.id,
+    );
+    if (nextIndex >= 0) selectedIndex = nextIndex;
+    window.setTimeout(() => input.focus());
+    render();
+  } catch (error) {
+    actionPinSaving = false;
+    pendingActionUnpinId = null;
+    console.error(
+      existing ? "Could not unpin action." : "Could not pin action.",
+      error,
+    );
+    actionPinError = existing
+      ? "Macnu couldn’t unpin that action. Nothing was changed; please try again."
+      : friendlyPinActionError(error, displayLabel(icon));
+    render();
+    window.setTimeout(() => input.focus());
+  } finally {
+    input.readOnly = false;
+    actionPinSaving = false;
+  }
+}
+
 function customizationEditorMarkup(
-  entry: PersonalizedMenuItem<MenuIcon>,
+  entry: Extract<
+    PaletteResult<PaletteMenuIcon>,
+    { kind: "item" }
+  >,
 ): string {
   if (!customizationDraft || customizationDraft.itemId !== entry.itemId) return "";
   const shortcutAvailable = Boolean(
@@ -2117,8 +3069,8 @@ function customizationEditorMarkup(
       ? shortcutMarkup(customizationDraft.shortcut)
       : "Set shortcut";
   const favoriteLabel = palettePersonalizePerDisplay
-    ? "Favorite on this display"
-    : "Favorite on every display";
+    ? "Pin on this display"
+    : "Pin on every display";
   const disabled = customizationSaving ? "disabled" : "";
   const shortcutControl = shortcutAvailable
     ? `
@@ -2171,11 +3123,109 @@ function customizationEditorMarkup(
         />
         <span>${favoriteLabel}</span>
       </label>
+      <label class="item-favorite-field item-visibility-field">
+        <input
+          type="checkbox"
+          data-customization-visible
+          ${customizationDraft.hidden ? "" : "checked"}
+          ${disabled}
+        />
+        <span>Show in search</span>
+      </label>
       ${shortcutControl}
       <div class="item-customization-actions">
         <span class="item-customization-message" role="status">${escapeHtml(customizationMessage)}</span>
         <button type="button" class="secondary-action" data-cancel-item-customization ${disabled}>Cancel</button>
         <button type="submit" class="primary-action" ${disabled}>Save</button>
+      </div>
+    </form>
+  `;
+}
+
+function savedActionEditorMarkup(
+  entry: Extract<
+    PaletteResult<PaletteMenuIcon>,
+    { kind: "action" }
+  >,
+): string {
+  if (
+    !savedActionDraft ||
+    savedActionDraft.savedActionId !== entry.savedAction.id
+  ) {
+    return "";
+  }
+  const disabled = savedActionSaving ? "disabled" : "";
+  const shortcutAvailable = supportsDirectShortcut(entry.parentItemId);
+  const shortcutLabel = savedActionShortcutRecording
+    ? "Press a shortcut"
+    : savedActionDraft.shortcut
+      ? shortcutMarkup(savedActionDraft.shortcut)
+      : "Set shortcut";
+  const shortcutControl = shortcutAvailable
+    ? `
+        <div class="item-shortcut-field">
+          <span>Direct shortcut</span>
+          <button
+            type="button"
+            class="item-shortcut-recorder ${savedActionShortcutRecording ? "recording" : ""}"
+            data-record-saved-action-shortcut
+            aria-pressed="${savedActionShortcutRecording}"
+            ${disabled}
+          >${shortcutLabel}</button>
+          <button
+            type="button"
+            class="item-shortcut-clear"
+            data-clear-saved-action-shortcut
+            ${savedActionDraft.shortcut ? "" : "hidden"}
+            ${disabled}
+          >Clear</button>
+        </div>
+      `
+    : `
+        <div class="item-shortcut-field unavailable">
+          <span>Direct shortcut</span>
+          <small>This app does not provide a permanent identity for this command.</small>
+        </div>
+      `;
+  return `
+    <form
+      class="item-customization-editor saved-action-editor"
+      data-saved-action-customization
+      aria-label="Customize pinned action ${escapeHtml(entry.originalLabel)}"
+    >
+      <div class="item-customization-heading">
+        <strong>Customize ${escapeHtml(entry.originalLabel)}</strong>
+        <small>${escapeHtml(entry.parent.label)} · Saved locally on this Mac.</small>
+      </div>
+      <label class="item-alias-field">
+        <span>Alias</span>
+        <input
+          type="text"
+          maxlength="48"
+          value="${escapeHtml(savedActionDraft.alias)}"
+          placeholder="${escapeHtml(entry.originalLabel)}"
+          data-saved-action-alias
+          ${disabled}
+        />
+      </label>
+      ${shortcutControl}
+      <div class="item-customization-actions">
+        ${
+          savedActionRemoveArmed && entry.savedAction.shortcut
+            ? `
+              <span class="item-customization-message saved-action-removal-warning" role="alert">
+                Unpin this action and remove its ${shortcutMarkup(entry.savedAction.shortcut)} shortcut?
+              </span>
+              <button type="button" class="secondary-action" data-cancel-saved-action-removal ${disabled}>Keep</button>
+              <button type="button" class="danger-action" data-confirm-saved-action-removal ${disabled}>${savedActionSaving ? "Unpinning…" : "Unpin"}</button>
+            `
+            : `
+              <span class="item-customization-message" role="status">${escapeHtml(savedActionMessage)}</span>
+              <button type="button" class="danger-action saved-action-remove" data-remove-saved-action ${disabled}>Unpin</button>
+              <button type="button" class="secondary-action" data-cancel-saved-action-customization ${disabled}>Cancel</button>
+              <button type="submit" class="primary-action" ${disabled}>Save</button>
+            `
+        }
       </div>
     </form>
   `;
@@ -2195,6 +3245,38 @@ function render(): void {
         <strong>That menu-bar item isn’t available right now</strong>
         <small>Make sure its app is running on this display, then try the shortcut again.</small>
         <button type="button" class="secondary-action dismiss-item-shortcut-error">Back to search</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (savedActionError) {
+    const canReviewSavedAction = Boolean(
+      savedActionErrorTarget &&
+      responseContainsItem(response, savedActionErrorTarget.parentItemId),
+    );
+    results.innerHTML = `
+      <div class="state saved-action-error-state" role="alert">
+        <span class="empty-symbol" aria-hidden="true">⌁</span>
+        <strong>${escapeHtml(savedActionErrorTitle)}</strong>
+        <small>${escapeHtml(savedActionError)}</small>
+        <div class="state-actions">
+          ${
+            canReviewSavedAction
+              ? '<button type="button" class="primary-action review-saved-action-error">Review Actions</button>'
+              : ""
+          }
+          ${
+            savedActionErrorOpenSettings
+              ? `<button
+                  type="button"
+                  class="secondary-action open-saved-action-error-settings"
+                  ${savedActionErrorOpeningSettings ? "disabled" : ""}
+                >${savedActionErrorOpeningSettings ? "Opening…" : "Open Settings"}</button>`
+              : ""
+          }
+          <button type="button" class="secondary-action dismiss-saved-action-error">Back to search</button>
+        </div>
       </div>
     `;
     return;
@@ -2250,49 +3332,70 @@ function render(): void {
     return;
   }
 
-  const icons = visibleIconEntries();
+  const paletteResults = visiblePaletteResults();
   if (selectedItemIdentity) {
-    const identityIndex = icons.findIndex(
-      ({ item }) => iconIdentity(item) === selectedItemIdentity,
+    const identityIndex = paletteResults.findIndex(
+      ({ id }) => id === selectedItemIdentity,
     );
     if (identityIndex >= 0) selectedIndex = identityIndex;
   }
-  selectedIndex = Math.max(0, Math.min(selectedIndex, icons.length - 1));
-  if (icons[selectedIndex]) {
-    selectedItemIdentity = iconIdentity(icons[selectedIndex].item);
+  selectedIndex = Math.max(
+    0,
+    Math.min(selectedIndex, paletteResults.length - 1),
+  );
+  if (paletteResults[selectedIndex]) {
+    selectedItemIdentity = paletteResults[selectedIndex].id;
   }
+  updatePaletteChrome();
 
-  if (!icons.length) {
+  if (!paletteResults.length) {
     results.innerHTML = `
       <div class="state">
         <span class="empty-symbol">⌕</span>
-        <strong>No matching menu-bar icons</strong>
+        <strong>No matching menu bar icons</strong>
       </div>
     `;
     return;
   }
 
-  results.innerHTML = icons
+  const itemPinErrorMarkup = itemPinError
+    ? `
+        <div class="action-pin-error" role="alert">
+          <span>${escapeHtml(itemPinError)}</span>
+          <button type="button" data-dismiss-item-pin-error aria-label="Dismiss pin error">×</button>
+        </div>
+      `
+    : "";
+  results.innerHTML = itemPinErrorMarkup + paletteResults
     .map(
       (entry, index) => {
-        const icon = entry.item;
-        const customization = customizationFor(icon);
-        const itemId = customizations?.displayKey === response?.displayKey
-          ? stableItemId(icon)
-          : null;
-        const context = getSecondaryContext(entry);
-        const directShortcut =
-          itemId && supportsDirectShortcut(itemId)
+        const icon = resultParent(entry);
+        const itemId = entry.kind === "item" ? entry.itemId : null;
+        const customization = entry.kind === "item"
+          ? customizationFor(icon)
+          : undefined;
+        const directShortcut = entry.kind === "action"
+          ? entry.savedAction.shortcut
+          : itemId && supportsDirectShortcut(itemId)
             ? customization?.shortcut
             : null;
-        const personalizationTail = itemId
-          ? `
-              ${entry.favorite ? '<span class="favorite-mark" title="Favorite">★</span>' : ""}
-              ${directShortcut ? `<span class="item-shortcut-mark">${shortcutMarkup(directShortcut)}</span>` : ""}
-            `
+        const personalizationTail = directShortcut
+          ? `<span class="item-shortcut-mark">${shortcutMarkup(directShortcut)}</span>`
           : "";
-        const customizeButton = itemId
+        const customizeButton = entry.kind === "action"
           ? `
+              <button
+                type="button"
+                class="customize-item customize-saved-action"
+                data-index="${index}"
+                data-customize-saved-action="${escapeHtml(entry.savedAction.id)}"
+                aria-label="Customize pinned action ${escapeHtml(entry.originalLabel)}"
+                aria-keyshortcuts="Meta+E"
+                title="Customize pinned action"
+              >•••</button>
+            `
+          : itemId
+            ? `
               <button
                 type="button"
                 class="customize-item"
@@ -2303,24 +3406,43 @@ function render(): void {
                 title="Customize ${escapeHtml(entry.originalLabel)}"
               >•••</button>
             `
-          : "";
-        const resultLabel = paletteResultLabel(icon.isMacnu, entry.displayLabel);
+            : "";
+        const resultLabel = entry.kind === "item"
+          ? paletteResultLabel(icon.isMacnu, entry.label)
+          : entry.label;
+        const context = icon.isMacnu ? null : entry.context;
+        const itemPinButton =
+          entry.kind === "item" && itemId && !icon.isMacnu
+            ? `
+              <button
+                type="button"
+                class="pin-action item-pin-action ${entry.favorite ? "pinned" : ""}"
+                data-pin-item="${escapeHtml(itemId)}"
+                data-index="${index}"
+                aria-pressed="${entry.favorite}"
+                aria-keyshortcuts="Meta+P"
+                aria-label="${entry.favorite ? "Unpin" : "Pin"} ${escapeHtml(resultLabel)}"
+                title="${entry.favorite ? "Unpin" : "Pin"} ${escapeHtml(resultLabel)} (⌘P)"
+                ${itemPinSavingId === itemId ? 'disabled aria-busy="true"' : ""}
+              >${bookmarkIconMarkup()}</button>
+            `
+            : "";
         return `
         <div
-          class="result-row ${index === selectedIndex ? "selected" : ""} ${itemId ? "" : "no-customization"}"
+          class="result-row ${entry.kind === "action" ? "saved-action-result-row" : ""} ${index === selectedIndex ? "selected" : ""} ${itemId || entry.kind === "action" ? "" : "no-customization"} ${itemPinButton ? "has-pin" : ""}"
           data-result-row
           data-index="${index}"
-          data-item-identity="${escapeHtml(iconIdentity(icon))}"
+          data-result-id="${escapeHtml(entry.id)}"
         >
           <button
             type="button"
-            class="result menu-result ${index === selectedIndex ? "selected" : ""}"
+            class="result menu-result ${personalizationTail ? "has-tail" : ""} ${entry.kind === "action" ? "saved-action-result" : ""} ${index === selectedIndex ? "selected" : ""}"
             data-index="${index}"
             tabindex="-1"
             aria-label="${escapeHtml(
               icon.isMacnu
                 ? "Macnu, open settings"
-                : `${entry.displayLabel}${context ? `, ${context}` : ""}${entry.favorite ? ", favorite" : ""}`,
+                : `${resultLabel}${entry.kind === "action" ? ", pinned action" : ""}${context ? `, ${context}` : ""}${entry.kind === "item" && entry.favorite ? ", pinned" : ""}`,
             )}"
           >
             <span class="icon-frame">
@@ -2328,16 +3450,18 @@ function render(): void {
             </span>
             <span class="result-copy">
               <strong>${escapeHtml(resultLabel)}</strong>
-              ${icon.isMacnu || !context ? "" : `<small>${escapeHtml(context)}</small>`}
+              ${!context ? "" : `<small>${escapeHtml(context)}</small>`}
             </span>
-            <span class="result-tail" aria-hidden="true">
-              ${personalizationTail}
-              <span class="open-hint">↵</span>
-            </span>
+            ${personalizationTail ? `<span class="result-tail" aria-hidden="true">${personalizationTail}</span>` : ""}
           </button>
+          ${itemPinButton}
           ${customizeButton}
         </div>
-        ${customizationEditorMarkup(entry)}
+        ${
+          entry.kind === "action"
+            ? savedActionEditorMarkup(entry)
+            : customizationEditorMarkup(entry)
+        }
       `;
       },
     )
@@ -2430,6 +3554,7 @@ function applyResponse(next: MenuResponse | null): void {
     }
     return;
   }
+  itemPinError = null;
   preserveSelectedIdentity();
   response = next;
   if (!next) {
@@ -2517,13 +3642,13 @@ async function openPalette(generation: number): Promise<void> {
   }
 }
 
-function updateSelection(next: number): void {
-  const itemCount = actionScope ? visibleActions().length : visibleIcons().length;
+function updateSelection(next: number, announce = false, scroll = true): void {
+  const itemCount = actionScope ? visibleActions().length : visiblePaletteResults().length;
   if (!itemCount) return;
   selectedIndex = (next + itemCount) % itemCount;
   if (!actionScope) {
-    const selected = visibleIconEntries()[selectedIndex];
-    selectedItemIdentity = selected ? iconIdentity(selected.item) : null;
+    const selected = visiblePaletteResults()[selectedIndex];
+    selectedItemIdentity = selected?.id ?? null;
   }
   const items = results.querySelectorAll<HTMLElement>(".result");
   items.forEach((item, index) => {
@@ -2535,10 +3660,19 @@ function updateSelection(next: number): void {
     );
   });
   const selectedItem = items[selectedIndex];
-  (selectedItem?.closest<HTMLElement>("[data-result-row]") ?? selectedItem)
-    ?.scrollIntoView({
-      block: "nearest",
-    });
+  if (scroll) {
+    (selectedItem?.closest<HTMLElement>("[data-result-row]") ?? selectedItem)
+      ?.scrollIntoView({
+        block: "nearest",
+      });
+  }
+  if (announce) {
+    const announcement = selectedItem?.getAttribute("aria-label")?.trim();
+    if (announcement) {
+      selectionAnnouncer.textContent = announcement;
+    }
+  }
+  updatePaletteChrome();
 }
 
 async function restorePaletteFocus(generation: number): Promise<void> {
@@ -2577,17 +3711,35 @@ function leaveActionScope(): void {
   actionResponse = null;
   actionLoading = false;
   actionRunError = null;
+  actionPinError = null;
+  pendingActionUnpinId = null;
   input.value = "";
-  const icons = visibleIcons();
+  const paletteResults = visiblePaletteResults();
+  const exactOriginIndex = selectedItemIdentity
+    ? paletteResults.findIndex(({ id }) => id === selectedItemIdentity)
+    : -1;
+  const parentItemIndex = previousScope
+    ? paletteResults.findIndex(
+        (entry) =>
+          entry.kind === "item" &&
+          actionCacheKey(entry.item) === actionCacheKey(previousScope),
+      )
+    : -1;
+  const parentResultIndex = previousScope
+    ? paletteResults.findIndex(
+        (entry) =>
+          actionCacheKey(resultParent(entry)) === actionCacheKey(previousScope),
+      )
+    : -1;
   selectedIndex = Math.max(
     0,
-    previousScope
-      ? icons.findIndex(
-          (icon) => actionCacheKey(icon) === actionCacheKey(previousScope),
-        )
-      : 0,
+    exactOriginIndex >= 0
+      ? exactOriginIndex
+      : parentItemIndex >= 0
+        ? parentItemIndex
+        : parentResultIndex,
   );
-  selectedItemIdentity = icons[selectedIndex] ? iconIdentity(icons[selectedIndex]) : null;
+  selectedItemIdentity = paletteResults[selectedIndex]?.id ?? null;
   render();
   window.setTimeout(() => input.focus(), 0);
 }
@@ -2603,7 +3755,10 @@ async function openActionScope(
 
   actionScope = icon;
   actionResponse = null;
+  itemPinError = null;
   actionRunError = null;
+  actionPinError = null;
+  pendingActionUnpinId = null;
   actionLoading = true;
   input.value = "";
   selectedIndex = 0;
@@ -2679,24 +3834,52 @@ async function activate(icon: MenuIcon): Promise<void> {
   }
 }
 
+async function activateSavedAction(savedAction: SavedActionView): Promise<void> {
+  savedActionError = null;
+  savedActionErrorTitle = "That pinned action isn’t available right now";
+  savedActionErrorTarget = null;
+  savedActionErrorOpenSettings = false;
+  savedActionErrorOpeningSettings = false;
+  await currentWindow.hide();
+  try {
+    await invoke("activate_saved_action", {
+      savedActionId: savedAction.id,
+    });
+  } catch (error) {
+    const description = describeSavedActionError(error, savedAction);
+    savedActionErrorTitle = description.title;
+    savedActionError = description.message;
+    savedActionErrorTarget = savedAction;
+    savedActionErrorOpenSettings = Boolean(description.openSettings);
+    render();
+    await restorePaletteFocus(blurDismissGeneration);
+  }
+}
+
 function activateSelected(): void {
   if (actionScope) {
     const action = visibleActions()[selectedIndex];
     if (action) void activateScopedAction(action);
     return;
   }
-  const icon = visibleIcons()[selectedIndex];
-  if (icon) void activate(icon);
+  const selected = selectedPaletteResult();
+  if (!selected) return;
+  if (selected.kind === "action") {
+    void activateSavedAction(selected.savedAction);
+  } else void activate(selected.item);
 }
 
 input.addEventListener("input", () => {
-  if (itemShortcutError) {
+  if (itemShortcutError || savedActionError) {
     input.value = "";
     return;
   }
   selectedIndex = 0;
   selectedItemIdentity = null;
   itemShortcutError = null;
+  savedActionError = null;
+  actionPinError = null;
+  pendingActionUnpinId = null;
   resetCustomizationState();
   render();
 });
@@ -2733,10 +3916,56 @@ window.addEventListener(
       });
       return;
     }
+    if (savedActionShortcutRecording && savedActionDraft) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (
+        savedActionDraft.session !== savedActionEditSession ||
+        response?.displayKey !== savedActionDraft.displayKey ||
+        !supportsDirectShortcut(
+          customizations?.savedActions[savedActionDraft.savedActionId]
+            ?.parentItemId ?? "",
+        )
+      ) {
+        resetCustomizationState();
+        render();
+        return;
+      }
+      if (event.key === "Escape") {
+        savedActionShortcutRecording = false;
+        savedActionMessage = "";
+      } else {
+        const shortcut = eventShortcut(event);
+        if (!shortcut) return;
+        savedActionDraft.shortcut = shortcut;
+        savedActionShortcutRecording = false;
+        savedActionMessage = "";
+      }
+      render();
+      window.setTimeout(() => {
+        results.querySelector<HTMLButtonElement>("[data-record-saved-action-shortcut]")?.focus();
+      });
+      return;
+    }
     if (event.key !== "Escape") return;
     event.preventDefault();
     event.stopPropagation();
-    if (customizationDraft) {
+    if (savedActionSaving || actionPinSaving) return;
+    if (savedActionRemoveArmed) {
+      savedActionRemoveArmed = false;
+      render();
+      window.setTimeout(() => {
+        results.querySelector<HTMLButtonElement>("[data-remove-saved-action]")?.focus();
+      });
+      return;
+    }
+    if (pendingActionUnpinId) {
+      pendingActionUnpinId = null;
+      render();
+      window.setTimeout(() => input.focus());
+      return;
+    }
+    if (customizationDraft || savedActionDraft) {
       closeCustomization();
       return;
     }
@@ -2747,25 +3976,47 @@ window.addEventListener(
 );
 
 input.addEventListener("keydown", (event) => {
-  if (itemShortcutError) {
+  if (itemShortcutError || savedActionError) {
     event.preventDefault();
     event.stopPropagation();
     const action = itemShortcutErrorKeyAction(event.key);
     if (action === "dismiss") {
-      dismissItemShortcutError();
+      if (itemShortcutError) dismissItemShortcutError();
+      else dismissSavedActionError();
     } else if (action === "focus-dismiss") {
-      results
-        .querySelector<HTMLButtonElement>(".dismiss-item-shortcut-error")
-        ?.focus();
+      const recoverySelector = itemShortcutError
+        ? ".dismiss-item-shortcut-error"
+        : ".saved-action-error-state button:not([disabled])";
+      results.querySelector<HTMLButtonElement>(recoverySelector)?.focus();
     }
     return;
   }
-  if (!actionScope && event.metaKey && event.key.toLocaleLowerCase() === "e") {
-    const icon = visibleIcons()[selectedIndex];
-    if (icon && stableItemId(icon)) {
+  if (isPinShortcut(event.key, event)) {
+    if (actionScope) {
+      const action = visibleActions()[selectedIndex];
+      if (!action) return;
       event.preventDefault();
       event.stopPropagation();
-      openCustomization(icon);
+      void toggleSavedAction(action);
+    } else {
+      const selected = selectedPaletteResult();
+      if (selected?.kind !== "item" || !selected.itemId || selected.item.isMacnu) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      void toggleItemPin(selected.item);
+    }
+  } else if (!actionScope && event.metaKey && event.key.toLocaleLowerCase() === "e") {
+    const selected = selectedPaletteResult();
+    if (selected?.kind === "action") {
+      event.preventDefault();
+      event.stopPropagation();
+      openSavedActionCustomization(selected.savedAction);
+    } else if (selected?.kind === "item" && selected.itemId) {
+      event.preventDefault();
+      event.stopPropagation();
+      openCustomization(selected.item);
     }
   } else if (event.key === "ArrowDown") {
     event.preventDefault();
@@ -2774,7 +4025,7 @@ input.addEventListener("keydown", (event) => {
     if (event.repeat && now - lastArrowNavigationAt < 90) return;
     lastArrowNavigationAt = now;
     pointerSelectionArmed = false;
-    updateSelection(selectedIndex + 1);
+    updateSelection(selectedIndex + 1, true);
   } else if (event.key === "ArrowUp") {
     event.preventDefault();
     event.stopPropagation();
@@ -2782,7 +4033,7 @@ input.addEventListener("keydown", (event) => {
     if (event.repeat && now - lastArrowNavigationAt < 90) return;
     lastArrowNavigationAt = now;
     pointerSelectionArmed = false;
-    updateSelection(selectedIndex - 1);
+    updateSelection(selectedIndex - 1, true);
   } else if (
     actionScope &&
     (event.key === "ArrowLeft" ||
@@ -2797,8 +4048,8 @@ input.addEventListener("keydown", (event) => {
   ) {
     event.preventDefault();
     event.stopPropagation();
-    const icon = visibleIcons()[selectedIndex];
-    if (icon && !actionLoading) void openActionScope(icon);
+    const selected = selectedPaletteResult();
+    if (selected && !actionLoading) void openActionScope(resultParent(selected));
   } else if (actionScope && event.key === "Tab") {
     // Keep keyboard focus in the search field while action results are open.
     event.preventDefault();
@@ -2820,10 +4071,16 @@ results.addEventListener("focusin", (event) => {
   const index = resultIndexFromTarget(event.target as HTMLElement);
   if (index === null) return;
   pointerSelectionArmed = false;
-  updateSelection(index);
+  const pinControl = (event.target as HTMLElement).closest("[data-pin-item]");
+  updateSelection(index, false, !pinControl);
 });
 
 results.addEventListener("mousemove", (event) => {
+  const position = { x: event.clientX, y: event.clientY };
+  const moved = pointerPositionChanged(lastPointerPosition, position);
+  lastPointerPosition = position;
+  // Scrolling or replacing rows can emit mousemove without physical movement.
+  if (!moved || itemPinSavingId) return;
   if (!pointerSelectionArmed) {
     pointerSelectionArmed = true;
     return;
@@ -2838,34 +4095,199 @@ results.addEventListener("input", (event) => {
     "[data-customization-alias]",
   );
   if (alias && customizationDraft) customizationDraft.alias = alias.value;
+  const savedAlias = (event.target as HTMLElement).closest<HTMLInputElement>(
+    "[data-saved-action-alias]",
+  );
+  if (savedAlias && savedActionDraft) savedActionDraft.alias = savedAlias.value;
 });
 
 results.addEventListener("change", (event) => {
+  const target = event.target as HTMLElement;
   const favorite = (event.target as HTMLElement).closest<HTMLInputElement>(
     "[data-customization-favorite]",
   );
   if (favorite && customizationDraft) customizationDraft.favorite = favorite.checked;
+  const visible = target.closest<HTMLInputElement>("[data-customization-visible]");
+  if (visible && customizationDraft) customizationDraft.hidden = !visible.checked;
 });
 
 results.addEventListener("submit", (event) => {
-  const form = (event.target as HTMLElement).closest<HTMLFormElement>(
+  const itemForm = (event.target as HTMLElement).closest<HTMLFormElement>(
     "[data-item-customization]",
   );
-  if (!form) return;
-  event.preventDefault();
-  const alias = form.querySelector<HTMLInputElement>("[data-customization-alias]");
-  const favorite = form.querySelector<HTMLInputElement>("[data-customization-favorite]");
-  if (customizationDraft) {
-    customizationDraft.alias = alias?.value ?? customizationDraft.alias;
-    customizationDraft.favorite = favorite?.checked ?? customizationDraft.favorite;
+  if (itemForm) {
+    event.preventDefault();
+    const alias = itemForm.querySelector<HTMLInputElement>("[data-customization-alias]");
+    const favorite = itemForm.querySelector<HTMLInputElement>("[data-customization-favorite]");
+    const visible = itemForm.querySelector<HTMLInputElement>("[data-customization-visible]");
+    if (customizationDraft) {
+      customizationDraft.alias = alias?.value ?? customizationDraft.alias;
+      customizationDraft.favorite = favorite?.checked ?? customizationDraft.favorite;
+      customizationDraft.hidden = !(visible?.checked ?? !customizationDraft.hidden);
+    }
+    void saveCustomization();
+    return;
   }
-  void saveCustomization();
+  const savedActionForm = (event.target as HTMLElement).closest<HTMLFormElement>(
+    "[data-saved-action-customization]",
+  );
+  if (!savedActionForm) return;
+  event.preventDefault();
+  const alias = savedActionForm.querySelector<HTMLInputElement>(
+    "[data-saved-action-alias]",
+  );
+  if (savedActionDraft) savedActionDraft.alias = alias?.value ?? savedActionDraft.alias;
+  void saveSavedActionCustomization();
 });
 
 results.addEventListener("click", (event) => {
   const target = event.target as HTMLElement;
   if (target.closest(".dismiss-item-shortcut-error")) {
     dismissItemShortcutError();
+    return;
+  }
+  if (target.closest(".review-saved-action-error")) {
+    event.preventDefault();
+    const failedAction = savedActionErrorTarget;
+    const parent = failedAction
+      ? response?.icons.find(
+          (icon) => stableItemId(icon) === failedAction.parentItemId,
+        )
+      : undefined;
+    savedActionError = null;
+    savedActionErrorTitle = "That pinned action isn’t available right now";
+    savedActionErrorTarget = null;
+    savedActionErrorOpenSettings = false;
+    savedActionErrorOpeningSettings = false;
+    if (parent) {
+      void openActionScope(parent, true);
+    } else {
+      render();
+      input.focus();
+    }
+    return;
+  }
+  if (target.closest(".open-saved-action-error-settings")) {
+    event.preventDefault();
+    if (savedActionErrorOpeningSettings) return;
+    savedActionErrorOpeningSettings = true;
+    render();
+    void invoke("open_settings")
+      .then(() => {
+        if (!savedActionError) return;
+        savedActionErrorOpeningSettings = false;
+        render();
+      })
+      .catch((error) => {
+        console.error("Could not open Settings from the pinned action error.", error);
+        if (!savedActionError) return;
+        savedActionErrorOpeningSettings = false;
+        savedActionError =
+          "Macnu couldn’t open Settings. Nothing was changed; please try again.";
+        render();
+        window.setTimeout(() => {
+          results
+            .querySelector<HTMLButtonElement>(
+              ".open-saved-action-error-settings",
+            )
+            ?.focus();
+        });
+      });
+    return;
+  }
+  if (target.closest(".dismiss-saved-action-error")) {
+    dismissSavedActionError();
+    return;
+  }
+  if (target.closest("[data-dismiss-item-pin-error]")) {
+    event.preventDefault();
+    itemPinError = null;
+    render();
+    input.focus();
+    return;
+  }
+  if (target.closest("[data-dismiss-action-pin-error]")) {
+    event.preventDefault();
+    actionPinError = null;
+    render();
+    input.focus();
+    return;
+  }
+  if (target.closest("[data-cancel-action-unpin]")) {
+    if (actionPinSaving) return;
+    event.preventDefault();
+    event.stopPropagation();
+    pendingActionUnpinId = null;
+    render();
+    window.setTimeout(() => input.focus());
+    return;
+  }
+  const confirmActionUnpin = target.closest<HTMLButtonElement>(
+    "[data-confirm-action-unpin]",
+  );
+  if (confirmActionUnpin && pendingActionUnpinId) {
+    if (actionPinSaving) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const savedActionId = pendingActionUnpinId;
+    const action = visibleActions().find(
+      (candidate) => savedActionFor(candidate)?.id === savedActionId,
+    );
+    if (action) {
+      confirmActionUnpin.disabled = true;
+      void toggleSavedAction(action);
+    } else {
+      pendingActionUnpinId = null;
+      render();
+      window.setTimeout(() => input.focus());
+    }
+    return;
+  }
+  const pinItem = target.closest<HTMLButtonElement>("[data-pin-item]");
+  if (pinItem && !actionScope) {
+    event.preventDefault();
+    event.stopPropagation();
+    lastPointerPosition = { x: event.clientX, y: event.clientY };
+    const index = Number(pinItem.dataset.index);
+    const itemId = pinItem.dataset.pinItem;
+    const selected = visiblePaletteResults()[index];
+    if (
+      selected?.kind === "item" &&
+      selected.itemId === itemId &&
+      !selected.item.isMacnu
+    ) {
+      updateSelection(index, false, false);
+      void toggleItemPin(selected.item);
+    }
+    return;
+  }
+  const pinAction = target.closest<HTMLButtonElement>("[data-pin-action]");
+  if (pinAction && actionScope) {
+    event.preventDefault();
+    event.stopPropagation();
+    const index = Number(pinAction.dataset.index);
+    const action = visibleActions()[index];
+    if (action) {
+      updateSelection(index);
+      void toggleSavedAction(action);
+    }
+    return;
+  }
+  const customizeSaved = target.closest<HTMLButtonElement>(
+    "[data-customize-saved-action]",
+  );
+  if (customizeSaved) {
+    event.preventDefault();
+    event.stopPropagation();
+    const savedActionId = customizeSaved.dataset.customizeSavedAction;
+    const savedAction = savedActionId
+      ? customizations?.savedActions[savedActionId]
+      : undefined;
+    const index = Number(customizeSaved.dataset.index);
+    if (savedAction) {
+      if (Number.isInteger(index)) updateSelection(index);
+      openSavedActionCustomization(savedAction);
+    }
     return;
   }
   const customize = target.closest<HTMLElement>("[data-customize-item]");
@@ -2878,6 +4300,12 @@ results.addEventListener("click", (event) => {
     return;
   }
   if (target.closest("[data-cancel-item-customization]")) {
+    event.preventDefault();
+    closeCustomization();
+    return;
+  }
+  if (target.closest("[data-cancel-saved-action-customization]")) {
+    if (savedActionSaving) return;
     event.preventDefault();
     closeCustomization();
     return;
@@ -2914,6 +4342,79 @@ results.addEventListener("click", (event) => {
     });
     return;
   }
+  if (target.closest("[data-record-saved-action-shortcut]")) {
+    event.preventDefault();
+    const current = savedActionDraft
+      ? customizations?.savedActions[savedActionDraft.savedActionId]
+      : undefined;
+    if (
+      !savedActionDraft ||
+      !current ||
+      !supportsDirectShortcut(current.parentItemId) ||
+      savedActionDraft.session !== savedActionEditSession ||
+      response?.displayKey !== savedActionDraft.displayKey
+    ) {
+      resetCustomizationState();
+      render();
+      return;
+    }
+    savedActionShortcutRecording = true;
+    savedActionMessage = "Use a modifier with another key.";
+    render();
+    window.setTimeout(() => {
+      results.querySelector<HTMLButtonElement>("[data-record-saved-action-shortcut]")?.focus();
+    });
+    return;
+  }
+  if (target.closest("[data-clear-saved-action-shortcut]")) {
+    event.preventDefault();
+    if (savedActionDraft) savedActionDraft.shortcut = "";
+    savedActionShortcutRecording = false;
+    savedActionMessage = "";
+    render();
+    window.setTimeout(() => {
+      results.querySelector<HTMLButtonElement>("[data-record-saved-action-shortcut]")?.focus();
+    });
+    return;
+  }
+  if (target.closest("[data-cancel-saved-action-removal]")) {
+    if (savedActionSaving) return;
+    event.preventDefault();
+    savedActionRemoveArmed = false;
+    render();
+    window.setTimeout(() => {
+      results.querySelector<HTMLButtonElement>("[data-remove-saved-action]")?.focus();
+    });
+    return;
+  }
+  const confirmSavedActionRemoval = target.closest<HTMLButtonElement>(
+    "[data-confirm-saved-action-removal]",
+  );
+  if (confirmSavedActionRemoval) {
+    if (savedActionSaving) return;
+    event.preventDefault();
+    if (savedActionDraft) {
+      confirmSavedActionRemoval.disabled = true;
+      void removeSavedAction(savedActionDraft.savedActionId);
+    }
+    return;
+  }
+  if (target.closest("[data-remove-saved-action]")) {
+    event.preventDefault();
+    if (!savedActionDraft) return;
+    const current = customizations?.savedActions[savedActionDraft.savedActionId];
+    if (current?.shortcut) {
+      savedActionRemoveArmed = true;
+      savedActionMessage = "";
+      render();
+      window.setTimeout(() => {
+        results.querySelector<HTMLButtonElement>("[data-cancel-saved-action-removal]")?.focus();
+      });
+    } else {
+      void removeSavedAction(savedActionDraft.savedActionId);
+    }
+    return;
+  }
   const item = target.closest<HTMLButtonElement>(".result");
   if (item) {
     const index = Number(item.dataset.index);
@@ -2921,8 +4422,12 @@ results.addEventListener("click", (event) => {
       const action = visibleActions()[index];
       if (action) void activateScopedAction(action);
     } else {
-      const icon = visibleIcons()[index];
-      if (icon) void activate(icon);
+      const selected = visiblePaletteResults()[index];
+      if (selected?.kind === "action") {
+        void activateSavedAction(selected.savedAction);
+      } else if (selected?.kind === "item") {
+        void activate(selected.item);
+      }
     }
     return;
   }
@@ -2961,11 +4466,19 @@ void currentWindow.listen("palette-opened", () => {
   actionResponse = null;
   actionLoading = false;
   actionRunError = null;
+  itemPinError = null;
+  actionPinError = null;
+  pendingActionUnpinId = null;
   input.value = "";
   selectedIndex = 0;
   selectedItemIdentity = null;
   resetCustomizationState();
   itemShortcutError = null;
+  savedActionError = null;
+  savedActionErrorTitle = "That pinned action isn’t available right now";
+  savedActionErrorTarget = null;
+  savedActionErrorOpenSettings = false;
+  savedActionErrorOpeningSettings = false;
   rankingNow = Date.now();
   pointerSelectionArmed = false;
   lastArrowNavigationAt = 0;
@@ -2977,6 +4490,7 @@ void currentWindow.listen("palette-opened", () => {
 });
 
 void currentWindow.listen<MenuResponse>("menu-cache-updated", ({ payload }) => {
+  if (actionScope || itemShortcutError || savedActionError) return;
   applyResponse(payload);
 });
 
@@ -3042,6 +4556,43 @@ void currentWindow.listen<string>("item-shortcut-error", ({ payload }) => {
     })
     .catch((error) => {
       console.error("Could not show the direct shortcut error.", error);
+    });
+});
+
+void currentWindow.listen<string>("saved-action-shortcut-error", ({ payload }) => {
+  console.error("A pinned action shortcut could not be completed.", payload);
+  applyAppearance();
+  const generation = ++blurDismissGeneration;
+  blurDismissArmed = false;
+  pendingBlur = false;
+  actionScope = null;
+  actionResponse = null;
+  actionLoading = false;
+  actionRunError = null;
+  actionPinError = null;
+  pendingActionUnpinId = null;
+  input.value = "";
+  selectedIndex = 0;
+  selectedItemIdentity = null;
+  resetCustomizationState();
+  itemShortcutError = null;
+  const description = describeSavedActionError(payload);
+  savedActionErrorTitle = description.title;
+  savedActionError = description.message;
+  savedActionErrorTarget = null;
+  savedActionErrorOpenSettings = Boolean(description.openSettings);
+  savedActionErrorOpeningSettings = false;
+  activeDisplayId = null;
+  response = null;
+  customizationRequest += 1;
+  customizations = null;
+  pointerSelectionArmed = false;
+  lastArrowNavigationAt = 0;
+  render();
+  void restorePaletteFocus(generation)
+    .then(() => armBlurDismissAfterDelay(generation))
+    .catch((error) => {
+      console.error("Could not show the pinned action shortcut error.", error);
     });
 });
 
