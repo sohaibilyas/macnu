@@ -2450,7 +2450,7 @@ async function toggleItemPin(icon: MenuIcon): Promise<void> {
     const nextIndex = visiblePaletteResults().findIndex(
       (entry) => entry.kind === "item" && entry.itemId === itemId,
     );
-    if (nextIndex >= 0) updateSelection(nextIndex, false, false);
+    if (nextIndex >= 0) updateSelection(nextIndex);
   } catch (error) {
     if (response?.displayKey !== displayKey) return;
     itemPinError = nextPinned
