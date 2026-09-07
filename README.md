@@ -104,8 +104,16 @@ command changed, the match is ambiguous, or the command is disabled.
 
 Macnu processes the menu bar catalog and captured artwork on your Mac. The
 official app contacts the licensing service when you activate a license and
-periodically validates it. It checks GitHub for updates automatically and when
-you request a manual check.
+periodically validates it. With automatic update checks enabled, it checks
+GitHub about 30 seconds after launch and every six hours after a successful
+check, even with Settings closed. After sleep, it checks within 30 seconds if
+overdue. Failed checks retry after 5 minutes, then 15 minutes, then hourly.
+
+Turn automatic checks off in Settings → Updates if you prefer manual checks.
+An available update adds a dot to Settings in the search palette. Click it to
+review the update, then choose **Download and Restart** to install it. Macnu
+does not download or install updates without that action. Source builds do not
+contact the official update feed.
 
 Aliases, pins, hidden-search state, pinned actions, direct shortcuts, and Smart
 ordering history stay in Macnu's local app data. Pinned actions contain

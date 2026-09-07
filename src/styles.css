@@ -1043,6 +1043,22 @@ footer kbd {
   font-size: 10.5px;
 }
 
+.settings-button.update-available::after,
+.settings-nav.update-available::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--accent-text);
+  flex-shrink: 0;
+}
+
+.automatic-update-setting { margin-bottom: 12px; }
+.automatic-update-status { color: var(--danger, #df8585); font-size: 12px; }
+.automatic-update-status:empty { display: none; }
+
 .settings-button + .refresh {
   margin-left: 0;
 }

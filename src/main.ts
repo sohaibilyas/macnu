@@ -215,6 +215,15 @@ type UpdateCheck = {
   notes: string | null;
 };
 
+type UpdateStatus = {
+  supported: boolean;
+  automaticChecks: boolean;
+  checking: boolean;
+  checkedAt: number | null;
+  result: UpdateCheck | null;
+  revision: number;
+};
+
 type UpdateInstallEvent =
   | { event: "started"; contentLength: number | null }
   | { event: "progress"; chunkLength: number; downloaded: number }
@@ -588,8 +597,21 @@ async function initSettings(): Promise<void> {
             >
               <div class="settings-copy">
                 <h1>Updates</h1>
-                <p>Macnu checks quietly and installs only signed official releases.</p>
+                <p>Check for signed official releases. You choose when to download and restart.</p>
               </div>
+              <section class="settings-group automatic-update-setting">
+                <div class="setting-row compact-setting-row">
+                  <div class="setting-label">
+                    <strong>Automatically check for updates</strong>
+                    <small>After launch and every six hours, even with Settings closed.</small>
+                  </div>
+                  <label class="switch">
+                    <input data-automatic-updates type="checkbox" aria-label="Automatically check for updates" disabled />
+                    <span></span>
+                  </label>
+                </div>
+              </section>
+              <p class="automatic-update-status" data-automatic-update-status role="status"></p>
               <article class="update-card" data-update-card>
                 <span class="update-state-mark" aria-hidden="true">
                   <span class="update-state-glyph" data-update-mark>↻</span>
@@ -786,7 +808,10 @@ async function initSettings(): Promise<void> {
     app.querySelector<HTMLButtonElement>("[data-restore-all-hidden]")!;
   let appVersion = "";
   let pendingUpdateVersion: string | null = null;
-  let automaticUpdateCheckStarted = false;
+  let updateSnapshot: UpdateStatus | null = null;
+  let savingAutomaticChecks = false;
+  const automaticChecksToggle = app.querySelector<HTMLInputElement>("[data-automatic-updates]")!;
+  const automaticChecksStatus = app.querySelector<HTMLElement>("[data-automatic-update-status]")!;
   let updateBusy = false;
   let updateContentLength: number | null = null;
   let settings: SettingsResponse | null = null;
@@ -838,8 +863,8 @@ async function initSettings(): Promise<void> {
 
   function setUpdateBusy(busy: boolean): void {
     updateBusy = busy;
-    updateCheckButton.disabled = busy;
-    updateInstallButton.disabled = busy;
+    updateCheckButton.disabled = busy || updateSnapshot?.checking === true;
+    updateInstallButton.disabled = busy || updateSnapshot?.checking === true;
     updateCard.setAttribute("aria-busy", String(busy));
   }
 
@@ -847,6 +872,65 @@ async function initSettings(): Promise<void> {
     updateStatus.classList.toggle("error", error);
     updateStatus.textContent = text;
   }
+
+  function applyUpdateStatus(next: UpdateStatus): void {
+    if (updateSnapshot && next.revision < updateSnapshot.revision) next = updateSnapshot;
+    updateSnapshot = next;
+    if (!savingAutomaticChecks) automaticChecksToggle.checked = next.automaticChecks;
+    automaticChecksToggle.disabled = savingAutomaticChecks || !next.supported;
+    updatesNav.classList.toggle("update-available", next.result?.available === true);
+    updatesNav.title = next.result?.available ? "An update is available" : "";
+    if (updateBusy) return;
+    if (next.result) applyUpdateCheck(next.result);
+    updateCheckButton.disabled = next.checking || !next.supported;
+    updateInstallButton.disabled = next.checking;
+    updateCard.setAttribute("aria-busy", String(next.checking));
+    updateCard.classList.toggle("checking", next.checking);
+    if (next.checking) {
+      updateMark.textContent = "↻";
+      if (!next.result) updateTitle.textContent = "Checking for updates…";
+    } else if (!next.result) {
+      updateTitle.textContent = "Ready to check";
+      updateMark.textContent = "↻";
+    }
+    if (next.checkedAt !== null && !next.checking && next.result) {
+      setUpdateStatus("Last checked " + new Date(next.checkedAt * 1000).toLocaleString() + ".");
+    }
+  }
+
+  async function refreshUpdateStatus(): Promise<void> {
+    try {
+      applyUpdateStatus(await invoke<UpdateStatus>("get_update_status"));
+    } catch (error) {
+      console.error("Could not read update status.", error);
+    }
+  }
+
+  automaticChecksToggle.addEventListener("change", () => {
+    const enabled = automaticChecksToggle.checked;
+    savingAutomaticChecks = true;
+    automaticChecksToggle.disabled = true;
+    automaticChecksStatus.textContent = "";
+    void invoke<UpdateStatus>("set_automatic_update_checks", { enabled })
+      .then((next) => {
+        savingAutomaticChecks = false;
+        applyUpdateStatus(next);
+      })
+      .catch((error) => {
+        savingAutomaticChecks = false;
+        automaticChecksToggle.checked = updateSnapshot?.automaticChecks ?? true;
+        automaticChecksToggle.disabled = false;
+        automaticChecksStatus.textContent = String(error);
+      });
+  });
+
+  void currentWindow.listen<UpdateStatus>("update-status-changed", ({ payload }) => {
+    applyUpdateStatus(payload);
+  });
+  void currentWindow.listen("show-updates", () => {
+    showSettingsView("updates");
+    void refreshUpdateStatus();
+  });
 
   function formatBytes(bytes: number): string {
     if (bytes < 1_024) return `${bytes} B`;
@@ -902,7 +986,7 @@ async function initSettings(): Promise<void> {
   }
 
   async function checkForUpdates(manual = false): Promise<void> {
-    if (updateBusy) return;
+    if (updateBusy || updateSnapshot?.checking) return;
     setUpdateBusy(true);
     pendingUpdateVersion = null;
     updateInstallButton.hidden = true;
@@ -1179,6 +1263,7 @@ async function initSettings(): Promise<void> {
     if (view === "personalization") {
       void refreshPersonalizationManagers();
     }
+    if (view === "updates") void refreshUpdateStatus();
   }
 
   function syncVisibleSurface(): void {
@@ -1229,12 +1314,6 @@ async function initSettings(): Promise<void> {
     updatesNav.hidden = !next.licenseRequired;
     if (!next.licenseRequired && updatesNav.classList.contains("selected")) {
       showSettingsView("general");
-    }
-    if (next.licenseRequired && !automaticUpdateCheckStarted) {
-      automaticUpdateCheckStarted = true;
-      window.setTimeout(() => {
-        void checkForUpdates();
-      }, 900);
     }
 
     app.querySelector<HTMLElement>("[data-license-plan]")!.textContent = readablePlan(next.plan);
@@ -2015,6 +2094,7 @@ async function initSettings(): Promise<void> {
     licenseInput.value = "";
     licenseGateError.textContent = "";
     void refreshAppState();
+    void refreshUpdateStatus();
   });
   void currentWindow.listen<LicenseStatus>("license-status-changed", ({ payload }) => {
     applyLicenseStatus(payload);
@@ -2050,6 +2130,7 @@ async function initSettings(): Promise<void> {
   });
   updateAppearanceControls();
   await refreshAppState();
+  await refreshUpdateStatus();
 }
 
 if (currentWindow.label === "settings") {
@@ -4610,10 +4691,21 @@ refresh.addEventListener("click", () => void refreshIcons(true, true));
 searchLeading.addEventListener("click", () => {
   if (actionScope) leaveActionScope();
 });
-app.querySelector<HTMLButtonElement>(".settings-button")!.addEventListener(
-  "click",
-  () => void invoke("open_settings"),
-);
+const paletteSettingsButton = app.querySelector<HTMLButtonElement>(".settings-button")!;
+let paletteUpdateRevision = -1;
+function applyPaletteUpdateStatus(next: UpdateStatus): void {
+  if (next.revision < paletteUpdateRevision) return;
+  paletteUpdateRevision = next.revision;
+  const available = next.supported && next.result?.available === true;
+  paletteSettingsButton.classList.toggle("update-available", available);
+  paletteSettingsButton.title = available ? "An update is available" : "Settings";
+  paletteSettingsButton.setAttribute("aria-label", available ? "Settings, update available" : "Settings");
+}
+void currentWindow.listen<UpdateStatus>("update-status-changed", ({ payload }) => applyPaletteUpdateStatus(payload));
+void invoke<UpdateStatus>("get_update_status").then(applyPaletteUpdateStatus).catch(() => {});
+paletteSettingsButton.addEventListener("click", () => {
+  void invoke(paletteSettingsButton.classList.contains("update-available") ? "open_update_settings" : "open_settings");
+});
 
 void currentWindow.listen("palette-opened", () => {
   applyAppearance();

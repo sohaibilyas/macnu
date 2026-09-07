@@ -14,7 +14,7 @@ await page.route(/\/@tauri-apps_api_(core|window|app)\.js/, async (route) => {
   const name = route.request().url().match(/api_(core|window|app)\.js/)[1];
   const body = name === "core"
     ? 'export const invoke=(cmd,args)=>window.testInvoke(cmd,args); export class Channel {}'
-    : name === "app" ? 'export const getVersion=async()=>"0.5.0";'
+    : name === "app" ? 'export const getVersion=async()=>"0.5.2";'
     : `export const getCurrentWindow=()=>({
       label:new URL(location.href).searchParams.get("window") || "main", listen:async(name,fn)=>{window.testEvents[name]=(...args)=>{if(name==="palette-opened")window.testHidden=false;return fn(...args);};return ()=>{};},
       onCloseRequested:async()=>()=>{},
@@ -30,6 +30,7 @@ await page.addInitScript(() => {
   window.testEvents = {};
   window.testCalls = [];
   window.testHidden = false;
+  window.testUpdateStatus = { supported: false, automaticChecks: false, checking: false, checkedAt: null, result: null, revision: 0 };
   const displayKey = "v1.display-uuid.dGVzdA";
   const image = "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect x="2" y="2" width="60" height="60" rx="15" fill="#5264bd"/><circle cx="32" cy="32" r="15" fill="#cad4ff"/></svg>');
   const icon = (name, i) => ({
@@ -56,6 +57,20 @@ await page.addInitScript(() => {
     window.testCalls.push({ command, args });
     if (command === "get_settings") return { shortcut: "Command+Semicolon", rankingMode: "menuBar", personalizePerDisplay: true, startAtLoginStatus: 0, onboardingCompleted: true, accessibilityGranted: true, screenCaptureGranted: false };
     if (command === "get_license_status") return { state: "development", licenseRequired: false, canUseApp: true, plan: null, offlineGrace: false, validationDue: false, lastValidatedAt: null, graceEndsAt: null, message: null };
+    if (command === "get_update_status") return structuredClone(window.testUpdateStatus);
+    if (command === "set_automatic_update_checks") {
+      if (window.testToggleFails) throw Error("Could not save the setting.");
+      window.testUpdateStatus.automaticChecks = args.enabled;
+      window.testUpdateStatus.revision++;
+      const saved = structuredClone(window.testUpdateStatus);
+      if (window.testToggleRace) {
+        window.testUpdateStatus.revision++;
+        window.testEvents["update-status-changed"]({ payload: structuredClone(window.testUpdateStatus) });
+      }
+      return saved;
+    }
+    if (command === "check_for_updates") return structuredClone(window.testUpdateStatus.result);
+    if (command === "open_update_settings") return;
     if (command === "palette_test_mode") return true;
     if (command === "active_display_menu_icons") return { response: window.testResponse, stale: false, displayId: 1 };
     if (command === "list_menu_icons") return structuredClone(window.testResponse);
@@ -293,6 +308,18 @@ try {
   await page.waitForTimeout(750);
   assert.equal(await page.evaluate(() => window.testSwitchScans), 1, "Persistent AX uncertainty must not trigger a scan loop");
   assert.equal(await search.inputValue(), "Tailscale");
+  // A background result adds a quiet indicator; it never downloads anything.
+  await page.evaluate(() => {
+    window.testUpdateStatus = { supported: true, automaticChecks: true, checking: false,
+      checkedAt: 1700000000, revision: 5,
+      result: { supported: true, available: true, currentVersion: "0.5.2", version: "0.5.3", notes: "Example update" } };
+    window.testEvents["update-status-changed"]({ payload: structuredClone(window.testUpdateStatus) });
+    window.testEvents["update-status-changed"]({ payload: { ...window.testUpdateStatus, revision: 4, result: null } });
+  });
+  assert.equal(await page.locator(".settings-button").getAttribute("aria-label"), "Settings, update available");
+  await page.locator(".settings-button").click();
+  assert.equal(await page.evaluate(() => window.testCalls.at(-1).command), "open_update_settings");
+  assert.equal(await page.evaluate(() => window.testCalls.filter(x => x.command === "install_update").length), 0);
   await page.setViewportSize({ width: 650, height: 450 });
   await page.goto((process.env.MACNU_UI_URL || "http://127.0.0.1:5173/") + "?window=settings");
   await page.locator('[data-layout="list"]').click();
@@ -303,6 +330,64 @@ try {
   await page.locator('[data-layout="grid"]').click();
   assert.equal(await page.locator('[data-layout="grid"]').getAttribute("aria-pressed"), "true");
   await page.screenshot({ path: "/tmp/macnu-v0.5-settings.png" });
+  // Test official-update controls with mocked responses only. Source builds
+  // remain unsupported and no real release server or installer is contacted.
+  await page.evaluate(() => {
+    window.testEvents["license-status-changed"]({ payload: {
+      state: "active", licenseRequired: true, canUseApp: true, plan: "personal",
+      offlineGrace: false, validationDue: false, lastValidatedAt: null, graceEndsAt: null, message: null,
+    } });
+    window.testUpdateStatus = { supported: true, automaticChecks: true, checking: false,
+      checkedAt: 1700000000, revision: 1, result: {
+        supported: true, available: false, currentVersion: "0.5.2", version: null, notes: null,
+      } };
+    window.testEvents["update-status-changed"]({ payload: structuredClone(window.testUpdateStatus) });
+    window.testEvents["show-updates"]({});
+  });
+  await page.locator("#updates-panel:not([hidden])").waitFor();
+  const automatic = page.locator("[data-automatic-updates]");
+  await page.waitForFunction(() => document.querySelector("[data-automatic-updates]").checked);
+  assert.match(await page.locator("[data-update-status]").textContent(), /Last checked/);
+  await automatic.uncheck();
+  await page.waitForFunction(() => !window.testUpdateStatus.automaticChecks);
+  assert.equal(await automatic.isChecked(), false);
+  await page.locator("[data-check-updates]").click();
+  await page.waitForFunction(() => window.testCalls.some(x => x.command === "check_for_updates"));
+  assert.equal(await automatic.isChecked(), false, "Manual check must not re-enable automatic checks");
+  await page.evaluate(() => { window.testToggleFails = true; });
+  await automatic.click();
+  await page.waitForFunction(() => !!document.querySelector("[data-automatic-update-status]").textContent);
+  assert.equal(await automatic.isChecked(), false, "Failed persistence must restore the previous toggle");
+  await page.evaluate(() => {
+    window.testToggleFails = false;
+    window.testUpdateStatus = { ...window.testUpdateStatus, checking: true, revision: 4 };
+    window.testEvents["update-status-changed"]({ payload: structuredClone(window.testUpdateStatus) });
+  });
+  assert.equal(await page.locator("[data-check-updates]").isDisabled(), true);
+  await page.evaluate(() => {
+    window.testUpdateStatus = { ...window.testUpdateStatus, checking: false, revision: 5,
+      result: { supported: true, available: true, currentVersion: "0.5.2", version: "0.5.3", notes: "<script>bad()</script>Example release" } };
+    window.testEvents["update-status-changed"]({ payload: structuredClone(window.testUpdateStatus) });
+  });
+  await page.locator("[data-install-update]:not([hidden])").waitFor();
+  assert.equal(await page.locator("[data-update-title]").textContent(), "Macnu 0.5.3 is available");
+  assert.equal(await page.locator("[data-update-notes] script").count(), 0);
+  assert.equal(await page.evaluate(() => window.testCalls.filter(x => x.command === "install_update").length), 0);
+  assert.equal(await page.locator("[data-settings-view='updates']").evaluate(el => el.classList.contains("update-available")), true);
+  await page.evaluate(() => { window.testToggleRace = true; });
+  await automatic.check();
+  await page.waitForFunction(() => window.testUpdateStatus.automaticChecks);
+  assert.equal(await automatic.isEnabled(), true, "A newer event during save must not leave the toggle disabled");
+  assert.equal(await page.locator("[data-automatic-update-status]").textContent(), "");
+  await page.evaluate(() => {
+    window.testUpdateStatus.result.notes = "Example release notes for this interface test.";
+    window.testUpdateStatus.revision++;
+    window.testEvents["update-status-changed"]({ payload: structuredClone(window.testUpdateStatus) });
+  });
+  await page.screenshot({ path: "/tmp/macnu-v0.5.2-updates.png", scale: "css" });
+  await page.locator("[data-install-update]").scrollIntoViewIfNeeded();
+  assert.equal(await page.locator("[data-install-update]").isEnabled(), true);
+  await page.screenshot({ path: "/tmp/macnu-v0.5.2-update-actions.png", scale: "css" });
   assert.deepEqual(errors, []);
-  console.log("Browser checks passed: grid/list, navigation, status, Macnu title, Actions, pin identity, unavailable app, reopen-to-menu, provisional monitor cache and focus settling.");
+  console.log("Browser checks passed: grid/list, navigation, status, Macnu title, Actions, pin identity, unavailable app, reopen-to-menu, provisional monitor cache, focus settling, automatic-update controls, manual-only installation, and update indicators.");
 } finally { await browser.close(); }

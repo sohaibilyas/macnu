@@ -22,6 +22,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 mod app_updater;
 #[cfg(feature = "official-distribution")]
 mod update_policy;
+#[cfg(any(feature = "official-distribution", test))]
+mod update_schedule;
 
 #[cfg(not(any(feature = "source-build", feature = "official-distribution")))]
 compile_error!("Choose exactly one Macnu build mode: `source-build` or `official-distribution`.");
@@ -654,6 +656,8 @@ struct Preferences {
     #[serde(default = "preferences_state_version")]
     version: u8,
     shortcut: String,
+    #[serde(default = "default_true")]
+    automatic_update_checks: bool,
     #[serde(default)]
     onboarding_completed: bool,
     #[serde(default)]
@@ -667,6 +671,7 @@ impl Default for Preferences {
         Self {
             version: PREFERENCES_STATE_VERSION,
             shortcut: DEFAULT_SHORTCUT.to_string(),
+            automatic_update_checks: true,
             onboarding_completed: false,
             ranking_mode: RankingMode::Smart,
             personalize_per_display: true,
@@ -2232,6 +2237,12 @@ fn stored_version_is_supported(value: &serde_json::Value, current: u8) -> bool {
 
 fn salvage_preferences(value: &serde_json::Value) -> Preferences {
     let mut preferences = Preferences::default();
+    if let Some(enabled) = value
+        .get("automaticUpdateChecks")
+        .and_then(serde_json::Value::as_bool)
+    {
+        preferences.automatic_update_checks = enabled;
+    }
     if let Some(shortcut) = value.get("shortcut").and_then(serde_json::Value::as_str) {
         if let Ok((shortcut, _)) = normalized_global_shortcut(shortcut) {
             preferences.shortcut = shortcut;
@@ -3153,6 +3164,40 @@ fn current_settings(state: &PreferencesState) -> Result<SettingsResponse, String
 #[tauri::command]
 fn get_settings(state: State<'_, PreferencesState>) -> Result<SettingsResponse, String> {
     current_settings(state.inner())
+}
+
+#[tauri::command]
+fn set_automatic_update_checks(
+    app: AppHandle,
+    window: WebviewWindow,
+    enabled: bool,
+    state: State<'_, PreferencesState>,
+) -> Result<app_updater::UpdateStatus, String> {
+    if window.label() != "settings" {
+        return Err("Update preferences can only be changed in Settings.".to_string());
+    }
+    #[cfg(feature = "source-build")]
+    {
+        let _ = (enabled, state);
+        app_updater::get_update_status(app, window)
+    }
+    #[cfg(feature = "official-distribution")]
+    {
+        let _guard = state
+            .write_lock
+            .lock()
+            .map_err(|_| "The settings writer is unavailable.")?;
+        let mut preferences = state
+            .preferences
+            .lock()
+            .map_err(|_| "The settings are unavailable.")?;
+        let mut updated = preferences.clone();
+        updated.automatic_update_checks = enabled;
+        persist_preferences(state.inner(), &updated)?;
+        *preferences = updated;
+        app_updater::configure_automatic_checks(&app, enabled)?;
+        app_updater::get_update_status(app, window)
+    }
 }
 
 #[tauri::command]
@@ -4701,6 +4746,13 @@ fn close_settings(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_update_settings(app: AppHandle) -> Result<(), String> {
+    open_settings(app.clone())?;
+    let _ = app.emit_to("settings", "show-updates", ());
+    Ok(())
+}
+
+#[tauri::command]
 fn open_settings(app: AppHandle) -> Result<(), String> {
     if let Some(palette) = app.get_webview_window("main") {
         let _ = palette.hide();
@@ -5029,6 +5081,9 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            #[cfg(feature = "official-distribution")]
+            app_updater::start_background_checks(app.handle().clone())?;
+
             let launch_arguments: Vec<String> = std::env::args().collect();
             if launch_arguments
                 .iter()
@@ -5069,6 +5124,9 @@ pub fn run() {
             app_updater::check_for_updates,
             app_updater::install_update,
             get_settings,
+            app_updater::get_update_status,
+            open_update_settings,
+            set_automatic_update_checks,
             get_catalog_customizations,
             reopen_pinned_app,
             set_item_customization,
@@ -5406,6 +5464,22 @@ mod tests {
             name: name.to_string(),
             created_at: "2026-08-22T00:00:00.000000Z".to_string(),
         }
+    }
+
+    #[test]
+    fn automatic_update_preference_defaults_on_and_preserves_opt_out() {
+        let legacy = decode_preferences(r#"{"shortcut":"Command+Semicolon"}"#);
+        assert!(legacy.value.automatic_update_checks);
+        let mut preferences = Preferences::default();
+        preferences.automatic_update_checks = false;
+        let decoded = decode_preferences(&serde_json::to_string(&preferences).unwrap());
+        assert!(!decoded.value.automatic_update_checks);
+        let future = serde_json::json!({
+            "version": 255, "shortcut": "Command+Semicolon", "automaticUpdateChecks": false
+        });
+        let decoded = decode_preferences(&serde_json::to_string(&future).unwrap());
+        assert!(decoded.write_protected);
+        assert!(!decoded.value.automatic_update_checks);
     }
 
     #[test]

@@ -18,6 +18,47 @@ pub(crate) struct UpdateCheck {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateStatus {
+    supported: bool,
+    automatic_checks: bool,
+    checking: bool,
+    checked_at: Option<u64>,
+    result: Option<UpdateCheck>,
+    revision: u64,
+}
+
+#[tauri::command]
+pub(crate) fn get_update_status(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> Result<UpdateStatus, String> {
+    if !matches!(window.label(), "settings" | "main") {
+        return Err("Update status is only available in Macnu windows.".to_string());
+    }
+    #[cfg(feature = "official-distribution")]
+    {
+        use tauri::Manager;
+        app.state::<official::UpdateOperationState>().snapshot()
+    }
+    #[cfg(feature = "source-build")]
+    {
+        let _ = app;
+        Ok(UpdateStatus {
+            supported: false,
+            automatic_checks: false,
+            checking: false,
+            checked_at: None,
+            result: None,
+            revision: 0,
+        })
+    }
+}
+
+#[cfg(feature = "official-distribution")]
+pub(crate) use official::{configure_automatic_checks, start_background_checks};
+
+#[derive(Debug, Clone, Serialize)]
 #[cfg(feature = "official-distribution")]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub(crate) enum UpdateInstallEvent {
@@ -54,10 +95,13 @@ mod official {
         ffi::OsStr,
         io::Read,
         path::Path,
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex,
+        },
         time::Duration,
     };
-    use tauri::{ipc::Channel, AppHandle, State, WebviewWindow};
+    use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State, WebviewWindow};
     use tauri_plugin_updater::{Update, UpdaterExt};
 
     const RELEASE_HOST: &str = "github.com";
@@ -68,9 +112,140 @@ mod official {
     const UPDATE_DOWNLOAD_CHUNK_SIZE: usize = 64 * 1024;
     const UPDATE_INITIAL_CAPACITY_LIMIT: usize = 8 * 1024 * 1024;
     const UPDATE_REDIRECT_LIMIT: usize = 5;
-    #[derive(Default)]
     pub(crate) struct UpdateOperationState {
         busy: AtomicBool,
+        runtime: Mutex<UpdateRuntime>,
+    }
+
+    struct UpdateRuntime {
+        schedule: crate::update_schedule::UpdateSchedule,
+        result: Option<UpdateCheck>,
+        checked_at: Option<u64>,
+        checking: bool,
+        revision: u64,
+    }
+
+    impl Default for UpdateOperationState {
+        fn default() -> Self {
+            Self {
+                busy: AtomicBool::new(false),
+                runtime: Mutex::new(UpdateRuntime {
+                    schedule: crate::update_schedule::UpdateSchedule::new(now(), false),
+                    result: None,
+                    checked_at: None,
+                    checking: false,
+                    revision: 0,
+                }),
+            }
+        }
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    impl UpdateOperationState {
+        pub(crate) fn snapshot(&self) -> Result<super::UpdateStatus, String> {
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| "The update status is unavailable.")?;
+            Ok(super::UpdateStatus {
+                supported: true,
+                automatic_checks: runtime.schedule.enabled,
+                checking: runtime.checking,
+                checked_at: runtime.checked_at,
+                result: runtime.result.clone(),
+                revision: runtime.revision,
+            })
+        }
+
+        fn finish_check(&self, result: &Result<UpdateCheck, String>, generation: Option<u64>) {
+            if let Ok(mut runtime) = self.runtime.lock() {
+                runtime.checking = false;
+                runtime.revision += 1;
+                // Turning automatic checks off invalidates a background response
+                // already in flight, including an off/on toggle during the request.
+                if generation.is_some_and(|value| value != runtime.schedule.generation) {
+                    return;
+                }
+                runtime.schedule.finished(now(), result.is_ok());
+                if let Ok(check) = result {
+                    runtime.result = Some(check.clone());
+                    runtime.checked_at = Some(now());
+                }
+                // A network failure keeps the last verified availability result.
+            }
+        }
+    }
+
+    fn emit_status(app: &AppHandle) {
+        if let Ok(status) = app.state::<UpdateOperationState>().snapshot() {
+            let _ = app.emit("update-status-changed", status);
+        }
+    }
+
+    pub(crate) fn configure_automatic_checks(app: &AppHandle, enabled: bool) -> Result<(), String> {
+        {
+            let operations = app.state::<UpdateOperationState>();
+            let mut runtime = operations
+                .runtime
+                .lock()
+                .map_err(|_| "The update status is unavailable.")?;
+            runtime.schedule.set_enabled(enabled, now());
+            runtime.revision += 1;
+        }
+        emit_status(app);
+        Ok(())
+    }
+
+    pub(crate) fn start_background_checks(app: AppHandle) -> Result<(), std::io::Error> {
+        let enabled = app
+            .state::<crate::PreferencesState>()
+            .preferences
+            .lock()
+            .map(|preferences| preferences.automatic_update_checks)
+            .unwrap_or(false);
+        configure_automatic_checks(&app, enabled).map_err(std::io::Error::other)?;
+        std::thread::Builder::new()
+            .name("macnu-update-checks".to_string())
+            .spawn(move || {
+                loop {
+                    // Wall-clock deadlines catch overdue checks after sleep within
+                    // this polling interval. No work is added to menu interaction.
+                    std::thread::sleep(Duration::from_secs(30));
+                    tauri::async_runtime::block_on(background_check(&app));
+                }
+            })?;
+        Ok(())
+    }
+
+    async fn background_check(app: &AppHandle) {
+        let operations = app.state::<UpdateOperationState>();
+        // Checks and installation share one guard; a busy updater is retried
+        // at the next tick, never queued behind or run alongside installation.
+        let Ok(operation) = operations.acquire() else {
+            return;
+        };
+        let generation = {
+            let Ok(mut runtime) = operations.runtime.lock() else {
+                return;
+            };
+            if !runtime.schedule.due(now()) {
+                return;
+            }
+            runtime.checking = true;
+            runtime.revision += 1;
+            runtime.schedule.generation
+        };
+        emit_status(app);
+        let result = query_update(app).await;
+        operations.finish_check(&result, Some(generation));
+        drop(operation);
+        emit_status(app);
     }
 
     struct UpdateOperationGuard<'a> {
@@ -317,15 +492,9 @@ mod official {
         }
     }
 
-    pub(crate) async fn check_for_updates_impl(
-        app: AppHandle,
-        window: WebviewWindow,
-        operations: State<'_, UpdateOperationState>,
-    ) -> Result<UpdateCheck, String> {
-        require_settings_window(&window)?;
-        let _operation = operations.acquire()?;
+    async fn query_update(app: &AppHandle) -> Result<UpdateCheck, String> {
         let current_version = app.package_info().version.to_string();
-        let update = checked_update(&app).await?;
+        let update = checked_update(app).await?;
         Ok(match update {
             Some((update, announced)) => UpdateCheck {
                 supported: true,
@@ -342,6 +511,29 @@ mod official {
                 notes: None,
             },
         })
+    }
+
+    pub(crate) async fn check_for_updates_impl(
+        app: AppHandle,
+        window: WebviewWindow,
+        operations: State<'_, UpdateOperationState>,
+    ) -> Result<UpdateCheck, String> {
+        require_settings_window(&window)?;
+        let operation = operations.acquire()?;
+        {
+            let mut runtime = operations
+                .runtime
+                .lock()
+                .map_err(|_| "The update status is unavailable.")?;
+            runtime.checking = true;
+            runtime.revision += 1;
+        }
+        emit_status(&app);
+        let result = query_update(&app).await;
+        operations.finish_check(&result, None);
+        drop(operation);
+        emit_status(&app);
+        result
     }
 
     pub(crate) async fn install_update_impl(
@@ -388,6 +580,70 @@ mod official {
         use super::{allowed_release_transport, installation_bundle_from_executable, read_bounded};
         use reqwest::Url;
         use std::{io::Cursor, path::Path};
+
+        fn available_check() -> super::UpdateCheck {
+            super::UpdateCheck {
+                supported: true,
+                available: true,
+                current_version: "0.5.2".into(),
+                version: Some("0.5.3".into()),
+                notes: None,
+            }
+        }
+
+        #[test]
+        fn checking_and_installation_cannot_overlap() {
+            let operations = super::UpdateOperationState::default();
+            let guard = operations.acquire().unwrap();
+            assert!(operations.acquire().is_err());
+            drop(guard);
+            assert!(operations.acquire().is_ok());
+        }
+
+        #[test]
+        fn failed_background_checks_keep_known_updates_and_last_success_time() {
+            let operations = super::UpdateOperationState::default();
+            operations.finish_check(&Ok(available_check()), None);
+            let before = operations.snapshot().unwrap();
+            operations.finish_check(&Err("offline".into()), None);
+            let after = operations.snapshot().unwrap();
+            assert_eq!(before.checked_at, after.checked_at);
+            assert_eq!(after.result.unwrap().version.as_deref(), Some("0.5.3"));
+            assert!(!after.checking);
+            assert!(after.revision > before.revision);
+        }
+
+        #[test]
+        fn toggling_off_discards_inflight_automatic_result() {
+            let operations = super::UpdateOperationState::default();
+            let generation = {
+                let mut runtime = operations.runtime.lock().unwrap();
+                runtime.schedule.set_enabled(true, super::now());
+                let generation = runtime.schedule.generation;
+                runtime.schedule.set_enabled(false, super::now());
+                generation
+            };
+            operations.finish_check(&Ok(available_check()), Some(generation));
+            let status = operations.snapshot().unwrap();
+            assert!(!status.automatic_checks);
+            assert!(status.result.is_none());
+            assert!(status.checked_at.is_none());
+            assert!(!status.checking);
+            // Manual checks are still usable when automatic checks are off.
+            operations.finish_check(&Ok(available_check()), None);
+            assert!(operations.snapshot().unwrap().result.unwrap().available);
+        }
+
+        #[test]
+        fn current_result_clears_old_update_indicator() {
+            let operations = super::UpdateOperationState::default();
+            operations.finish_check(&Ok(available_check()), None);
+            let mut current = available_check();
+            current.available = false;
+            current.version = None;
+            operations.finish_check(&Ok(current), None);
+            assert!(!operations.snapshot().unwrap().result.unwrap().available);
+        }
 
         #[test]
         fn updater_redirects_stay_on_secure_github_transport() {
