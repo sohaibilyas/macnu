@@ -718,6 +718,43 @@ fn catalog_state_version() -> u8 {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PinnedApp {
+    name: String,
+    bundle_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PinnedAppView {
+    name: String,
+    bundle_id: String,
+    image: String,
+    running: bool,
+    installed: bool,
+}
+
+fn valid_reopen_bundle_id(value: &str) -> bool {
+    value.len() <= 255
+        && value.contains('.')
+        && !value.starts_with("com.apple.")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
+}
+
+fn pinned_app_from_icon(icon: &MenuIcon) -> Option<PinnedApp> {
+    let bundle_id = icon.activation_bundle_id.as_deref()?;
+    if icon.is_macnu || !valid_reopen_bundle_id(bundle_id) || icon.owner.trim().is_empty() {
+        return None;
+    }
+    Some(PinnedApp {
+        name: icon.owner.chars().take(160).collect(),
+        bundle_id: bundle_id.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CatalogState {
     #[serde(default = "catalog_state_version")]
     version: u8,
@@ -729,6 +766,8 @@ struct CatalogState {
     displays: HashMap<String, DisplayCustomization>,
     #[serde(default)]
     saved_actions: HashMap<String, SavedAction>,
+    #[serde(default)]
+    pinned_apps: HashMap<String, PinnedApp>,
 }
 
 impl Default for CatalogState {
@@ -739,6 +778,7 @@ impl Default for CatalogState {
             global_favorites: Vec::new(),
             displays: HashMap::new(),
             saved_actions: HashMap::new(),
+            pinned_apps: HashMap::new(),
         }
     }
 }
@@ -790,6 +830,7 @@ struct SavedActionView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CatalogCustomizationsResponse {
+    pinned_apps: HashMap<String, PinnedAppView>,
     ranking_mode: RankingMode,
     personalize_per_display: bool,
     display_key: String,
@@ -906,6 +947,8 @@ unsafe extern "C" {
     fn macnu_open_login_items_settings();
     fn macnu_activate_application();
     fn macnu_activate_menu_icon_json(request_json: *const c_char) -> i32;
+    fn macnu_copy_pinned_apps_json(request_json: *const c_char) -> *mut c_char;
+    fn macnu_reopen_pinned_app(bundle_id: *const c_char) -> i32;
     fn macnu_copy_menu_actions_json(request_json: *const c_char) -> *mut c_char;
     fn macnu_activate_menu_action_json(request_json: *const c_char) -> i32;
 }
@@ -2279,6 +2322,7 @@ fn migrate_catalog_state_v1(state: CatalogStateV1) -> CatalogState {
         global_favorites: state.global_favorites,
         displays: state.displays,
         saved_actions: HashMap::new(),
+        pinned_apps: HashMap::new(),
     }
 }
 
@@ -2412,6 +2456,11 @@ fn valid_item_id(item_id: &str) -> bool {
 
 fn valid_item_shortcut_id(item_id: &str) -> bool {
     valid_versioned_key(item_id, "item-identifier", 2, 512)
+        || valid_versioned_key(item_id, "item-label-role", 3, 512)
+}
+
+fn shortcut_requires_fresh_catalog(item_id: &str) -> bool {
+    valid_versioned_key(item_id, "item-label-role", 3, 512)
 }
 
 fn valid_display_key(display_key: &str) -> bool {
@@ -2783,6 +2832,13 @@ fn retain_catalog_items_within_limit(catalog: &mut CatalogState) {
 }
 
 fn prune_catalog_state(catalog: &mut CatalogState) {
+    let retained: HashSet<_> = catalog
+        .pinned_apps
+        .keys()
+        .filter(|id| catalog.items.contains_key(*id) && item_is_favorite(catalog, id))
+        .cloned()
+        .collect();
+    catalog.pinned_apps.retain(|id, _| retained.contains(id));
     for display in catalog.displays.values_mut() {
         display
             .usage
@@ -2876,6 +2932,16 @@ fn sanitize_catalog_state(
         global_favorites,
         displays,
         saved_actions,
+        pinned_apps: state
+            .pinned_apps
+            .into_iter()
+            .filter(|(id, app)| {
+                valid_item_id(id)
+                    && valid_reopen_bundle_id(&app.bundle_id)
+                    && !app.name.trim().is_empty()
+                    && app.name.chars().count() <= 160
+            })
+            .collect(),
     };
     prune_catalog_state(&mut sanitized);
     retain_catalog_items_within_limit(&mut sanitized);
@@ -2960,6 +3026,21 @@ fn resolved_customizations(
         .collect();
 
     CatalogCustomizationsResponse {
+        pinned_apps: catalog
+            .pinned_apps
+            .iter()
+            .filter(|(id, _)| favorites.contains(id))
+            .map(|(id, app)| {
+                (
+                    id.clone(),
+                    PinnedAppView {
+                        name: app.name.clone(),
+                        bundle_id: app.bundle_id.clone(),
+                        ..PinnedAppView::default()
+                    },
+                )
+            })
+            .collect(),
         ranking_mode: preferences.ranking_mode,
         personalize_per_display: preferences.personalize_per_display,
         display_key: display_key.to_string(),
@@ -3068,14 +3149,123 @@ fn get_settings(state: State<'_, PreferencesState>) -> Result<SettingsResponse, 
 }
 
 #[tauri::command]
-fn get_catalog_customizations(
+async fn get_catalog_customizations(
     display_key: String,
+    menu_cache: State<'_, MenuCache>,
     catalog: State<'_, CatalogStateStore>,
     preferences: State<'_, PreferencesState>,
 ) -> Result<CatalogCustomizationsResponse, String> {
-    current_customizations(catalog.inner(), preferences.inner(), &display_key)
+    let cache = menu_cache.inner().clone();
+    let catalog = catalog.inner().clone();
+    let preferences = preferences.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        remember_pinned_apps(&cache, &catalog, &display_key)?;
+        let mut response = current_customizations(&catalog, &preferences, &display_key)?;
+        hydrate_pinned_apps(&mut response)?;
+        Ok(response)
+    })
+    .await
+    .map_err(|_| "Could not load saved apps.".to_string())?
 }
 
+fn remember_pinned_apps(
+    cache: &MenuCache,
+    store: &CatalogStateStore,
+    display_key: &str,
+) -> Result<(), String> {
+    if store.write_protected {
+        return Ok(());
+    }
+    let icons: Vec<_> = cache
+        .responses
+        .lock()
+        .map_err(|_| "The menu cache is unavailable.")?
+        .values()
+        .filter(|entry| entry.response.display_key == display_key)
+        .flat_map(|entry| entry.response.icons.clone())
+        .collect();
+    let _guard = store
+        .write_lock
+        .lock()
+        .map_err(|_| "The personalization writer is unavailable.")?;
+    let mut state = store
+        .state
+        .lock()
+        .map_err(|_| "The personalization data is unavailable.")?;
+    let mut updated = state.clone();
+    for icon in icons {
+        if let (Some(id), Some(app)) = (icon.item_id.as_ref(), pinned_app_from_icon(&icon)) {
+            if item_is_favorite(&updated, id) {
+                updated.pinned_apps.insert(id.clone(), app);
+            }
+        }
+    }
+    if updated != *state {
+        persist_catalog_state(store, &updated)?;
+        *state = updated;
+    }
+    Ok(())
+}
+
+fn hydrate_pinned_apps(response: &mut CatalogCustomizationsResponse) -> Result<(), String> {
+    if response.pinned_apps.is_empty() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ids: Vec<_> = response
+            .pinned_apps
+            .values()
+            .map(|app| &app.bundle_id)
+            .collect();
+        let json =
+            CString::new(serde_json::to_string(&ids).map_err(|_| "Could not read saved apps.")?)
+                .map_err(|_| "Could not read saved apps.")?;
+        let json = copy_native_owned_string(unsafe { macnu_copy_pinned_apps_json(json.as_ptr()) })
+            .ok_or("Could not read saved apps.")?;
+        let native: HashMap<String, PinnedAppView> =
+            serde_json::from_str(&json).map_err(|_| "Could not read saved apps.")?;
+        for app in response.pinned_apps.values_mut() {
+            if let Some(current) = native.get(&app.bundle_id) {
+                app.image = current.image.clone();
+                app.running = current.running;
+                app.installed = current.installed;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn reopen_pinned_app(
+    app: AppHandle,
+    item_id: String,
+    display_key: String,
+    catalog: State<'_, CatalogStateStore>,
+    preferences: State<'_, PreferencesState>,
+) -> Result<(), String> {
+    require_ready(&app)?;
+    let response = current_customizations(catalog.inner(), preferences.inner(), &display_key)?;
+    let saved = response
+        .pinned_apps
+        .get(&item_id)
+        .filter(|saved| valid_reopen_bundle_id(&saved.bundle_id))
+        .ok_or("That app is no longer pinned. Refresh and try again.")?;
+    let bundle_id =
+        CString::new(saved.bundle_id.clone()).map_err(|_| "That app cannot be opened.")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = unsafe { macnu_reopen_pinned_app(bundle_id.as_ptr()) };
+        match status {
+            0 => Ok(()),
+            1 => Err("This app is no longer installed. Install it again or unpin it.".to_string()),
+            _ => Err("Macnu couldn’t open that app. Try opening it from Applications.".to_string()),
+        }
+    })
+    .await
+    .map_err(|_| "Macnu couldn’t open that app.".to_string())?
+}
+
+#[cfg(test)]
 fn menu_cache_contains_item(
     cache: &MenuCache,
     display_key: &str,
@@ -3246,9 +3436,13 @@ fn persist_catalog_with_shortcut_change(
         .as_deref()
         .and_then(|shortcut| shortcut_id(shortcut).ok());
     let new_id = new_shortcut.as_deref().map(shortcut_id).transpose()?;
-    let registration_changed = old_id != new_id;
+    // Saving an unchanged assignment retries a failed startup registration.
+    let registration_changed = old_id != new_id
+        || new_shortcut
+            .as_deref()
+            .is_some_and(|shortcut| !app.global_shortcut().is_registered(shortcut));
     let old_registered: Vec<_> = old_shortcut
-        .filter(|shortcut| shortcut_id(shortcut).is_ok())
+        .filter(|shortcut| app.global_shortcut().is_registered(shortcut.as_str()))
         .into_iter()
         .collect();
     let mut released_old = Vec::new();
@@ -3331,7 +3525,11 @@ fn set_item_customization(
     if !valid_display_key(&display_key) {
         return Err("That display is no longer available.".to_string());
     }
-    if !menu_cache_contains_item(menu_cache.inner(), &display_key, &item_id)? {
+    let live_icon = menu_cache_item(menu_cache.inner(), &display_key, &item_id)?;
+    let saved = current_customizations(catalog.inner(), preferences.inner(), &display_key)?
+        .pinned_apps
+        .contains_key(&item_id);
+    if live_icon.is_none() && !saved {
         return Err("That menu-bar item is no longer available on this display.".to_string());
     }
 
@@ -3339,7 +3537,7 @@ fn set_item_customization(
     let shortcut = normalized_item_shortcut(shortcut)?;
     if shortcut.is_some() && !valid_item_shortcut_id(&item_id) {
         return Err(
-            "A direct shortcut requires an item identity supplied by the original app.".to_string(),
+            "Macnu can’t tell this item apart reliably. Refresh Macnu and try again.".to_string(),
         );
     }
 
@@ -3393,9 +3591,15 @@ fn set_item_customization(
     } else {
         update_display_favorite(&mut updated, scope, &item_id, favorite)?;
     }
+    if favorite {
+        if let Some(app) = live_icon.as_ref().and_then(pinned_app_from_icon) {
+            updated.pinned_apps.insert(item_id.clone(), app);
+        }
+    }
     prune_catalog_state(&mut updated);
 
-    let response = resolved_customizations(&updated, &current_preferences, &display_key);
+    let mut response = resolved_customizations(&updated, &current_preferences, &display_key);
+    hydrate_pinned_apps(&mut response)?;
     persist_catalog_with_shortcut_change(&app, catalog.inner(), updated, old_shortcut, shortcut)?;
     let _ = app.emit("catalog-customizations-changed", response.clone());
     Ok(response)
@@ -3452,8 +3656,7 @@ fn save_saved_action(
     let shortcut = normalized_item_shortcut(shortcut)?;
     if shortcut.is_some() && !valid_item_shortcut_id(&parent_item_id) {
         return Err(
-            "A saved-action shortcut requires an identity supplied by the original app."
-                .to_string(),
+            "Macnu can’t tell this item apart reliably. Refresh Macnu and try again.".to_string(),
         );
     }
     let id = saved_action_id(&parent_item_id, &action);
@@ -3513,7 +3716,8 @@ fn save_saved_action(
             display_usage,
         },
     );
-    let response = resolved_customizations(&updated, &current_preferences, &display_key);
+    let mut response = resolved_customizations(&updated, &current_preferences, &display_key);
+    hydrate_pinned_apps(&mut response)?;
     persist_catalog_with_shortcut_change(&app, catalog.inner(), updated, old_shortcut, shortcut)?;
     let _ = app.emit("catalog-customizations-changed", response.clone());
     Ok(response)
@@ -3562,8 +3766,7 @@ fn update_saved_action(
         .clone();
     if shortcut.is_some() && !valid_item_shortcut_id(&parent_item_id) {
         return Err(
-            "A saved-action shortcut requires an identity supplied by the original app."
-                .to_string(),
+            "Macnu can’t tell this item apart reliably. Refresh Macnu and try again.".to_string(),
         );
     }
     if let Some(new_id) = shortcut.as_deref().map(shortcut_id).transpose()? {
@@ -3578,7 +3781,8 @@ fn update_saved_action(
     let old_shortcut = saved_action.shortcut.clone();
     saved_action.alias = alias;
     saved_action.shortcut = shortcut.clone();
-    let response = resolved_customizations(&updated, &current_preferences, &display_key);
+    let mut response = resolved_customizations(&updated, &current_preferences, &display_key);
+    hydrate_pinned_apps(&mut response)?;
     persist_catalog_with_shortcut_change(&app, catalog.inner(), updated, old_shortcut, shortcut)?;
     let _ = app.emit("catalog-customizations-changed", response.clone());
     Ok(response)
@@ -3618,7 +3822,8 @@ fn remove_saved_action(
         .remove(&saved_action_id)
         .ok_or_else(|| "That saved action no longer exists.".to_string())?;
     let old_shortcut = removed.shortcut;
-    let response = resolved_customizations(&updated, &current_preferences, &display_key);
+    let mut response = resolved_customizations(&updated, &current_preferences, &display_key);
+    hydrate_pinned_apps(&mut response)?;
     persist_catalog_with_shortcut_change(&app, catalog.inner(), updated, old_shortcut, None)?;
     let _ = app.emit("catalog-customizations-changed", response.clone());
     Ok(response)
@@ -4074,22 +4279,9 @@ fn reconcile_persisted_direct_shortcuts<Register>(
 where
     Register: FnMut(&str) -> Result<(), String>,
 {
-    let mut updated = catalog.clone();
     let mut failures = Vec::new();
     for assignment in persisted_direct_shortcut_assignments(preferences, catalog) {
         if let Err(error) = register(&assignment.shortcut) {
-            match &assignment.target {
-                DirectShortcutTarget::Item(item_id) => {
-                    if let Some(item) = updated.items.get_mut(item_id) {
-                        item.shortcut = None;
-                    }
-                }
-                DirectShortcutTarget::SavedAction(saved_action_id) => {
-                    if let Some(action) = updated.saved_actions.get_mut(saved_action_id) {
-                        action.shortcut = None;
-                    }
-                }
-            }
             failures.push(DirectShortcutRegistrationFailure {
                 target: assignment.target,
                 shortcut: assignment.shortcut,
@@ -4097,10 +4289,8 @@ where
             });
         }
     }
-    if !failures.is_empty() {
-        prune_catalog_state(&mut updated);
-    }
-    (updated, failures)
+    // A temporary OS registration conflict must not erase a saved assignment.
+    (catalog.clone(), failures)
 }
 
 fn register_persisted_direct_shortcuts(
@@ -4117,25 +4307,14 @@ fn register_persisted_direct_shortcuts(
         .lock()
         .map_err(|_| "The personalization data is unavailable.".to_string())?
         .clone();
-    let (updated, failures) =
-        reconcile_persisted_direct_shortcuts(preferences, &current, |shortcut| {
-            app.global_shortcut()
-                .register(shortcut)
-                .map_err(|error| error.to_string())
-        });
-    if failures.is_empty() {
-        return Ok(());
-    }
-
-    persist_catalog_state(store, &updated)
-        .map_err(|error| format!("Could not save unavailable direct shortcut cleanup: {error}"))?;
-    *store
-        .state
-        .lock()
-        .map_err(|_| "The personalization data is unavailable.".to_string())? = updated;
+    let (_, failures) = reconcile_persisted_direct_shortcuts(preferences, &current, |shortcut| {
+        app.global_shortcut()
+            .register(shortcut)
+            .map_err(|error| error.to_string())
+    });
     for failure in failures {
         eprintln!(
-            "Macnu removed unavailable direct shortcut {} for {:?}: {}",
+            "Macnu kept saved shortcut {} for {:?}, but could not register it this session: {}",
             failure.shortcut, failure.target, failure.error
         );
     }
@@ -4159,17 +4338,29 @@ where
     Err("That menu-bar item is not available on this display.".to_string())
 }
 
+fn unique_shortcut_icon(icons: Vec<MenuIcon>, item_id: &str) -> Option<MenuIcon> {
+    if !valid_item_shortcut_id(item_id) {
+        return None;
+    }
+    let mut matches = icons
+        .into_iter()
+        .filter(|icon| !icon.is_macnu && icon.item_id.as_deref() == Some(item_id));
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
+}
+
 #[cfg(target_os = "macos")]
 fn catalog_icon_for_item(
     cache: &MenuCache,
     item_id: &str,
     force: bool,
 ) -> Result<Option<MenuIcon>, String> {
-    let response = refresh_menu_cache(cache, force)?.response;
-    Ok(response
-        .icons
-        .into_iter()
-        .find(|icon| icon.item_id.as_deref() == Some(item_id)))
+    // Label/role identities are safe only while the current menu exposes one
+    // exact match. Re-scan before execution; never infer a target from its
+    // position, app alone, or a stale label.
+    let response =
+        refresh_menu_cache(cache, force || shortcut_requires_fresh_catalog(item_id))?.response;
+    Ok(unique_shortcut_icon(response.icons, item_id))
 }
 
 fn activate_item_shortcut(app: &AppHandle, item_id: String) {
@@ -4872,6 +5063,7 @@ pub fn run() {
             app_updater::install_update,
             get_settings,
             get_catalog_customizations,
+            reopen_pinned_app,
             set_item_customization,
             save_saved_action,
             update_saved_action,
@@ -4910,6 +5102,190 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_shortcuts_survive_reload_and_register_for_items_and_actions() {
+        let parent = "v1.item-label-role.YXBw.bGFiZWw.cm9sZQ".to_string();
+        let preferences = Preferences::default();
+        let mut state = CatalogState::default();
+        state.items.insert(
+            parent.clone(),
+            ItemCustomization {
+                shortcut: Some("Command+Shift+K".into()),
+                ..ItemCustomization::default()
+            },
+        );
+        let (action_id, mut saved) = saved_action(&parent, "Settings");
+        saved.shortcut = Some("Command+Shift+J".into());
+        state.saved_actions.insert(action_id.clone(), saved);
+        let loaded = decode_catalog_state(&serde_json::to_string(&state).unwrap(), 500, None).value;
+        assert_eq!(
+            loaded.items[&parent].shortcut.as_deref(),
+            Some("Command+Shift+K")
+        );
+        assert_eq!(
+            loaded.saved_actions[&action_id].shortcut.as_deref(),
+            Some("Command+Shift+J")
+        );
+        assert_eq!(
+            persisted_direct_shortcut_assignments(&preferences, &loaded).len(),
+            2
+        );
+        assert_eq!(
+            global_shortcut_route(
+                shortcut_id("Command+Shift+K").unwrap(),
+                &preferences,
+                &loaded
+            ),
+            GlobalShortcutRoute::Item(parent.clone())
+        );
+        assert_eq!(
+            global_shortcut_route(
+                shortcut_id("Command+Shift+J").unwrap(),
+                &preferences,
+                &loaded
+            ),
+            GlobalShortcutRoute::SavedAction(action_id)
+        );
+        assert!(shortcut_requires_fresh_catalog(&parent));
+        assert!(!shortcut_requires_fresh_catalog(
+            "v1.item-identifier.YXBw.aWNvbg"
+        ));
+    }
+
+    #[test]
+    fn fallback_shortcuts_survive_repeated_conflicts_and_unpinning() {
+        let id = "v1.item-label-role.YXBw.bGFiZWw.cm9sZQ".to_string();
+        let preferences = Preferences::default();
+        let mut catalog = CatalogState::default();
+        catalog.items.insert(
+            id.clone(),
+            ItemCustomization {
+                shortcut: Some("Command+Shift+KeyK".into()),
+                ..ItemCustomization::default()
+            },
+        );
+        catalog.global_favorites.push(id.clone());
+        // Unpinning must retain a shortcut-only customization.
+        catalog.global_favorites.clear();
+        prune_catalog_state(&mut catalog);
+        for _ in 0..3 {
+            let (unchanged, failures) =
+                reconcile_persisted_direct_shortcuts(&preferences, &catalog, |_| {
+                    Err("temporarily occupied".into())
+                });
+            assert_eq!(failures.len(), 1);
+            catalog =
+                decode_catalog_state(&serde_json::to_string(&unchanged).unwrap(), 500, None).value;
+            assert_eq!(
+                catalog.items[&id].shortcut.as_deref(),
+                Some("Command+Shift+KeyK")
+            );
+        }
+        let mut attempts = 0;
+        let (_, failures) = reconcile_persisted_direct_shortcuts(&preferences, &catalog, |_| {
+            attempts += 1;
+            Ok(())
+        });
+        assert_eq!(attempts, 1);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn fallback_shortcut_matching_rejects_missing_renamed_and_duplicate_targets() {
+        let id = "v1.item-label-role.YXBw.bGFiZWw.cm9sZQ";
+        let mut target = icon("aWNvbg");
+        target.item_id = Some(id.into());
+        assert!(unique_shortcut_icon(vec![target.clone()], id).is_some());
+        assert!(unique_shortcut_icon(vec![], id).is_none());
+        assert!(unique_shortcut_icon(vec![target.clone(), target.clone()], id).is_none());
+        let mut renamed = target.clone();
+        renamed.item_id = Some("v1.item-label-role.YXBw.bmV3.cm9sZQ".into());
+        assert!(unique_shortcut_icon(vec![renamed], id).is_none());
+        target.is_macnu = true;
+        assert!(unique_shortcut_icon(vec![target], id).is_none());
+    }
+
+    #[test]
+    fn reopening_accepts_only_non_system_bundle_identifiers() {
+        assert!(valid_reopen_bundle_id("com.example.Status-App"));
+        for invalid in [
+            "",
+            "app",
+            "com.apple.controlcenter",
+            "/Applications/App.app",
+            "com.app;open",
+            "com.app\n",
+            "com.app/other",
+        ] {
+            assert!(!valid_reopen_bundle_id(invalid), "{invalid}");
+        }
+        let mut app = icon("cGlu");
+        assert_eq!(pinned_app_from_icon(&app).unwrap().name, "Example");
+        app.is_macnu = true;
+        assert!(pinned_app_from_icon(&app).is_none());
+        app.is_macnu = false;
+        app.activation_bundle_id = None;
+        assert!(pinned_app_from_icon(&app).is_none());
+    }
+
+    #[test]
+    fn saved_app_metadata_is_backward_compatible_and_scoped_to_pins() {
+        let old =
+            r#"{"version":2,"items":{},"globalFavorites":[],"displays":{},"savedActions":{}}"#;
+        let legacy: CatalogState = serde_json::from_str(old).unwrap();
+        assert!(legacy.pinned_apps.is_empty());
+        let icon = icon("cGlu");
+        let id = icon.item_id.clone().unwrap();
+        let mut catalog = CatalogState::default();
+        catalog
+            .items
+            .insert(id.clone(), ItemCustomization::default());
+        catalog
+            .pinned_apps
+            .insert(id.clone(), pinned_app_from_icon(&icon).unwrap());
+        catalog.global_favorites.push(id.clone());
+        let round_trip: CatalogState =
+            serde_json::from_str(&serde_json::to_string(&catalog).unwrap()).unwrap();
+        assert_eq!(round_trip, catalog);
+        let display = icon.display_key.unwrap();
+        let preferences = Preferences::default();
+        assert!(resolved_customizations(&catalog, &preferences, &display)
+            .pinned_apps
+            .contains_key(&id));
+        catalog
+            .displays
+            .insert(display.clone(), DisplayCustomization::default());
+        assert!(resolved_customizations(&catalog, &preferences, &display)
+            .pinned_apps
+            .is_empty());
+        prune_catalog_state(&mut catalog);
+        assert!(catalog.pinned_apps.contains_key(&id)); // Still pinned globally.
+        catalog.global_favorites.clear();
+        prune_catalog_state(&mut catalog);
+        assert!(catalog.pinned_apps.is_empty());
+    }
+
+    #[test]
+    fn saved_app_sanitization_removes_invalid_and_unpinned_metadata() {
+        let icon = icon("cGlu");
+        let id = icon.item_id.clone().unwrap();
+        let mut catalog = CatalogState::default();
+        catalog
+            .items
+            .insert(id.clone(), ItemCustomization::default());
+        catalog.global_favorites.push(id.clone());
+        catalog.pinned_apps.insert(
+            id.clone(),
+            PinnedApp {
+                name: "System".into(),
+                bundle_id: "com.apple.controlcenter".into(),
+            },
+        );
+        let sanitized = sanitize_catalog_state(catalog, 100, None);
+        assert!(sanitized.pinned_apps.is_empty());
+        assert!(sanitized.global_favorites.contains(&id));
+    }
 
     fn icon(identifier: &str) -> MenuIcon {
         MenuIcon {
@@ -5451,7 +5827,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_cleanup_removes_only_the_unavailable_saved_action_shortcut() {
+    fn startup_conflict_preserves_saved_action_shortcut_for_retry() {
         let preferences = Preferences::default();
         let parent = "v1.item-identifier.Y29tLmV4YW1wbGU.aXRlbQ";
         let (saved_id, mut saved) = saved_action(parent, "Disconnect");
@@ -5468,7 +5844,17 @@ mod tests {
             failures[0].target,
             DirectShortcutTarget::SavedAction(saved_id.clone())
         );
-        assert!(reconciled.saved_actions[&saved_id].shortcut.is_none());
+        assert_eq!(
+            reconciled.saved_actions[&saved_id].shortcut.as_deref(),
+            Some("Command+Period")
+        );
+        let (retried, failures) =
+            reconcile_persisted_direct_shortcuts(&preferences, &reconciled, |_| Ok(()));
+        assert!(failures.is_empty());
+        assert_eq!(
+            retried.saved_actions[&saved_id].shortcut.as_deref(),
+            Some("Command+Period")
+        );
     }
 
     #[test]
@@ -6093,7 +6479,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_reconciliation_removes_unavailable_shortcuts_from_views_and_storage() {
+    fn startup_conflict_preserves_shortcuts_in_views_and_storage() {
         let preferences = Preferences::default();
         let failed = "v1.item-identifier.Y29tLmV4YW1wbGU.ZmFpbGVk".to_string();
         let registered = "v1.item-identifier.Y29tLmV4YW1wbGU.c3VjY2Vzcw".to_string();
@@ -6137,17 +6523,29 @@ mod tests {
             reconciled.items[&failed].alias.as_deref(),
             Some("Keep this alias")
         );
-        assert!(reconciled.items[&failed].shortcut.is_none());
+        assert_eq!(
+            reconciled.items[&failed].shortcut.as_deref(),
+            Some("Command+Period")
+        );
         assert_eq!(
             reconciled.items[&registered].shortcut.as_deref(),
             Some("Command+Comma")
         );
         let view = resolved_customizations(&reconciled, &preferences, "v1.display-uuid.dGVzdA");
-        assert!(view.items[&failed].shortcut.is_none());
+        assert_eq!(
+            view.items[&failed].shortcut.as_deref(),
+            Some("Command+Period")
+        );
 
         let json = serde_json::to_string(&reconciled).unwrap();
         let reloaded = decode_catalog_state(&json, 500, None);
-        assert!(reloaded.value.items[&failed].shortcut.is_none());
+        assert_eq!(
+            reloaded.value.items[&failed].shortcut.as_deref(),
+            Some("Command+Period")
+        );
+        let (_, failures) =
+            reconcile_persisted_direct_shortcuts(&preferences, &reloaded.value, |_| Ok(()));
+        assert!(failures.is_empty());
         assert_eq!(attempted.borrow().len(), 2);
     }
 

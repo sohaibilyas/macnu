@@ -15,12 +15,15 @@ works on the display you are using, including multi-monitor Mac setups.
 ## Features
 
 - Search menu bar apps and system status items from one palette.
+- Choose a list or compact icon grid in Settings → General → Menu layout.
+- Reopen a pinned app after quitting it, without searching through Applications.
+- Read CPU, memory, temperature, and network measurements below an app’s name when it exposes them.
 - Open each item's original menu or popover without moving icons.
-- Press Tab or Right Arrow to search exposed standard menu actions without opening the native menu.
+- Press Tab to search exposed standard menu actions without opening the native menu. Right Arrow also opens Actions in list view.
 - Find hidden menu bar icons behind the MacBook notch or crowded app menus.
 - Launch Macnu on the active display with a customizable keyboard shortcut.
 - Pin menu bar icons so they appear first before you type, without changing fuzzy-search relevance, and add local aliases to items Macnu can identify reliably.
-- Assign direct global shortcuts when an app exposes a durable menu bar item identifier.
+- Assign direct global shortcuts to identifiable menu bar items, including third-party apps with a unique app-and-menu-label match.
 - Use Smart ordering to bring frequently and recently opened items forward on each display.
 - Switch between Smart, menu bar, and alphabetical ordering or reset local usage history at any time.
 - Pin supported commands inside each app’s Actions view so those actions appear first there before you type.
@@ -47,7 +50,7 @@ Click the Macnu menu bar icon or press **Command + Semicolon**.
 1. Type to search menu bar icons.
 2. Use the arrow keys to select a result.
 3. Press Enter to open an item.
-4. Press Tab or Right Arrow to browse an item's standard menu actions.
+4. Press Tab to browse an item's standard menu actions. In list view, Right Arrow does the same; in grid view, the arrow keys move between icons.
 5. In Actions, press Enter to run a command, use its pin or Command + P to pin or unpin it, or press Left Arrow to return. Pinned actions appear first while the Actions search is empty.
 6. Use the pin beside a main icon, or press Command + P, to keep it at the top before searching. Use the three-dot menu for aliases, visibility, and direct shortcuts.
 7. Press Escape, use the shortcut again, or click elsewhere to close Macnu.
@@ -56,10 +59,33 @@ Macnu never clicks a status item merely to discover its actions. Apps that
 build commands only after a click, including custom popovers, use the original
 menu fallback instead.
 
+Direct shortcuts support both app-provided identifiers and unique menu-label
+matches. For label-based shortcuts, Macnu refreshes the menu catalog before
+opening an item. If the app renames that item or exposes indistinguishable
+duplicates, the shortcut stops rather than opening another icon. Select the
+current item in Macnu to update its shortcut.
+
 Settings lets you change the launcher shortcut and appearance, choose how
 results are ordered, control per-display personalization, manage pinned actions
 and hidden search items, enable Start at Login, manage your license, and check
 for updates.
+
+### Pinned apps and status previews
+
+Pin an app while it is running to keep it available after you quit it. Existing
+pins gain this support the next time you open Macnu with those apps running.
+Select a dimmed **Not running** icon to reopen the app. Keep it selected and
+Macnu will open its menu once it appears. If you move away or close the palette,
+Macnu leaves the menu alone. Apps that take longer to start may need a Refresh.
+
+Reopening requires an installed app with a known bundle identifier. System
+controls and items without an app identity do not support it. A running app
+without an available menu shows **Menu unavailable**; an uninstalled app shows
+**Not installed** and you can unpin it.
+
+Status previews show measurements supplied by the app, refreshed with the menu
+catalog. You can search that text or hover over a result to read a truncated
+preview. Apps without exposed measurements keep their existing labels.
 
 ## Permissions and privacy
 
@@ -86,6 +112,10 @@ ordering history stay in Macnu's local app data. Pinned actions contain
 the parent item identity and command path needed to find the command again. You
 can clear usage history, unpin actions, and restore hidden items from
 Settings.
+
+For app reopening, Macnu also stores each pinned app’s name and bundle
+identifier on your Mac. It gets installed-app icons and running state from
+macOS. You choose when to reopen an app.
 
 ## Build from source
 
@@ -118,6 +148,11 @@ npm run test:rust:source
 swift test --package-path src-tauri/native
 npm --prefix services/lemon-webhook run check
 ```
+
+The optional browser regression test uses mocked macOS responses and requires
+Playwright. With the Vite development server running, run
+`node scripts/test-menu-hub.mjs`. Set `MACNU_PLAYWRIGHT_MODULE` or
+`MACNU_CHROME_PATH` if your test runtime provides them outside the project.
 
 ## Official releases
 

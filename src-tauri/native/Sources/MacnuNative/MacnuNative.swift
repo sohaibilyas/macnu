@@ -7,7 +7,7 @@ import ScreenCaptureKit
 import Security
 import ServiceManagement
 
-private struct MenuWindow {
+struct MenuWindow {
     let id: CGWindowID
     let pid: pid_t
     let owner: String
@@ -1451,14 +1451,31 @@ private func firstHitWindow(
     return DispatchQueue.main.sync { lookup() }
 }
 
-private func activationWindowMatches(
+private func unambiguousActivationWindows(
+    _ proposed: [Int: MenuWindow]
+) -> [Int: MenuWindow] {
+    // Apply on every display and every return path, not only notch displays.
+    let claims = Dictionary(grouping: proposed.keys) { proposed[$0]!.id }
+    let ambiguousIDs = Set(claims.compactMap { id, indices in
+        indices.count > 1 ? id : nil
+    })
+    return proposed.filter { !ambiguousIDs.contains($0.value.id) }
+}
+
+func activationWindowMatches(
     windows: [MenuWindow],
     candidates: [AccessibilityCandidate],
     targetDisplay: CGRect,
     displays: [CGRect],
-    strictMatches: [Int: MenuWindow]
+    strictMatches: [Int: MenuWindow],
+    hasTopSafeArea: (CGRect) -> Bool = displayHasTopSafeArea,
+    hitWindow: (CGPoint, Set<CGWindowID>) -> CGWindowID? = {
+        firstHitWindow(atCoreGraphicsPoint: $0, eligibleWindowIDs: $1)
+    }
 ) -> [Int: MenuWindow] {
-    guard !windows.isEmpty, !candidates.isEmpty else { return strictMatches }
+    guard !windows.isEmpty, !candidates.isEmpty else {
+        return unambiguousActivationWindows(strictMatches)
+    }
     let windowsByID = Dictionary(uniqueKeysWithValues: windows.map { ($0.id, $0) })
     let eligibleWindowIDs = Set(windowsByID.keys)
     var proposed = strictMatches
@@ -1478,10 +1495,8 @@ private func activationWindowMatches(
         var resolvedIDs: Set<CGWindowID> = []
 
         for point in points {
-            if let id = firstHitWindow(
-                atCoreGraphicsPoint: point,
-                eligibleWindowIDs: eligibleWindowIDs
-            ), let window = windowsByID[id],
+            if let id = hitWindow(point, eligibleWindowIDs),
+               let window = windowsByID[id],
                containingDisplay(for: window.bounds, in: displays) == targetDisplay,
                window.bounds.insetBy(dx: -1, dy: -1).contains(point) {
                 resolvedIDs.insert(id)
@@ -1502,7 +1517,9 @@ private func activationWindowMatches(
     // order/count alignment, provides direct identity evidence: AX and the
     // status-level window share the same horizontal centre and overlap completely.
     // Accept this route only for a mutual one-to-one precise match.
-    guard displayHasTopSafeArea(targetDisplay) else { return proposed }
+    guard hasTopSafeArea(targetDisplay) else {
+        return unambiguousActivationWindows(proposed)
+    }
     let claimedWindowIDs = Set(proposed.values.map(\.id))
     var seenGeometry: Set<String> = []
     let geometryWindows = windows.filter { window in
@@ -1561,13 +1578,7 @@ private func activationWindowMatches(
         }
     }
 
-    // One WindowServer target may never be assigned to two AX identities.
-    // Preserve safety even if two applications expose overlapping AX frames.
-    let claims = Dictionary(grouping: proposed.keys) { proposed[$0]!.id }
-    let ambiguousIDs = Set(claims.compactMap { id, indices in
-        indices.count > 1 ? id : nil
-    })
-    return proposed.filter { !ambiguousIDs.contains($0.value.id) }
+    return unambiguousActivationWindows(proposed)
 }
 
 private func pngDataURL(from image: CGImage) -> String? {
@@ -1894,7 +1905,7 @@ private func dismissLastActivatedPopup() {
     Thread.sleep(forTimeInterval: 0.015)
 }
 
-private func resolvedAccessibilityCandidate(
+func resolvedAccessibilityCandidate(
     pid: pid_t,
     bundleIdentifier: String?,
     identifier: String?,
@@ -1938,12 +1949,7 @@ private func resolvedAccessibilityCandidate(
     }
 
     if frame != nil {
-        let exactFrameMatches = matchingProcess.filter {
-            frameDistance($0) <= 2
-        }
-        if exactFrameMatches.count == 1 {
-            return exactFrameMatches[0]
-        }
+        // Coordinates alone cannot identify an item after a reorder/replacement.
         let namedNearby = matchingProcess.filter {
             frameDistance($0) <= 8
                 && $0.label.caseInsensitiveCompare(label) == .orderedSame
@@ -2051,6 +2057,20 @@ private func cachedActivationTarget(
     return target
 }
 
+func cachedCandidateIdentityMatches(
+    _ cached: AccessibilityCandidate,
+    live: AccessibilityCandidate
+) -> Bool {
+    guard cached.pid == live.pid,
+          cached.bundleIdentifier == live.bundleIdentifier,
+          cached.role == live.role else { return false }
+    if let identifier = cached.identifier {
+        return live.identifier == identifier
+    }
+    return !live.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        && cached.label.caseInsensitiveCompare(live.label) == .orderedSame
+}
+
 private func liveCachedCandidate(
     _ cached: AccessibilityCandidate,
     for request: ActivationRequest
@@ -2074,19 +2094,18 @@ private func liveCachedCandidate(
        !currentActions.contains(requestedAction) {
         return nil
     }
-    return AccessibilityCandidate(
+    let live = AccessibilityCandidate(
         element: cached.element,
         pid: cached.pid,
         appName: cached.appName,
         bundleIdentifier: cached.bundleIdentifier,
-        label: accessibilityText(from: cached.element, fallback: cached.label),
-        identifier: currentIdentifier?.isEmpty == false
-            ? currentIdentifier
-            : cached.identifier,
-        role: cached.role,
+        label: accessibilityText(from: cached.element, fallback: ""),
+        identifier: currentIdentifier?.isEmpty == false ? currentIdentifier : nil,
+        role: attribute(kAXRoleAttribute, from: cached.element) as? String,
         frame: currentFrame,
         actions: currentActions
     )
+    return cachedCandidateIdentityMatches(cached, live: live) ? live : nil
 }
 
 private func unchangedCachedMenuWindow(
@@ -2110,6 +2129,13 @@ private func unchangedCachedMenuWindow(
         return nil
     }
     return current
+}
+
+func configurePlainMenuClick(_ event: CGEvent) {
+    // A direct shortcut may still have Command/Option/Shift/Control held.
+    // Menu activation must be a plain click, not an alternate app command.
+    event.flags = []
+    event.setIntegerValueField(.mouseEventClickState, value: 1)
 }
 
 private func postProcessTargetedClick(
@@ -2139,7 +2165,7 @@ private func postProcessTargetedClick(
             .eventTargetUnixProcessID,
             value: Int64(candidate.pid)
         )
-        event.setIntegerValueField(.mouseEventClickState, value: 1)
+        configurePlainMenuClick(event)
     }
     mouseDown.postToPid(candidate.pid)
     Thread.sleep(forTimeInterval: 0.035)
@@ -2147,11 +2173,37 @@ private func postProcessTargetedClick(
     return true
 }
 
+func activationTargetDisplay(for frame: CGRect, in displays: [CGRect]) -> CGRect? {
+    guard !frame.isNull, !frame.isInfinite, frame.width > 0, frame.height > 0,
+          [frame.minX, frame.minY, frame.width, frame.height].allSatisfy({ $0.isFinite })
+    else { return nil }
+    let midpoint = CGPoint(x: frame.midX, y: frame.midY)
+    let matches = displays.filter { $0.contains(midpoint) }
+    // Do not project a disconnected display onto its nearest surviving monitor.
+    return matches.count == 1 ? matches[0] : nil
+}
+
+func activationFramesShareDisplay(
+    requested: CGRect, target: CGRect, displays: [CGRect]
+) -> Bool {
+    guard let requestedDisplay = activationTargetDisplay(for: requested, in: displays),
+          let targetDisplay = activationTargetDisplay(for: target, in: displays)
+    else { return false }
+    return requestedDisplay == targetDisplay
+}
+
 private func performAccessibilityAction(
     on candidate: AccessibilityCandidate,
     preferredAction: String?,
-    baselineWindowIDs: Set<CGWindowID>
+    baselineWindowIDs: Set<CGWindowID>,
+    requestedFrame: CGRect,
+    displays: [CGRect]
 ) -> AccessibilityActivationResult? {
+    // Both AX actions and process-targeted clicks address this exact AX element.
+    // A projected icon must retain a verified window on the requested display.
+    guard activationFramesShareDisplay(
+        requested: requestedFrame, target: candidate.frame, displays: displays
+    ) else { return nil }
     AXUIElementSetMessagingTimeout(
         candidate.element,
         activationAXMessagingTimeout
@@ -2352,7 +2404,7 @@ private func confidentMenuWindow(
         width: request.width,
         height: request.height
     )
-    guard let targetDisplay = containingDisplay(
+    guard let targetDisplay = activationTargetDisplay(
         for: requestedFrame,
         in: displays
     ) else {
@@ -2366,13 +2418,17 @@ private func confidentMenuWindow(
         targetDisplay: targetDisplay,
         displays: displays
     )
-    guard let index = catalog.firstIndex(where: { item in
-        guard item.pid == candidate.pid else { return false }
+    let matchingIndices = catalog.indices.filter { index in
+        let item = catalog[index]
+        guard item.pid == candidate.pid,
+              item.bundleIdentifier == candidate.bundleIdentifier,
+              item.role == candidate.role else { return false }
         if let identifier = candidate.identifier {
             return item.identifier == identifier
         }
         return item.label.caseInsensitiveCompare(candidate.label) == .orderedSame
-    }) else {
+    }
+    guard matchingIndices.count == 1, let index = matchingIndices.first else {
         return nil
     }
     let strictMatches = confidentWindowMatches(
@@ -2421,7 +2477,7 @@ private func postMenuWindowClick(_ menuWindow: MenuWindow) -> Bool {
         )
         event.setIntegerValueField(.eventTargetUnixProcessID, value: hostPID)
         event.setIntegerValueField(.eventSourceUserData, value: userData)
-        event.setIntegerValueField(.mouseEventClickState, value: 1)
+        configurePlainMenuClick(event)
         event.setIntegerValueField(
             .mouseEventWindowUnderMousePointer,
             value: hostWindow
@@ -2987,6 +3043,99 @@ public func macnuActivateApplication() {
     }
 }
 
+private struct PinnedApplicationState: Codable {
+    let name: String
+    let bundleId: String
+    let image: String
+    let running: Bool
+    let installed: Bool
+}
+
+func validReopenBundleIdentifier(_ identifier: String) -> Bool {
+    !identifier.isEmpty && identifier.utf8.count <= 255
+        && identifier.contains(".") && !identifier.hasPrefix("com.apple.")
+        && identifier.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-").contains($0)
+        }
+}
+
+private func pinnedApplicationURL(_ identifier: String) -> URL? {
+    guard validReopenBundleIdentifier(identifier),
+          identifier != Bundle.main.bundleIdentifier,
+          let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier),
+          url.isFileURL, url.pathExtension == "app",
+          Bundle(url: url)?.bundleIdentifier == identifier else { return nil }
+    return url
+}
+
+@_cdecl("macnu_copy_pinned_apps_json")
+public func macnuCopyPinnedAppsJSON(_ requestJSON: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
+    guard let requestJSON,
+          let data = String(cString: requestJSON).data(using: .utf8),
+          let identifiers = try? JSONDecoder().decode([String].self, from: data) else { return nil }
+    let read = {
+        var states: [String: PinnedApplicationState] = [:]
+        for identifier in Set(identifiers) {
+            guard validReopenBundleIdentifier(identifier) else { continue }
+            let url = pinnedApplicationURL(identifier)
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+                .contains { !$0.isTerminated }
+            var imageURL = ""
+            if let url {
+                let icon = NSWorkspace.shared.icon(forFile: url.path)
+                var rect = CGRect(x: 0, y: 0, width: 64, height: 64)
+                if let image = icon.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+                   let context = CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8,
+                       bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    context.interpolationQuality = .high
+                    context.draw(image, in: rect)
+                    if let resized = context.makeImage() { imageURL = pngDataURL(from: resized) ?? "" }
+                }
+            }
+            states[identifier] = PinnedApplicationState(name: "", bundleId: identifier,
+                image: imageURL, running: running, installed: url != nil)
+        }
+        guard let encoded = try? JSONEncoder().encode(states),
+              let json = String(data: encoded, encoding: .utf8) else { return nil as UnsafeMutablePointer<CChar>? }
+        return strdup(json)
+    }
+    return Thread.isMainThread ? read() : DispatchQueue.main.sync(execute: read)
+}
+
+@_cdecl("macnu_reopen_pinned_app")
+public func macnuReopenPinnedApp(_ bundleID: UnsafePointer<CChar>?) -> Int32 {
+    // Rust invokes this on a blocking worker. Never wait on the AppKit main thread.
+    guard !Thread.isMainThread, let bundleID else { return 2 }
+    let identifier = String(cString: bundleID)
+    guard validReopenBundleIdentifier(identifier) else { return 2 }
+    let done = DispatchSemaphore(value: 0)
+    let resultLock = NSLock()
+    var result: Int32 = 2
+    DispatchQueue.main.async {
+        guard let url = pinnedApplicationURL(identifier) else {
+            resultLock.lock(); result = 1; resultLock.unlock()
+            done.signal()
+            return
+        }
+        if NSRunningApplication.runningApplications(withBundleIdentifier: identifier).contains(where: { !$0.isTerminated }) {
+            resultLock.lock(); result = 0; resultLock.unlock()
+            done.signal()
+            return
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.addsToRecentItems = false
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
+            resultLock.lock(); result = app != nil && error == nil ? 0 : 2; resultLock.unlock()
+            done.signal()
+        }
+    }
+    guard done.wait(timeout: .now() + 15) == .success else { return 2 }
+    resultLock.lock(); defer { resultLock.unlock() }
+    return result
+}
+
 @_cdecl("macnu_activate_menu_icon_json")
 public func macnuActivateMenuIconJSON(
     _ requestJSON: UnsafePointer<CChar>?
@@ -3007,6 +3156,11 @@ public func macnuActivateMenuIconJSON(
     }
 
     let displays = activeDisplayBounds()
+    let requestedFrame = CGRect(x: request.x, y: request.y,
+                                width: request.width, height: request.height)
+    guard activationTargetDisplay(for: requestedFrame, in: displays) != nil else {
+        return 1
+    }
 
     // The catalog refresh already performed the expensive all-item AX scan,
     // notch-safe matching, and ambiguity checks. Reuse that exact result on
@@ -3023,6 +3177,8 @@ public func macnuActivateMenuIconJSON(
             cachedCandidate: cachedTarget.candidate,
             liveCandidate: activationCandidate,
             displays: displays
+        ), activationFramesShareDisplay(
+            requested: requestedFrame, target: menuWindow.bounds, displays: displays
         ), postMenuWindowClick(menuWindow) {
             _ = waitForOpenedPopup(
                 since: baselineWindowIDs,
@@ -3048,7 +3204,9 @@ public func macnuActivateMenuIconJSON(
         if let activation = performAccessibilityAction(
             on: activationCandidate,
             preferredAction: request.activationAction,
-            baselineWindowIDs: baselineWindowIDs
+            baselineWindowIDs: baselineWindowIDs,
+            requestedFrame: requestedFrame,
+            displays: displays
         ) {
             rememberActivation(
                 menuWindow: nil,
@@ -3092,7 +3250,9 @@ public func macnuActivateMenuIconJSON(
     // catalog still produces the same unambiguous one-to-one match. A stale or
     // uncertain window ID is never clicked.
     if let menuWindow,
-       postMenuWindowClick(menuWindow) {
+       activationFramesShareDisplay(
+           requested: requestedFrame, target: menuWindow.bounds, displays: displays
+       ), postMenuWindowClick(menuWindow) {
         _ = waitForOpenedPopup(
             since: baselineWindowIDs,
             targetPID: activationCandidate.pid,
@@ -3126,7 +3286,9 @@ public func macnuActivateMenuIconJSON(
     if let activation = performAccessibilityAction(
         on: activationCandidate,
         preferredAction: request.activationAction,
-        baselineWindowIDs: baselineWindowIDs
+        baselineWindowIDs: baselineWindowIDs,
+        requestedFrame: requestedFrame,
+        displays: displays
     ) {
         rememberActivation(
             menuWindow: nil,

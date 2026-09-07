@@ -1,3 +1,4 @@
+import { menuStatus } from "./menu-hub";
 export type InstantCommandRankingMode = "smart" | "menuBar" | "alphabetical";
 
 export type LiveMenuItemView = {
@@ -192,7 +193,7 @@ export function stableSavedActionResultId(
 
 export function menuItemResultLabel(item: LiveMenuItemView): string {
   if (item.isMacnu) return "Macnu";
-  return trimmed(item.alias) || item.label;
+  return trimmed(item.alias) || (menuStatus(item.label, item.owner) ? item.owner : item.label);
 }
 
 export function savedActionResultLabel(action: SavedActionView): string {
@@ -213,6 +214,8 @@ function uniqueContext(parts: readonly string[], displayLabel: string): string[]
 export function menuItemResultContext(item: LiveMenuItemView): string | null {
   if (item.isMacnu) return null;
   const label = menuItemResultLabel(item);
+  const status = menuStatus(item.label, item.owner);
+  if (status) return uniqueContext([item.owner, status], label).join(" · ") || null;
   const parts = trimmed(item.alias)
     ? [item.label, item.owner]
     : [item.owner];

@@ -4,6 +4,230 @@ import XCTest
 @testable import MacnuNative
 
 final class CatalogTests: XCTestCase {
+    func testStalePositionCannotSelectAReplacementItem() {
+        let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
+        let replacement = candidate(label: "Different menu", frame: frame)
+        let result = resolvedAccessibilityCandidate(
+            pid: 100, bundleIdentifier: "example.status", identifier: nil,
+            label: "Original menu", frame: frame,
+            preferredAction: kAXPressAction as String, in: [replacement]
+        )
+        XCTAssertNil(result)
+    }
+
+    func testLabelResolutionAcceptsSmallMovesButRejectsAmbiguity() {
+        let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
+        let same = candidate(label: "Original menu", frame: frame.offsetBy(dx: 4, dy: 0))
+        let replacement = candidate(label: "Different menu", frame: frame)
+        let resolve: ([AccessibilityCandidate]) -> AccessibilityCandidate? = {
+            resolvedAccessibilityCandidate(
+                pid: 100, bundleIdentifier: "example.status", identifier: nil,
+                label: "Original menu", frame: frame,
+                preferredAction: kAXPressAction as String, in: $0
+            )
+        }
+        XCTAssertEqual(resolve([replacement, same])?.label, "Original menu")
+        XCTAssertNil(resolve([same, same]))
+        XCTAssertNil(resolve([candidate(pid: 999, label: "Original menu", frame: frame)]))
+        XCTAssertNil(resolve([candidate(bundle: "other.app", label: "Original menu", frame: frame)]))
+    }
+
+    func testIdentifierResolutionStillAllowsChangingStatusLabels() {
+        let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
+        let current = candidate(label: "CPU 76%", identifier: "stable-status", frame: frame)
+        let resolve: ([AccessibilityCandidate]) -> AccessibilityCandidate? = {
+            resolvedAccessibilityCandidate(
+                pid: 100, bundleIdentifier: "example.status", identifier: "stable-status",
+                label: "CPU 18%", frame: frame,
+                preferredAction: kAXPressAction as String, in: $0
+            )
+        }
+        XCTAssertEqual(resolve([current])?.label, "CPU 76%")
+        XCTAssertNil(resolve([current, current]))
+        XCTAssertNil(resolve([candidate(label: "CPU 18%", identifier: "other", frame: frame)]))
+    }
+
+    func testCachedLabelTargetsRejectReplacementAndChangedRole() {
+        let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
+        let original = candidate(label: "Original menu", frame: frame)
+        XCTAssertTrue(cachedCandidateIdentityMatches(
+            original, live: candidate(label: "Original menu", frame: frame.offsetBy(dx: 4, dy: 0))
+        ))
+        for changed in [
+            candidate(label: "Replacement", frame: frame),
+            candidate(label: "", frame: frame),
+            candidate(pid: 999, label: "Original menu", frame: frame),
+            candidate(bundle: "other.app", label: "Original menu", frame: frame),
+            candidate(label: "Original menu", role: kAXStaticTextRole as String, frame: frame)
+        ] {
+            XCTAssertFalse(cachedCandidateIdentityMatches(original, live: changed))
+        }
+        let stable = candidate(label: "CPU 18%", identifier: "stable", frame: frame)
+        XCTAssertTrue(cachedCandidateIdentityMatches(
+            stable, live: candidate(label: "CPU 76%", identifier: "stable", frame: frame)
+        ))
+        XCTAssertFalse(cachedCandidateIdentityMatches(
+            stable, live: candidate(label: "CPU 18%", identifier: "replacement", frame: frame)
+        ))
+    }
+
+    func testFallbackNeverCrossesDisplaysIncludingNegativeCoordinates() {
+        let monitors = [
+            display,
+            display.offsetBy(dx: -1440, dy: 0),
+            display.offsetBy(dx: 1440, dy: 0),
+            display.offsetBy(dx: 0, dy: -900)
+        ]
+        for requestedDisplay in monitors {
+            let requested = CGRect(x: requestedDisplay.minX + 100,
+                                   y: requestedDisplay.minY, width: 24, height: 24)
+            for candidateDisplay in monitors {
+                let target = CGRect(x: candidateDisplay.minX + 120,
+                                    y: candidateDisplay.minY, width: 24, height: 24)
+                XCTAssertEqual(activationFramesShareDisplay(
+                    requested: requested, target: target, displays: monitors
+                ), requestedDisplay == candidateDisplay)
+            }
+        }
+    }
+
+    func testDisconnectedAndInvalidDisplayTargetsFailClosed() {
+        let local = CGRect(x: 1200, y: 0, width: 24, height: 24)
+        let disconnected = local.offsetBy(dx: 1440, dy: 0)
+        XCTAssertFalse(activationFramesShareDisplay(
+            requested: disconnected, target: local, displays: [display]
+        ))
+        XCTAssertFalse(activationFramesShareDisplay(
+            requested: local, target: disconnected, displays: [display]
+        ))
+        XCTAssertFalse(activationFramesShareDisplay(
+            requested: local, target: local, displays: []
+        ))
+        for invalid in [CGRect.zero, CGRect.infinite, CGRect.null] {
+            XCTAssertNil(activationTargetDisplay(for: invalid, in: [display]))
+        }
+    }
+
+    func testActivationWindowConflictsAreRejectedOnEveryDisplayType() {
+        let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
+        let window = MenuWindow(id: 42, pid: 100, owner: "Host",
+                                bounds: frame, isOnScreen: true)
+        let icons = [candidate(pid: 101, frame: frame),
+                     candidate(pid: 202, frame: frame)]
+        for notch in [false, true] {
+            for strict: [Int: MenuWindow] in [[:], [0: window]] {
+                let matches = activationWindowMatches(
+                    windows: [window], candidates: icons, targetDisplay: display,
+                    displays: [display], strictMatches: strict,
+                    hasTopSafeArea: { _ in notch }, hitWindow: { _, _ in 42 }
+                )
+                XCTAssertTrue(matches.isEmpty, "Conflicting target accepted, notch=\(notch)")
+            }
+        }
+    }
+
+    func testAmbiguousStrictMatchesAreFilteredEvenWithoutDiscoveryResults() {
+        let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
+        let duplicate = MenuWindow(id: 42, pid: 100, owner: "Host",
+                                   bounds: frame, isOnScreen: true)
+        let unique = MenuWindow(id: 43, pid: 100, owner: "Host",
+                                bounds: frame.offsetBy(dx: 40, dy: 0), isOnScreen: true)
+        let matches = activationWindowMatches(
+            windows: [], candidates: [], targetDisplay: display, displays: [display],
+            strictMatches: [0: duplicate, 1: duplicate, 2: unique],
+            hasTopSafeArea: { _ in XCTFail("Empty input should not query the display"); return false },
+            hitWindow: { _, _ in XCTFail("Empty input should not hit-test"); return nil }
+        )
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(matches[2]?.id, 43)
+    }
+
+    func testUniqueActivationWindowsRemainAvailableOnEveryDisplayType() {
+        let frames = [CGRect(x: 1200, y: 0, width: 24, height: 24),
+                      CGRect(x: 1240, y: 0, width: 24, height: 24)]
+        let windows = frames.enumerated().map {
+            MenuWindow(id: CGWindowID($0.offset + 42), pid: 100, owner: "Host",
+                       bounds: $0.element, isOnScreen: true)
+        }
+        for notch in [false, true] {
+            let matches = activationWindowMatches(
+                windows: windows, candidates: frames.map { candidate(frame: $0) },
+                targetDisplay: display, displays: [display], strictMatches: [:],
+                hasTopSafeArea: { _ in notch },
+                hitWindow: { point, _ in windows.first { $0.bounds.contains(point) }?.id }
+            )
+            XCTAssertEqual(matches[0]?.id, 42)
+            XCTAssertEqual(matches[1]?.id, 43)
+        }
+    }
+
+    func testHiddenNotchGeometryRequiresOneUniqueCandidate() {
+        let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
+        let window = MenuWindow(id: 42, pid: 100, owner: "Host",
+                                bounds: frame, isOnScreen: false)
+        for notch in [false, true] {
+            for count in [1, 2] {
+                let matches = activationWindowMatches(
+                    windows: [window],
+                    candidates: (0..<count).map { candidate(pid: pid_t(100 + $0), frame: frame) },
+                    targetDisplay: display, displays: [display], strictMatches: [:],
+                    hasTopSafeArea: { _ in notch }, hitWindow: { _, _ in nil }
+                )
+                XCTAssertEqual(matches.count, notch && count == 1 ? 1 : 0)
+            }
+        }
+    }
+
+    func testMenuClicksClearShortcutModifiersWithoutChangingTheirTarget() throws {
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            let event = try XCTUnwrap(CGEvent(
+                mouseEventSource: nil,
+                mouseType: type,
+                mouseCursorPosition: CGPoint(x: 1200, y: 12),
+                mouseButton: .left
+            ))
+            event.flags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
+            event.setIntegerValueField(.eventTargetUnixProcessID, value: 123)
+            event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: 456)
+            event.setIntegerValueField(.mouseEventClickState, value: 2)
+            configurePlainMenuClick(event)
+            XCTAssertTrue(event.flags.isEmpty)
+            XCTAssertEqual(event.type, type)
+            XCTAssertEqual(event.location, CGPoint(x: 1200, y: 12))
+            XCTAssertEqual(event.getIntegerValueField(.eventTargetUnixProcessID), 123)
+            XCTAssertEqual(event.getIntegerValueField(.mouseEventWindowUnderMousePointer), 456)
+            XCTAssertEqual(event.getIntegerValueField(.mouseEventClickState), 1)
+        }
+    }
+
+    func testMissingPinnedApplicationLookupDoesNotInventState() throws {
+        let identifier = "com.macnu.tests.definitely-not-installed"
+        let json = "[\"\(identifier)\"]"
+        let pointer = try XCTUnwrap(json.withCString { macnuCopyPinnedAppsJSON($0) })
+        defer { free(pointer) }
+        let data = try XCTUnwrap(String(cString: pointer).data(using: .utf8))
+        let states = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: [String: Any]])
+        XCTAssertEqual(states[identifier]?["installed"] as? Bool, false)
+        XCTAssertEqual(states[identifier]?["running"] as? Bool, false)
+        XCTAssertEqual(states[identifier]?["image"] as? String, "")
+    }
+
+    func testReopeningMissingApplicationReturnsRecoverableFailure() {
+        let finished = expectation(description: "Missing app is rejected")
+        DispatchQueue.global().async {
+            let result = "com.macnu.tests.definitely-not-installed".withCString { macnuReopenPinnedApp($0) }
+            XCTAssertEqual(result, 1)
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 20)
+    }
+    func testReopenIdentifiersRejectSystemAppsPathsAndCommands() {
+        XCTAssertTrue(validReopenBundleIdentifier("com.example.Status-App"))
+        for invalid in ["", "App", "com.apple.controlcenter", "/Applications/App.app",
+                        "com.app;open", "com.app\n", "com.app/other"] {
+            XCTAssertFalse(validReopenBundleIdentifier(invalid), invalid)
+        }
+    }
     private let element = AXUIElementCreateSystemWide()
     private let display = CGRect(x: 0, y: 0, width: 1440, height: 900)
 

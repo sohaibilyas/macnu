@@ -15,11 +15,26 @@ import {
 } from "./palette-behavior";
 import {
   buildPaletteResults,
+  menuItemResultLabel,
   type PaletteResult,
   type SavedActionView,
 } from "./instant-commands";
 import { friendlyPinActionError } from "./saved-command-errors";
 import "./styles.css";
+import { supportsDirectShortcut } from "./shortcut-identity";
+import { gridSelection, parsePaletteLayout, type PaletteLayout } from "./menu-hub";
+
+const LAYOUT_STORAGE_KEY = "macnu.layout";
+function storedLayout(): PaletteLayout {
+  try { return parsePaletteLayout(localStorage.getItem(LAYOUT_STORAGE_KEY)); }
+  catch { return "list"; }
+}
+let paletteLayout = storedLayout();
+function saveLayout(layout: PaletteLayout): void {
+  paletteLayout = layout;
+  try { localStorage.setItem(LAYOUT_STORAGE_KEY, layout); } catch { /* Session-only fallback. */ }
+  window.dispatchEvent(new Event("palette-layout-changed"));
+}
 
 type Appearance = "system" | "light" | "dark";
 
@@ -60,9 +75,16 @@ function saveAppearance(appearance: Appearance): void {
 applyAppearance();
 window.addEventListener("storage", ({ key }) => {
   if (key === APPEARANCE_STORAGE_KEY) applyAppearance();
+  if (key === LAYOUT_STORAGE_KEY) {
+    paletteLayout = storedLayout();
+    window.dispatchEvent(new Event("palette-layout-changed"));
+  }
 });
 
 type MenuIcon = {
+  savedApp?: boolean;
+  appRunning?: boolean;
+  appInstalled?: boolean;
   windowId: number;
   owner: string;
   label: string;
@@ -137,6 +159,7 @@ type ItemCustomization = {
 };
 
 type CatalogCustomizationsResponse = {
+  pinnedApps?: Record<string, { name: string; bundleId: string; image: string; running: boolean; installed: boolean }>;
   rankingMode: RankingMode;
   personalizePerDisplay: boolean;
   displayKey: string;
@@ -401,6 +424,16 @@ async function initSettings(): Promise<void> {
                     <button data-appearance="system" aria-pressed="true">System</button>
                     <button data-appearance="light" aria-pressed="false">Light</button>
                     <button data-appearance="dark" aria-pressed="false">Dark</button>
+                  </div>
+                </div>
+                <div class="setting-row compact-setting-row">
+                  <div class="setting-label">
+                    <strong>Menu layout</strong>
+                    <small>Browse icons in a list or a compact grid.</small>
+                  </div>
+                  <div class="appearance-picker" role="group" aria-label="Menu layout">
+                    <button data-layout="list" aria-pressed="true">List</button>
+                    <button data-layout="grid" aria-pressed="false">Grid</button>
                   </div>
                 </div>
                 <div class="setting-row compact-setting-row shortcut-row">
@@ -793,6 +826,9 @@ async function initSettings(): Promise<void> {
   }
 
   function updateAppearanceControls(): void {
+    app.querySelectorAll<HTMLButtonElement>("[data-layout]").forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.layout === paletteLayout));
+    });
     const appearance = storedAppearance();
     app.querySelectorAll<HTMLButtonElement>("[data-appearance]").forEach((button) => {
       button.setAttribute("aria-pressed", String(button.dataset.appearance === appearance));
@@ -1859,6 +1895,12 @@ async function initSettings(): Promise<void> {
     // The selected theme also lives on <html data-appearance="…">. Keep
     // delegated clicks scoped to the picker buttons so a click elsewhere in
     // Settings cannot mistake the document root for an appearance control.
+    const layout = target.closest<HTMLButtonElement>("button[data-layout]");
+    if (layout) {
+      saveLayout(parsePaletteLayout(layout.dataset.layout ?? null));
+      updateAppearanceControls();
+      return;
+    }
     const appearance = target.closest<HTMLButtonElement>("button[data-appearance]");
     if (appearance) {
       saveAppearance(appearance.dataset.appearance as Appearance);
@@ -2087,6 +2129,7 @@ let actionRunError: string | null = null;
 let actionPinError: string | null = null;
 let actionPinSaving = false;
 let itemPinSavingId: string | null = null;
+let launchingItemId: string | null = null;
 let itemPinError: string | null = null;
 let pendingActionUnpinId: string | null = null;
 let paletteRankingMode: RankingMode = "smart";
@@ -2158,19 +2201,10 @@ void currentWindow.listen<string>("shortcut-changed", ({ payload }) => {
   applyShortcutDisplay(payload);
 });
 
-const DIRECT_SHORTCUT_ITEM_PREFIX = "v1.item-identifier.";
-
 function stableItemId(icon: MenuIcon): string | null {
   if (icon.isMacnu || typeof icon.itemId !== "string") return null;
   const itemId = icon.itemId.trim();
   return itemId ? itemId : null;
-}
-
-function supportsDirectShortcut(itemId: string): boolean {
-  return (
-    itemId.startsWith(DIRECT_SHORTCUT_ITEM_PREFIX) &&
-    itemId.length > DIRECT_SHORTCUT_ITEM_PREFIX.length
-  );
 }
 
 function responseContainsItem(
@@ -2179,9 +2213,9 @@ function responseContainsItem(
 ): boolean {
   return Boolean(
     current &&
-    current.icons.some(
+    (current.icons.some(
       (icon) => stableItemId(icon) === itemId,
-    ),
+    ) || (customizations?.displayKey === current.displayKey && customizations?.pinnedApps?.[itemId])),
   );
 }
 
@@ -2222,12 +2256,23 @@ function customizationFor(icon: MenuIcon): ItemCustomization | undefined {
 
 function displayLabel(icon: MenuIcon): string {
   if (icon.isMacnu) return "Macnu";
-  return customizationFor(icon)?.alias?.trim() || icon.label;
+  return menuItemResultLabel({ ...icon, alias: customizationFor(icon)?.alias });
 }
 
 function paletteLiveItems(): PaletteMenuIcon[] {
   const catalogReady = customizations?.displayKey === response?.displayKey;
-  return (response?.icons ?? []).map((icon, nativeOrder) => {
+  const icons = [...(response?.icons ?? [])];
+  if (catalogReady) {
+    for (const [itemId, saved] of Object.entries(customizations?.pinnedApps ?? {})) {
+      if (!customizations?.items[itemId]?.favorite || icons.some((icon) => icon.itemId === itemId)) continue;
+      icons.push({
+        itemId, displayKey: response?.displayKey, owner: saved.name, label: saved.name,
+        image: saved.image || "", windowId: 0, x: 0, y: 0, width: 0, height: 0,
+        isMacnu: false, savedApp: true, appRunning: saved.running, appInstalled: saved.installed,
+      });
+    }
+  }
+  return icons.map((icon, nativeOrder) => {
     const customization = catalogReady ? customizationFor(icon) : undefined;
     return {
       ...icon,
@@ -2282,6 +2327,12 @@ function preserveSelectedIdentity(): void {
   const selected = visiblePaletteResults()[selectedIndex];
   if (selected) selectedItemIdentity = selected.id;
 }
+
+window.addEventListener("palette-layout-changed", () => {
+  preserveSelectedIdentity();
+  render();
+  updateSelection(selectedIndex);
+});
 
 function renderPreservingScroll(): void {
   const scrollTop = results.scrollTop;
@@ -2786,6 +2837,9 @@ function actionContext(action: MenuAction): string {
 
 function updatePaletteChrome(): void {
   const scoped = actionScope !== null;
+  const navigationKeys = app.querySelector(".footer-navigation .footer-key-cluster");
+  if (navigationKeys) navigationKeys.innerHTML = paletteLayout === "grid" && !scoped
+    ? "<kbd>↑↓</kbd><kbd>←→</kbd>" : "<kbd>↑</kbd><kbd>↓</kbd>";
   const selectedRoot = scoped ? null : selectedPaletteResult();
   const selectedAction = scoped ? visibleActions()[selectedIndex] : null;
   const selectedRootPinnable = Boolean(
@@ -2842,7 +2896,7 @@ function updatePaletteChrome(): void {
         footerKeyGroup("⌘P", selectedRootPinned ? "unpin" : "pin"),
       );
     }
-    secondaryGroups.push(footerKeyGroup("tab", "actions"));
+    if (!resultParent(selectedRoot).savedApp) secondaryGroups.push(footerKeyGroup("tab", "actions"));
     if (selectedRoot.kind === "item" && selectedRoot.itemId) {
       secondaryGroups.push(footerKeyGroup("⌘E", "edit"));
     }
@@ -3089,7 +3143,7 @@ function customizationEditorMarkup(
     : `
         <div class="item-shortcut-field unavailable">
           <span>Direct shortcut</span>
-          <small>Unavailable because macOS does not provide a permanent identity for this menu-bar item.</small>
+          <small>Macnu can’t tell this item apart reliably. Refresh Macnu and try again.</small>
         </div>
       `;
 
@@ -3184,7 +3238,7 @@ function savedActionEditorMarkup(
     : `
         <div class="item-shortcut-field unavailable">
           <span>Direct shortcut</span>
-          <small>This app does not provide a permanent identity for this command.</small>
+          <small>Macnu can’t tell this item apart reliably. Refresh Macnu and try again.</small>
         </div>
       `;
   return `
@@ -3232,6 +3286,7 @@ function savedActionEditorMarkup(
 }
 
 function render(): void {
+  results.classList.toggle("icon-grid", paletteLayout === "grid" && !actionScope && !customizationDraft && !savedActionDraft && !itemShortcutError && !savedActionError);
   updatePaletteChrome();
   if (actionScope) {
     renderActions();
@@ -3410,7 +3465,9 @@ function render(): void {
         const resultLabel = entry.kind === "item"
           ? paletteResultLabel(icon.isMacnu, entry.label)
           : entry.label;
-        const context = icon.isMacnu ? null : entry.context;
+        const context = icon.savedApp
+          ? launchingItemId === itemId ? "Opening…" : !icon.appInstalled ? "Not installed" : icon.appRunning ? "Menu unavailable" : "Not running"
+          : icon.isMacnu ? null : entry.context;
         const itemPinButton =
           entry.kind === "item" && itemId && !icon.isMacnu
             ? `
@@ -3429,7 +3486,7 @@ function render(): void {
             : "";
         return `
         <div
-          class="result-row ${entry.kind === "action" ? "saved-action-result-row" : ""} ${index === selectedIndex ? "selected" : ""} ${itemId || entry.kind === "action" ? "" : "no-customization"} ${itemPinButton ? "has-pin" : ""}"
+          class="result-row ${icon.savedApp ? "saved-app-row" : ""} ${entry.kind === "action" ? "saved-action-result-row" : ""} ${index === selectedIndex ? "selected" : ""} ${itemId || entry.kind === "action" ? "" : "no-customization"} ${itemPinButton ? "has-pin" : ""}"
           data-result-row
           data-index="${index}"
           data-result-id="${escapeHtml(entry.id)}"
@@ -3437,6 +3494,7 @@ function render(): void {
           <button
             type="button"
             class="result menu-result ${personalizationTail ? "has-tail" : ""} ${entry.kind === "action" ? "saved-action-result" : ""} ${index === selectedIndex ? "selected" : ""}"
+            title="${escapeHtml(`${resultLabel}${context ? ` — ${context}` : ""}`)}"
             data-index="${index}"
             tabindex="-1"
             aria-label="${escapeHtml(
@@ -3446,7 +3504,7 @@ function render(): void {
             )}"
           >
             <span class="icon-frame">
-              <img src="${icon.image}" alt="" draggable="false" />
+              ${icon.image ? `<img src="${icon.image}" alt="" draggable="false" />` : '<span aria-hidden="true">◇</span>'}
             </span>
             <span class="result-copy">
               <strong>${escapeHtml(resultLabel)}</strong>
@@ -3571,6 +3629,9 @@ function applyResponse(next: MenuResponse | null): void {
   ) {
     resetCustomizationState();
   }
+  if (next?.displayKey && customizations?.displayKey === next.displayKey) {
+    void loadCustomizations(next.displayKey);
+  }
   render();
 }
 
@@ -3591,6 +3652,7 @@ async function refreshIcons(
   try {
     next = await invoke<MenuResponse>("list_menu_icons", { force });
     applyResponse(next);
+    if (force && next.displayKey) await loadCustomizations(next.displayKey);
   } catch (error) {
     next = {
       icons: [],
@@ -3748,6 +3810,7 @@ async function openActionScope(
   icon: MenuIcon,
   force = false,
 ): Promise<void> {
+  if (icon.savedApp) return;
   if (icon.isMacnu) {
     await invoke("open_settings");
     return;
@@ -3821,6 +3884,48 @@ async function activateScopedAction(action: MenuAction): Promise<void> {
 }
 
 async function activate(icon: MenuIcon): Promise<void> {
+  if (icon.savedApp) {
+    if (launchingItemId || !icon.itemId || !response) return;
+    const itemId = icon.itemId;
+    const displayKey = response.displayKey;
+    const generation = blurDismissGeneration;
+    const query = input.value;
+    launchingItemId = itemId;
+    itemPinError = null;
+    renderPreservingScroll();
+    const stillSelected = () => {
+      const selected = selectedPaletteResult();
+      return generation === blurDismissGeneration
+        && !actionScope && !customizationDraft && !savedActionDraft
+        && input.value === query && response?.displayKey === displayKey
+        && selected?.kind === "item" && selected.item.itemId === itemId;
+    };
+    try {
+      await invoke("reopen_pinned_app", { itemId, displayKey });
+      for (let attempt = 0; attempt < 6; attempt++) {
+        await new Promise((resolve) => window.setTimeout(resolve, 600));
+        if (!stillSelected() || !await currentWindow.isVisible()) return;
+        await refreshIcons(false, true);
+        const live = response?.icons.find((candidate) => candidate.itemId === itemId);
+        if (live) {
+          if (stillSelected() && await currentWindow.isVisible() && stillSelected()) {
+            await activate(live);
+          }
+          return;
+        }
+      }
+      if (stillSelected()) itemPinError = `${icon.owner} opened, but its menu isn’t available yet. Try Refresh in a moment.`;
+    } catch (error) {
+      if (stillSelected()) itemPinError = String(error);
+    } finally {
+      launchingItemId = null;
+      if (generation === blurDismissGeneration) {
+        if (response) await loadCustomizations(response.displayKey);
+        renderPreservingScroll();
+      }
+    }
+    return;
+  }
   await currentWindow.hide();
   try {
     await invoke("activate_menu_icon", { icon });
@@ -4018,6 +4123,12 @@ input.addEventListener("keydown", (event) => {
       event.stopPropagation();
       openCustomization(selected.item);
     }
+  } else if (!actionScope && paletteLayout === "grid" && ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+    event.preventDefault();
+    event.stopPropagation();
+    pointerSelectionArmed = false;
+    const columns = getComputedStyle(results).gridTemplateColumns.split(" ").length;
+    updateSelection(gridSelection(selectedIndex, event.key, visiblePaletteResults().length, columns), true);
   } else if (event.key === "ArrowDown") {
     event.preventDefault();
     event.stopPropagation();
@@ -4418,6 +4529,7 @@ results.addEventListener("click", (event) => {
   const item = target.closest<HTMLButtonElement>(".result");
   if (item) {
     const index = Number(item.dataset.index);
+    updateSelection(index, false, false);
     if (actionScope) {
       const action = visibleActions()[index];
       if (action) void activateScopedAction(action);
