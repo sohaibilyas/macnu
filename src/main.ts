@@ -112,6 +112,7 @@ type MenuResponse = {
   displayKey: string;
   screenCaptureDenied: boolean;
   accessibilityDenied: boolean;
+  geometryPending?: boolean;
   error: string | null;
 };
 
@@ -2136,6 +2137,11 @@ let paletteRankingMode: RankingMode = "smart";
 let palettePersonalizePerDisplay = true;
 let customizations: CatalogCustomizationsResponse | null = null;
 let customizationRequest = 0;
+let pendingCustomizations: {
+  displayKey: string;
+  request: number;
+  promise: Promise<void>;
+} | null = null;
 let rankingNow = Date.now();
 let selectedItemIdentity: string | null = null;
 let customizationDraft: {
@@ -2345,6 +2351,8 @@ function applyCustomizations(
   preferredSelection: string | null = null,
 ): void {
   if (!response || next.displayKey !== response.displayKey) return;
+  // A saved edit or event supersedes any older in-flight read.
+  customizationRequest += 1;
   preserveSelectedIdentity();
   if (preferredSelection) selectedItemIdentity = preferredSelection;
   customizations = next;
@@ -2354,26 +2362,38 @@ function applyCustomizations(
   renderPreservingScroll();
 }
 
-async function loadCustomizations(displayKey: string): Promise<void> {
+function loadCustomizations(displayKey: string): Promise<void> {
   if (!displayKey) {
+    customizationRequest += 1;
     customizations = null;
     render();
-    return;
+    return Promise.resolve();
+  }
+  if (
+    pendingCustomizations?.displayKey === displayKey &&
+    pendingCustomizations.request === customizationRequest
+  ) {
+    return pendingCustomizations.promise;
   }
   const request = ++customizationRequest;
-  try {
-    const next = await invoke<CatalogCustomizationsResponse>(
-      "get_catalog_customizations",
-      { displayKey },
-    );
-    if (request !== customizationRequest) return;
-    applyCustomizations(next);
-  } catch (error) {
-    if (request !== customizationRequest) return;
-    customizations = null;
-    console.error("Could not load local personalization.", error);
-    render();
-  }
+  const promise = (async () => {
+    try {
+      const next = await invoke<CatalogCustomizationsResponse>(
+        "get_catalog_customizations", { displayKey },
+      );
+      if (request !== customizationRequest) return;
+      applyCustomizations(next);
+    } catch (error) {
+      if (request !== customizationRequest) return;
+      customizations = null;
+      console.error("Could not load local personalization.", error);
+      render();
+    } finally {
+      if (pendingCustomizations?.request === request) pendingCustomizations = null;
+    }
+  })();
+  pendingCustomizations = { displayKey, request, promise };
+  return promise;
 }
 
 function openCustomization(icon: MenuIcon): void {
@@ -3563,6 +3583,7 @@ function responsesEqual(
     left.displayKey !== right.displayKey ||
     left.screenCaptureDenied !== right.screenCaptureDenied ||
     left.accessibilityDenied !== right.accessibilityDenied ||
+    left.geometryPending !== right.geometryPending ||
     left.error !== right.error ||
     left.icons.length !== right.icons.length
   ) {
@@ -3595,7 +3616,25 @@ function responsesEqual(
   });
 }
 
-function applyResponse(next: MenuResponse | null): void {
+function customizationCatalogChanged(
+  previous: MenuResponse | null,
+  next: MenuResponse,
+): boolean {
+  if (
+    !previous || previous.displayKey !== next.displayKey ||
+    previous.icons.length !== next.icons.length
+  ) return true;
+  const identities = (catalog: MenuResponse) => catalog.icons
+    .map((icon) => JSON.stringify([icon.itemId, icon.owner, icon.activationBundleId]))
+    .sort();
+  const before = identities(previous);
+  return identities(next).some((identity, index) => identity !== before[index]);
+}
+
+function applyResponse(
+  next: MenuResponse | null,
+  reloadCustomizations = false,
+): void {
   if (
     next &&
     activeDisplayId !== null &&
@@ -3606,13 +3645,15 @@ function applyResponse(next: MenuResponse | null): void {
   if (responsesEqual(response, next)) {
     if (
       next?.displayKey &&
-      customizations?.displayKey !== next.displayKey
+      (reloadCustomizations || customizations?.displayKey !== next.displayKey)
     ) {
       void loadCustomizations(next.displayKey);
     }
     return;
   }
   itemPinError = null;
+  const catalogChanged = next !== null && customizationCatalogChanged(response, next);
+  if (catalogChanged) customizationRequest += 1;
   preserveSelectedIdentity();
   response = next;
   if (!next) {
@@ -3629,7 +3670,10 @@ function applyResponse(next: MenuResponse | null): void {
   ) {
     resetCustomizationState();
   }
-  if (next?.displayKey && customizations?.displayKey === next.displayKey) {
+  if (
+    next?.displayKey && customizations?.displayKey === next.displayKey &&
+    (catalogChanged || reloadCustomizations)
+  ) {
     void loadCustomizations(next.displayKey);
   }
   render();
@@ -3651,8 +3695,7 @@ async function refreshIcons(
 
   try {
     next = await invoke<MenuResponse>("list_menu_icons", { force });
-    applyResponse(next);
-    if (force && next.displayKey) await loadCustomizations(next.displayKey);
+    applyResponse(next, force);
   } catch (error) {
     next = {
       icons: [],
@@ -3690,12 +3733,15 @@ async function openPalette(generation: number): Promise<void> {
     );
     if (generation !== blurDismissGeneration) return;
     activeDisplayId = snapshot.displayId;
-    if (snapshot.response && !snapshot.stale) {
+    if (snapshot.response) {
       applyResponse(snapshot.response);
       updateSelection(0);
     } else {
       applyResponse(null);
-      void refreshIcons(true);
+    }
+    if (!snapshot.response || snapshot.stale) {
+      // Updating an existing catalog must not re-prompt optional permissions.
+      void refreshIcons(!snapshot.response);
     }
   } catch {
     if (generation !== blurDismissGeneration) return;
@@ -4600,6 +4646,25 @@ void currentWindow.listen("palette-opened", () => {
   void openPalette(generation);
   armBlurDismissAfterDelay(generation);
 });
+
+void currentWindow.listen("palette-display-settled", () => {
+  void recheckPaletteDisplay(blurDismissGeneration);
+});
+
+async function recheckPaletteDisplay(generation: number): Promise<void> {
+  // Check once after focus settles. Refresh on an actual cache invalidation,
+  // not repeatedly just because an app keeps reporting another display's AX geometry.
+  if (generation !== blurDismissGeneration || actionScope) return;
+  try {
+    const snapshot = await invoke<ActiveDisplayCache>("active_display_menu_icons");
+    if (generation !== blurDismissGeneration || actionScope) return;
+    if (snapshot.displayId !== activeDisplayId) return;
+    if (snapshot.response) applyResponse(snapshot.response);
+    if (!snapshot.response || snapshot.stale) await refreshIcons(false);
+  } catch {
+    return;
+  }
+}
 
 void currentWindow.listen<MenuResponse>("menu-cache-updated", ({ payload }) => {
   if (actionScope || itemShortcutError || savedActionError) return;

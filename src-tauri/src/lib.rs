@@ -156,6 +156,8 @@ struct MenuResponse {
     display_key: String,
     screen_capture_denied: bool,
     accessibility_denied: bool,
+    #[serde(default)]
+    geometry_pending: bool,
     error: Option<String>,
 }
 
@@ -164,6 +166,14 @@ struct MenuCacheEntry {
     response: MenuResponse,
     refreshed_at: Instant,
     menu_signature: u64,
+}
+
+impl MenuCacheEntry {
+    fn is_fresh(&self, menu_signature: u64) -> bool {
+        // Geometry uncertainty is not a change notification. Keep a stable
+        // catalog warm; native activation still validates the live target.
+        self.menu_signature == menu_signature && self.refreshed_at.elapsed() < MENU_CACHE_FRESHNESS
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1776,8 +1786,8 @@ fn fresh_cached_menu_icons(
         .map_err(|_| "The menu cache is unavailable.".to_string())
         .map(|responses| {
             responses.get(&display_id).and_then(|entry| {
-                (entry.menu_signature == menu_signature
-                    && entry.refreshed_at.elapsed() < MENU_CACHE_FRESHNESS)
+                entry
+                    .is_fresh(menu_signature)
                     .then(|| entry.response.clone())
             })
         })
@@ -1859,13 +1869,17 @@ fn refresh_menu_cache(cache: &MenuCache, force: bool) -> Result<CacheRefresh, St
             .clear();
         return Err(error);
     }
-    let menu_signature = unsafe { macnu_active_menu_signature(response.display_id) };
+    // Do not stamp pre-switch AX data with a post-switch window signature.
+    // Keep the scan's starting signature; a transition makes it stale at once.
+    let final_signature = unsafe { macnu_active_menu_signature(response.display_id) };
+    response.geometry_pending |=
+        response.display_id != display_id || final_signature != menu_signature;
     let mut changed = true;
 
     // Accessibility provides the catalog identity and activation target.
     // Screen Recording only enriches entries with captured artwork, so a
     // successful AX catalog remains useful and should stay warm without it.
-    if response_is_cacheable(&response) {
+    if response_is_cacheable(&response) && response.display_id == display_id {
         let mut responses = cache
             .responses
             .lock()
@@ -1928,10 +1942,7 @@ fn active_display_menu_icons(
             let entry = responses.get(&display_id);
             (
                 entry.map(|cached| cached.response.clone()),
-                entry.is_some_and(|cached| {
-                    cached.menu_signature != menu_signature
-                        || cached.refreshed_at.elapsed() >= MENU_CACHE_FRESHNESS
-                }),
+                entry.is_some_and(|cached| !cached.is_fresh(menu_signature)),
             )
         })?;
     Ok(ActiveDisplayCache {
@@ -2457,10 +2468,6 @@ fn valid_item_id(item_id: &str) -> bool {
 fn valid_item_shortcut_id(item_id: &str) -> bool {
     valid_versioned_key(item_id, "item-identifier", 2, 512)
         || valid_versioned_key(item_id, "item-label-role", 3, 512)
-}
-
-fn shortcut_requires_fresh_catalog(item_id: &str) -> bool {
-    valid_versioned_key(item_id, "item-label-role", 3, 512)
 }
 
 fn valid_display_key(display_key: &str) -> bool {
@@ -4355,11 +4362,9 @@ fn catalog_icon_for_item(
     item_id: &str,
     force: bool,
 ) -> Result<Option<MenuIcon>, String> {
-    // Label/role identities are safe only while the current menu exposes one
-    // exact match. Re-scan before execution; never infer a target from its
-    // position, app alone, or a stale label.
-    let response =
-        refresh_menu_cache(cache, force || shortcut_requires_fresh_catalog(item_id))?.response;
+    // Native activation revalidates the selected app's live identity and
+    // ambiguity. A warm shortcut does not need an all-app catalog scan.
+    let response = refresh_menu_cache(cache, force)?.response;
     Ok(unique_shortcut_icon(response.icons, item_id))
 }
 
@@ -4781,6 +4786,8 @@ fn toggle_palette(app: &tauri::AppHandle) {
                 macnu_activate_application();
             }
             let _ = refocus_window.set_focus();
+            // macOS may move menu extras only after this focus transition.
+            let _ = refocus_window.emit("palette-display-settled", ());
         }
     });
 }
@@ -5147,10 +5154,6 @@ mod tests {
             ),
             GlobalShortcutRoute::SavedAction(action_id)
         );
-        assert!(shortcut_requires_fresh_catalog(&parent));
-        assert!(!shortcut_requires_fresh_catalog(
-            "v1.item-identifier.YXBw.aWNvbg"
-        ));
     }
 
     #[test]
@@ -5320,6 +5323,7 @@ mod tests {
             display_key: "v1.display-uuid.dGVzdA".to_string(),
             screen_capture_denied: false,
             accessibility_denied: false,
+            geometry_pending: false,
             error: None,
         }
     }
@@ -7180,6 +7184,53 @@ mod tests {
         );
 
         assert!(fresh_cached_menu_icons(&cache, 7, 100).unwrap().is_none());
+    }
+
+    #[test]
+    fn stable_pending_monitor_geometry_does_not_trigger_repeated_scans() {
+        let cache = MenuCache::default();
+        let mut pending = response();
+        pending.geometry_pending = true;
+        cache.responses.lock().unwrap().insert(
+            7,
+            MenuCacheEntry {
+                response: pending,
+                refreshed_at: Instant::now(),
+                menu_signature: 99,
+            },
+        );
+        for _ in 0..10 {
+            let warm = fresh_cached_menu_icons(&cache, 7, 99).unwrap().unwrap();
+            assert!(warm.geometry_pending);
+            assert_eq!(warm.icons.len(), 2);
+        }
+        // A real signature change, another display, or expiration must still scan.
+        assert!(fresh_cached_menu_icons(&cache, 7, 100).unwrap().is_none());
+        assert!(fresh_cached_menu_icons(&cache, 8, 99).unwrap().is_none());
+        cache
+            .responses
+            .lock()
+            .unwrap()
+            .get_mut(&7)
+            .unwrap()
+            .refreshed_at = Instant::now() - MENU_CACHE_FRESHNESS;
+        assert!(fresh_cached_menu_icons(&cache, 7, 99).unwrap().is_none());
+        cache
+            .responses
+            .lock()
+            .unwrap()
+            .get_mut(&7)
+            .unwrap()
+            .refreshed_at = Instant::now();
+        cache
+            .responses
+            .lock()
+            .unwrap()
+            .get_mut(&7)
+            .unwrap()
+            .response
+            .geometry_pending = false;
+        assert!(fresh_cached_menu_icons(&cache, 7, 99).unwrap().is_some());
     }
 
     #[test]

@@ -4,6 +4,75 @@ import XCTest
 @testable import MacnuNative
 
 final class CatalogTests: XCTestCase {
+    func testPinnedArtworkCacheReusesPixelsAndInvalidatesChangedFiles() {
+        var cache = PinnedArtworkCache(lifetime: 60, capacity: 2)
+        var loads = 0
+        func load() -> String { loads += 1; return "image-\(loads)" }
+        let modified = Date(timeIntervalSince1970: 1)
+        XCTAssertEqual(cache.image(identifier: "example.app", path: "/A.app",
+            modifiedAt: modified, now: 0, load: load), "image-1")
+        XCTAssertEqual(cache.image(identifier: "example.app", path: "/A.app",
+            modifiedAt: modified, now: 59, load: load), "image-1")
+        XCTAssertEqual(loads, 1)
+        XCTAssertEqual(cache.image(identifier: "example.app", path: "/A.app",
+            modifiedAt: modified, now: 60, load: load), "image-2")
+        XCTAssertEqual(cache.image(identifier: "example.app", path: "/B.app",
+            modifiedAt: modified, now: 61, load: load), "image-3")
+        XCTAssertEqual(cache.image(identifier: "example.app", path: "/B.app",
+            modifiedAt: nil, now: 62, load: load), "image-4")
+        XCTAssertEqual(cache.image(identifier: "example.other", path: "/B.app",
+            modifiedAt: nil, now: 63, load: load), "image-5")
+        _ = cache.image(identifier: "example.third", path: "/C.app",
+            modifiedAt: nil, now: 64, load: load)
+        XCTAssertEqual(cache.image(identifier: "example.app", path: "/B.app",
+            modifiedAt: nil, now: 65, load: load), "image-7", "Oldest artwork is evicted")
+    }
+
+    func testPinnedArtworkCacheDoesNotRetainFailedLoads() {
+        var cache = PinnedArtworkCache()
+        XCTAssertEqual(cache.image(identifier: "example.app", path: "/A.app",
+            modifiedAt: nil, now: 0, load: { "" }), "")
+        XCTAssertEqual(cache.image(identifier: "example.app", path: "/A.app",
+            modifiedAt: nil, now: 1, load: { "recovered" }), "recovered")
+    }
+
+    func testDifferentMonitorOrderCannotBindProtonToMolesWindow() {
+        let builtIn = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let external = CGRect(x: 1512, y: -98, width: 1920, height: 1080)
+        let proton = candidate(label: "Proton Drive",
+            frame: CGRect(x: 842, y: 4.5, width: 24, height: 24))
+        let mole = MenuWindow(id: 77320, pid: 1073, owner: "Control Centre",
+            bounds: CGRect(x: 2753, y: -98, width: 126, height: 30), isOnScreen: true)
+        let matches = activationWindowMatches(
+            windows: [mole], candidates: [proton], targetDisplay: external,
+            displays: [builtIn, external], strictMatches: [:],
+            hasTopSafeArea: { _ in false },
+            hitWindow: { _, _ in XCTFail("Source geometry must not be projected for activation"); return mole.id }
+        )
+        XCTAssertTrue(matches.isEmpty)
+        // Discovery keeps the identity available during the focus transition.
+        XCTAssertEqual(catalogCandidates([proton], targetDisplay: external,
+            displays: [builtIn, external]).count, 1)
+        // An actual AX identity match on the destination remains valid.
+        let strict = activationWindowMatches(
+            windows: [mole], candidates: [proton], targetDisplay: external,
+            displays: [builtIn, external], strictMatches: [0: mole],
+            hasTopSafeArea: { _ in false }, hitWindow: { _, _ in nil }
+        )
+        XCTAssertEqual(strict[0]?.id, mole.id)
+    }
+
+    func testTargetedLabelValidationRejectsNewDuplicatesAndReplacements() {
+        let frame = CGRect(x: 1200, y: 4, width: 24, height: 24)
+        let original = candidate(label: "Menu", frame: frame)
+        let moved = candidate(label: "Menu", frame: frame.offsetBy(dx: 1800, dy: -98))
+        XCTAssertNotNil(uniqueLiveLabelCandidate(original, in: [moved]))
+        XCTAssertNil(uniqueLiveLabelCandidate(original, in: [moved, moved]))
+        XCTAssertNil(uniqueLiveLabelCandidate(original,
+            in: [candidate(label: "Replacement", frame: frame)]))
+        XCTAssertNil(uniqueLiveLabelCandidate(original, in: []))
+    }
+
     func testStalePositionCannotSelectAReplacementItem() {
         let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
         let replacement = candidate(label: "Different menu", frame: frame)

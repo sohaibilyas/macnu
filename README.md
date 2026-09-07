@@ -60,8 +60,8 @@ build commands only after a click, including custom popovers, use the original
 menu fallback instead.
 
 Direct shortcuts support both app-provided identifiers and unique menu-label
-matches. For label-based shortcuts, Macnu refreshes the menu catalog before
-opening an item. If the app renames that item or exposes indistinguishable
+matches. Before opening a label-based shortcut, Macnu checks the selected app's
+current menu items. If the app renames that item or exposes indistinguishable
 duplicates, the shortcut stops rather than opening another icon. Select the
 current item in Macnu to update its shortcut.
 

@@ -278,6 +278,7 @@ private struct CaptureResponse: Codable {
     let displayKey: String
     let screenCaptureDenied: Bool
     let accessibilityDenied: Bool
+    var geometryPending: Bool = false
     let error: String?
 }
 
@@ -1481,6 +1482,11 @@ func activationWindowMatches(
     var proposed = strictMatches
 
     for index in candidates.indices where proposed[index] == nil {
+        // Monitors can have different item orders. A hit at a projected source
+        // position identifies a window, not the app that owns that window.
+        guard containingDisplay(for: candidates[index].frame, in: displays) == targetDisplay else {
+            continue
+        }
         let frame = projectedFrame(
             for: candidates[index],
             onto: targetDisplay,
@@ -2071,6 +2077,14 @@ func cachedCandidateIdentityMatches(
         && cached.label.caseInsensitiveCompare(live.label) == .orderedSame
 }
 
+func uniqueLiveLabelCandidate(
+    _ cached: AccessibilityCandidate,
+    in candidates: [AccessibilityCandidate]
+) -> AccessibilityCandidate? {
+    let matches = candidates.filter { cachedCandidateIdentityMatches(cached, live: $0) }
+    return matches.count == 1 ? matches[0] : nil
+}
+
 private func liveCachedCandidate(
     _ cached: AccessibilityCandidate,
     for request: ActivationRequest
@@ -2105,7 +2119,22 @@ private func liveCachedCandidate(
         frame: currentFrame,
         actions: currentActions
     )
-    return cachedCandidateIdentityMatches(cached, live: live) ? live : nil
+    guard cachedCandidateIdentityMatches(cached, live: live) else { return nil }
+    guard cached.identifier == nil else { return live }
+    // Label-based shortcuts still require one current item, but only this
+    // process needs checking—not every running app and every captured image.
+    let displays = activeDisplayBounds()
+    guard let target = activationTargetDisplay(for: live.frame, in: displays) else { return nil }
+    let processItems = accessibilityCandidates(
+        for: AccessibilityApplicationSnapshot(
+            index: 0, pid: cached.pid, appName: cached.appName,
+            bundleIdentifier: cached.bundleIdentifier
+        ),
+        displays: displays
+    )
+    return uniqueLiveLabelCandidate(cached, in: catalogCandidates(
+        processItems, targetDisplay: target, displays: displays
+    ))
 }
 
 private func unchangedCachedMenuWindow(
@@ -2562,13 +2591,11 @@ private func captureMenuIcons() async -> CaptureResponse {
             ) || candidate.actions.contains(
                 kAXPickAction as String
             )
-            // A projected source-display AX element must never be activated on
-            // its original monitor while the row claims to target this one.
-            // Keep it only when one exact target-display WindowServer window
-            // provides the activation route. Actionless custom views follow
-            // the same rule on every display.
+            // Keep identified apps visible while macOS switches AX geometry
+            // to the newly focused monitor. These rows use application artwork;
+            // activation still requires a live, target-local identity check.
             return activationMatches[index] != nil
-                || (isTargetLocal && hasSemanticAction)
+                || hasSemanticAction || !isTargetLocal
         }
         if diagnosticsEnabled {
             var diagnosticLines = [[
@@ -2580,7 +2607,8 @@ private func captureMenuIcons() async -> CaptureResponse {
                 "allWindows=\(allWindows.count)",
                 "strict=\(confidentMatches.count)",
                 "activation=\(activationMatches.count)",
-                "kept=\(catalogIndices.count)"
+                "kept=\(catalogIndices.count)",
+                "discoveryMs=\(Int((ProcessInfo.processInfo.systemUptime - captureTimestamp) * 1000))"
             ].joined(separator: " ")]
             for (windowIndex, window) in allWindows.enumerated() {
                 let hit = hitTestedCandidateIndex(
@@ -2785,6 +2813,10 @@ private func captureMenuIcons() async -> CaptureResponse {
             displayKey: targetDisplayKey,
             screenCaptureDenied: screenCaptureDenied,
             accessibilityDenied: accessibilityDenied,
+            geometryPending: catalog.isEmpty || catalog.indices.contains {
+                containingDisplay(for: catalog[$0].frame, in: displays) != targetDisplay
+                    && confidentMatches[$0] == nil
+            },
             error: nil
         )
     } catch {
@@ -3068,6 +3100,47 @@ private func pinnedApplicationURL(_ identifier: String) -> URL? {
     return url
 }
 
+// Artwork is presentation-only. Installation and running state are always
+// resolved live; cached pixels must never authorize launching or activation.
+struct PinnedArtworkCache {
+    private struct Entry {
+        let path: String
+        let modifiedAt: Date?
+        let capturedAt: TimeInterval
+        let image: String
+    }
+    private var entries: [String: Entry] = [:]
+    let lifetime: TimeInterval
+    let capacity: Int
+
+    init(lifetime: TimeInterval = 60, capacity: Int = 256) {
+        self.lifetime = lifetime
+        self.capacity = capacity
+    }
+
+    mutating func image(identifier: String, path: String, modifiedAt: Date?,
+                        now: TimeInterval, load: () -> String) -> String {
+        if let entry = entries[identifier], entry.path == path,
+           entry.modifiedAt == modifiedAt, now >= entry.capturedAt,
+           now - entry.capturedAt < lifetime {
+            return entry.image
+        }
+        entries.removeValue(forKey: identifier)
+        let image = load()
+        guard !image.isEmpty, capacity > 0 else { return image }
+        if entries.count >= capacity,
+           let oldest = entries.min(by: { $0.value.capturedAt < $1.value.capturedAt })?.key {
+            entries.removeValue(forKey: oldest)
+        }
+        entries[identifier] = Entry(path: path, modifiedAt: modifiedAt,
+                                    capturedAt: now, image: image)
+        return image
+    }
+}
+
+// Accessed only by the main-thread hydration closure below.
+private var pinnedArtworkCache = PinnedArtworkCache()
+
 @_cdecl("macnu_copy_pinned_apps_json")
 public func macnuCopyPinnedAppsJSON(_ requestJSON: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
     guard let requestJSON,
@@ -3082,15 +3155,20 @@ public func macnuCopyPinnedAppsJSON(_ requestJSON: UnsafePointer<CChar>?) -> Uns
                 .contains { !$0.isTerminated }
             var imageURL = ""
             if let url {
-                let icon = NSWorkspace.shared.icon(forFile: url.path)
-                var rect = CGRect(x: 0, y: 0, width: 64, height: 64)
-                if let image = icon.cgImage(forProposedRect: &rect, context: nil, hints: nil),
-                   let context = CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8,
-                       bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                let modifiedAt = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate
+                imageURL = pinnedArtworkCache.image(identifier: identifier, path: url.path,
+                    modifiedAt: modifiedAt, now: ProcessInfo.processInfo.systemUptime) {
+                    let icon = NSWorkspace.shared.icon(forFile: url.path)
+                    var rect = CGRect(x: 0, y: 0, width: 64, height: 64)
+                    guard let image = icon.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+                          let context = CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return "" }
                     context.interpolationQuality = .high
                     context.draw(image, in: rect)
-                    if let resized = context.makeImage() { imageURL = pngDataURL(from: resized) ?? "" }
+                    guard let resized = context.makeImage() else { return "" }
+                    return pngDataURL(from: resized) ?? ""
                 }
             }
             states[identifier] = PinnedApplicationState(name: "", bundleId: identifier,
