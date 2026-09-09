@@ -147,6 +147,12 @@ Macnu writes the app bundle under
 signature, do not require a paid license, and cannot use the official update
 channel. Do not distribute a source build as an official Macnu release.
 
+For local UI comparison with the License and Updates panels visible, run
+`npm run build:preview`. This source build needs no license and labels Settings
+as **UI Preview**. Those two panels use sample responses; license actions and
+update installation never reach the native services. Other app features work
+normally. The preview uses a local ad hoc signature and skips notarization.
+
 Run the main verification commands:
 
 ```sh

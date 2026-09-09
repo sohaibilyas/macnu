@@ -1,5 +1,6 @@
 // Run against npm run dev. Requires Playwright (set MACNU_PLAYWRIGHT_MODULE if not installed locally).
 import assert from "node:assert/strict";
+import { verifyDesignSystem, verifyPaletteDesign } from "./test-design-system.mjs";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.MACNU_PLAYWRIGHT_MODULE || "playwright");
@@ -320,6 +321,7 @@ try {
   await page.locator(".settings-button").click();
   assert.equal(await page.evaluate(() => window.testCalls.at(-1).command), "open_update_settings");
   assert.equal(await page.evaluate(() => window.testCalls.filter(x => x.command === "install_update").length), 0);
+  await verifyPaletteDesign(page);
   await page.setViewportSize({ width: 650, height: 450 });
   await page.goto((process.env.MACNU_UI_URL || "http://127.0.0.1:5173/") + "?window=settings");
   await page.locator('[data-layout="list"]').click();
@@ -388,6 +390,7 @@ try {
   await page.locator("[data-install-update]").scrollIntoViewIfNeeded();
   assert.equal(await page.locator("[data-install-update]").isEnabled(), true);
   await page.screenshot({ path: "/tmp/macnu-v0.5.2-update-actions.png", scale: "css" });
+  await verifyDesignSystem(page);
   assert.deepEqual(errors, []);
   console.log("Browser checks passed: grid/list, navigation, status, Macnu title, Actions, pin identity, unavailable app, reopen-to-menu, provisional monitor cache, focus settling, automatic-update controls, manual-only installation, and update indicators.");
 } finally { await browser.close(); }

@@ -1,0 +1,230 @@
+/* Shared interface primitives. Screen-specific files own layout, not controls.
+   Semantic selectors also cover controls rendered dynamically in main.ts. */
+:root {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --copy-gap: 6px;
+  --font-helper: 11px;
+  --font-label: 12px;
+  --line-helper: 1.45;
+  --line-label: 1.4;
+  --control-height: 32px;
+  --control-radius: 10px;
+  --card-radius: 16px;
+  --card-padding: 14px;
+  --button-primary: #5265c9;
+  --button-primary-hover: #4658bb;
+  --button-on-primary: #fff;
+}
+
+:where(button, input) { font: inherit; }
+
+/* All text actions share geometry; hierarchy changes color, not spacing.
+   Opaque button surfaces keep the same fill on cards and window backgrounds. */
+:where(.primary-action, .secondary-action, .danger-action, .tertiary-action,
+    .shortcut-recorder, .item-shortcut-recorder, .item-shortcut-clear,
+    .shortcut-reset, .login-settings-link, .permission-recheck,
+    .gate-fallback-link, .license-help-links a, .license-help-links button,
+    .settings-button, .refresh) {
+  display: inline-flex;
+  min-width: 0;
+  min-height: var(--control-height);
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 6px var(--space-3);
+  border: 1px solid var(--control-border);
+  border-radius: var(--control-radius);
+  color: var(--text-primary);
+  background: var(--button-surface);
+  cursor: pointer;
+  font-size: var(--font-helper);
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+:where(.primary-action, .secondary-action, .shortcut-recorder,
+    .item-shortcut-recorder):hover:not(:disabled) {
+  background: var(--button-hover);
+}
+.primary-action {
+  border-color: var(--button-primary);
+  color: var(--button-on-primary);
+  background: var(--button-primary);
+}
+.primary-action:hover:not(:disabled) {
+  border-color: var(--button-primary-hover);
+  background: var(--button-primary-hover);
+}
+.danger-action {
+  border-color: color-mix(in srgb, var(--danger-text) 32%, transparent);
+  color: var(--danger-text);
+  background: transparent;
+}
+.danger-action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger-text) 9%, transparent);
+}
+
+:where(.tertiary-action, .item-shortcut-clear, .shortcut-reset,
+    .login-settings-link, .permission-recheck, .gate-fallback-link,
+    .license-help-links a, .license-help-links button, .settings-button, .refresh) {
+  border-color: transparent;
+  color: var(--text-secondary);
+  background: transparent;
+}
+:where(.tertiary-action, .item-shortcut-clear, .shortcut-reset,
+    .login-settings-link, .permission-recheck, .gate-fallback-link,
+    .license-help-links a, .license-help-links button, .settings-button,
+    .refresh):hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--text-primary);
+  background: var(--control-hover);
+}
+/* Only dense palette toolbars and the setup call-to-action change size. */
+footer :where(.settings-button, .refresh) {
+  --control-height: 28px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  padding: var(--space-1) 6px;
+}
+.license-key-control,
+.gate-simple > .primary-action {
+  --control-height: 40px;
+}
+:where(.shortcut-recorder, .item-shortcut-recorder).recording {
+  border-color: var(--accent-border);
+  color: var(--accent-text);
+  background: var(--accent-surface);
+}
+:where(button, a):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+:where(button:disabled, a[aria-disabled="true"]) {
+  cursor: default;
+  opacity: 0.52;
+}
+
+/* Description, hint, and status text have one readable type scale. */
+:where(.result-copy small, .settings-heading small, .settings-version, .settings-loading,
+    .settings-copy p, .setting-label small, .permission-setting-copy small,
+    .update-state-copy small, .license-summary-heading small,
+    .personalization-help, .personalization-status,
+    .personalization-manager-copy small, .personalization-manager-empty,
+    .manager-removal-warning, .item-customization-heading small,
+    .item-shortcut-field.unavailable small, .item-customization-message,
+    .source-build-notice, .automatic-update-status, .settings-message,
+    .license-panel-status, .license-gate-status, .license-gate-error,
+    .update-panel-status, .update-progress span, .update-notes p,
+    .business-seat-picker small, .onboarding-error, .gate-copy p,
+    .gate-live-status, .state small, .permission-state p,
+    .action-pin-error, .action-unpin-confirmation, .license-deactivate-confirmation) {
+  min-width: 0;
+  color: var(--text-tertiary);
+  font-size: var(--font-helper);
+  font-weight: 400;
+  line-height: var(--line-helper);
+  overflow-wrap: anywhere;
+}
+:where(.item-alias-field > span, .item-shortcut-field > span, .business-seat-picker label,
+    .license-activation-form > label, .update-notes strong, .setting-label strong, .permission-title-line strong,
+    .update-state-copy strong, .license-summary-heading strong,
+    .personalization-manager-copy strong, .item-customization-heading strong) {
+  color: var(--text-primary);
+  font-size: var(--font-label);
+  font-weight: 600;
+  line-height: var(--line-label);
+  overflow-wrap: anywhere;
+}
+:where(.setting-label, .permission-setting-copy, .update-state-copy,
+    .license-summary-heading > div, .personalization-manager-copy,
+    .item-customization-heading, .item-alias-field) {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--copy-gap);
+}
+:where(.automatic-update-status, .license-gate-error, .onboarding-error,
+    .action-pin-error, .manager-removal-warning,
+    .item-customization-message.error, .personalization-status.error,
+    .settings-message.error, .license-panel-status.error, .update-panel-status.error) {
+  color: var(--danger-text);
+}
+:where(.personalization-status, .automatic-update-status, .settings-message,
+    .license-panel-status, .license-gate-status, .license-gate-error,
+    .onboarding-error) {
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  user-select: text;
+}
+/* Empty live regions remain accessible without reserving blank space. */
+:where(.personalization-status, .automatic-update-status, .settings-message,
+    .license-panel-status, .license-gate-status, .license-gate-error,
+    .onboarding-error):empty {
+  min-height: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+}
+:where(.item-alias-field input, .license-key-control input, .business-seat-picker input) {
+  min-width: 0;
+  height: var(--control-height);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--control-border);
+  border-radius: var(--control-radius);
+  outline: 0;
+  color: var(--text-primary);
+  background: var(--control-surface);
+  font-size: var(--font-helper);
+  line-height: var(--line-helper);
+  user-select: text;
+}
+:where(.item-alias-field input, .license-key-control input, .business-seat-picker input):focus-visible {
+  border-color: var(--focus-ring);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+:where(.settings-group, .permission-setting-card, .update-card, .license-summary) {
+  border: 1px solid var(--control-border);
+  border-radius: var(--card-radius);
+  background: var(--control-surface);
+}
+:where(.permission-setting-card, .update-card, .license-summary-heading) {
+  display: grid;
+  min-height: 86px;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--card-padding);
+}
+@media (prefers-reduced-motion: reduce) {
+  button, a { transition: none !important; }
+}
+
+/* Keycaps have one regular size and one compact toolbar/row variant. */
+kbd {
+  display: inline-grid;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  place-items: center;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  color: var(--text-tertiary);
+  background: var(--control-surface);
+  font: 10px/1 -apple-system, BlinkMacSystemFont, sans-serif;
+}
+:where(footer, .item-shortcut-mark, .item-shortcut-recorder, .shortcut-recorder,
+    .manager-shortcut, .manager-removal-warning, .action-unpin-confirmation,
+    .saved-action-removal-warning) kbd {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  font-size: 9px;
+}

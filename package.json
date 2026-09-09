@@ -1,7 +1,7 @@
 {
   "name": "macnu",
   "private": true,
-  "version": "0.5.2",
+  "version": "0.5.3",
   "license": "PolyForm-Noncommercial-1.0.0",
   "author": "Sohaib Ilyas",
   "repository": {
@@ -16,6 +16,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "build:app": "./scripts/tauri-source.sh build --bundles app && MACNU_BUILD_MODE=source-build ./scripts/sign-app.sh",
+    "build:preview": "VITE_MACNU_SETTINGS_PREVIEW=1 ./scripts/tauri-source.sh build --bundles app --no-sign && MACNU_BUILD_MODE=source-build ./scripts/sign-app.sh",
     "build:official": "./scripts/build-official.sh",
     "release:preflight": "node ./scripts/release-preflight.mjs",
     "release:sign-updater": "./scripts/sign-updater.sh",

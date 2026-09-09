@@ -1,4 +1,5 @@
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel, invoke as nativeInvoke } from "@tauri-apps/api/core";
+import { createSettingsPreview } from "./settings-preview";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -25,6 +26,7 @@ import { supportsDirectShortcut } from "./shortcut-identity";
 import { gridSelection, parsePaletteLayout, type PaletteLayout } from "./menu-hub";
 
 const LAYOUT_STORAGE_KEY = "macnu.layout";
+const invoke = nativeInvoke;
 function storedLayout(): PaletteLayout {
   try { return parsePaletteLayout(localStorage.getItem(LAYOUT_STORAGE_KEY)); }
   catch { return "list"; }
@@ -326,13 +328,16 @@ function eventShortcut(event: KeyboardEvent): string | null {
 }
 
 async function initSettings(): Promise<void> {
+  const { invoke, preview } = await createSettingsPreview(
+    nativeInvoke, import.meta.env.VITE_MACNU_SETTINGS_PREVIEW === "1", getVersion,
+  );
   app.innerHTML = `
     <section class="settings-window" aria-label="Macnu Settings">
       <header class="settings-titlebar">
         <img class="settings-app-icon" src="${appIconUrl}" alt="" draggable="false" />
         <span class="settings-heading">
           <strong>Macnu</strong>
-          <small>Settings</small>
+          <small>Settings${preview ? " · UI Preview" : ""}</small>
         </span>
         <button class="close settings-close" aria-label="Close Settings">×</button>
       </header>
@@ -868,6 +873,11 @@ async function initSettings(): Promise<void> {
     updateCard.setAttribute("aria-busy", String(busy));
   }
 
+  function setPersonalizationStatus(text: string, error = false): void {
+    personalizationStatus.textContent = text;
+    personalizationStatus.classList.toggle("error", error);
+  }
+
   function setUpdateStatus(text = "", error = false): void {
     updateStatus.classList.toggle("error", error);
     updateStatus.textContent = text;
@@ -1237,10 +1247,10 @@ async function initSettings(): Promise<void> {
       if (request !== personalizationManagerRequest) return;
       personalizationIcons = menu.icons;
       personalizationCatalog = catalog;
-      personalizationStatus.textContent = "";
+      setPersonalizationStatus("");
     } catch (error) {
       if (request !== personalizationManagerRequest) return;
-      personalizationStatus.textContent = String(error);
+      setPersonalizationStatus(String(error), true);
     } finally {
       if (request === personalizationManagerRequest) {
         personalizationManagersLoading = false;
@@ -1279,7 +1289,7 @@ async function initSettings(): Promise<void> {
       ? "Activation"
       : permissionGuardVisible
         ? "Setup"
-        : "Settings";
+        : preview ? "Settings · UI Preview" : "Settings";
   }
 
   function readablePlan(plan: LicenseStatus["plan"]): string {
@@ -1653,7 +1663,7 @@ async function initSettings(): Promise<void> {
     clearItemShortcutsArmed = false;
     personalizationClearShortcutsButton.textContent = "Clear All";
     personalizationClearShortcutsButton.classList.remove("armed");
-    if (wasArmed) personalizationStatus.textContent = "";
+    if (wasArmed) setPersonalizationStatus("");
   }
 
   function setPersonalizationBusy(busy: boolean): void {
@@ -1668,7 +1678,7 @@ async function initSettings(): Promise<void> {
     personalizePerDisplay: boolean,
   ): Promise<void> {
     setPersonalizationBusy(true);
-    personalizationStatus.textContent = "Saving…";
+    setPersonalizationStatus("Saving…");
     try {
       applySettings(
         await invoke<SettingsResponse>("update_personalization_settings", {
@@ -1676,10 +1686,10 @@ async function initSettings(): Promise<void> {
           personalizePerDisplay,
         }),
       );
-      personalizationStatus.textContent = "Saved locally on this Mac.";
+      setPersonalizationStatus("Saved locally on this Mac.");
     } catch (error) {
       if (settings) applySettings(settings);
-      personalizationStatus.textContent = String(error);
+      setPersonalizationStatus(String(error), true);
     } finally {
       setPersonalizationBusy(false);
     }
@@ -1722,7 +1732,7 @@ async function initSettings(): Promise<void> {
     } else {
       trigger.disabled = true;
     }
-    personalizationStatus.textContent = "Unpinning action…";
+    setPersonalizationStatus("Unpinning action…");
     try {
       const next = await invoke<CatalogCustomizationsResponse>(
         "remove_saved_action",
@@ -1735,14 +1745,13 @@ async function initSettings(): Promise<void> {
       settingsSavedActionRemovalBusy = null;
       pendingSettingsSavedActionRemoval = null;
       personalizationCatalog = next;
-      personalizationStatus.textContent = "Action unpinned.";
+      setPersonalizationStatus("Action unpinned.");
       renderPersonalizationManagers();
     } catch (error) {
       if (personalizationCatalog?.displayKey !== catalog.displayKey) return;
       settingsSavedActionRemovalBusy = null;
       pendingSettingsSavedActionRemoval = null;
-      personalizationStatus.textContent =
-        "Macnu couldn’t unpin that action. Nothing was changed; please try again.";
+      setPersonalizationStatus("Macnu couldn’t unpin that action. Nothing was changed; please try again.", true);
       console.error("Could not unpin action from Settings.", error);
       renderPersonalizationManagers();
       focusSettingsRemovalControl(savedActionId);
@@ -1799,7 +1808,7 @@ async function initSettings(): Promise<void> {
       const savedActionId =
         cancelSavedActionRemoval.dataset.settingsCancelRemoveAction;
       pendingSettingsSavedActionRemoval = null;
-      personalizationStatus.textContent = "Pinned action kept.";
+      setPersonalizationStatus("Pinned action kept.");
       renderPersonalizationManagers();
       if (savedActionId) focusSettingsRemovalControl(savedActionId);
       return;
@@ -1825,8 +1834,7 @@ async function initSettings(): Promise<void> {
       if (!savedAction) return;
       if (savedAction.shortcut) {
         pendingSettingsSavedActionRemoval = savedActionId;
-        personalizationStatus.textContent =
-          "Confirm removal. Its direct shortcut will be removed too.";
+        setPersonalizationStatus("Confirm removal. Its direct shortcut will be removed too.");
         renderPersonalizationManagers();
         focusSettingsRemovalControl(savedActionId, true);
       } else {
@@ -1842,7 +1850,7 @@ async function initSettings(): Promise<void> {
       const current = itemId ? personalizationCatalog.items[itemId] : undefined;
       if (!itemId || !current) return;
       unhideItemButton.disabled = true;
-      personalizationStatus.textContent = "Restoring item…";
+      setPersonalizationStatus("Restoring item…");
       void invoke<CatalogCustomizationsResponse>("set_item_customization", {
         displayKey: personalizationCatalog.displayKey,
         itemId,
@@ -1853,29 +1861,29 @@ async function initSettings(): Promise<void> {
       })
         .then((next) => {
           personalizationCatalog = next;
-          personalizationStatus.textContent = "Item restored to search.";
+          setPersonalizationStatus("Item restored to search.");
           renderPersonalizationManagers();
         })
         .catch((error) => {
-          personalizationStatus.textContent = String(error);
+          setPersonalizationStatus(String(error), true);
           unhideItemButton.disabled = false;
         });
       return;
     }
     if (target.closest("[data-restore-all-hidden]")) {
       restoreAllHiddenButton.disabled = true;
-      personalizationStatus.textContent = "Restoring hidden items…";
+      setPersonalizationStatus("Restoring hidden items…");
       void invoke<number>("clear_hidden_items")
         .then(async (restored) => {
           await refreshPersonalizationManagers();
-          personalizationStatus.textContent = restored === 0
+          setPersonalizationStatus(restored === 0
             ? "No hidden items needed restoring."
             : restored === 1
               ? "1 item restored to search."
-              : `${restored} items restored to search.`;
+              : `${restored} items restored to search.`);
         })
         .catch((error) => {
-          personalizationStatus.textContent = String(error);
+          setPersonalizationStatus(String(error), true);
         })
         .finally(() => {
           restoreAllHiddenButton.disabled = false;
@@ -1884,14 +1892,13 @@ async function initSettings(): Promise<void> {
     }
     if (target.closest("[data-reset-personalization-history]")) {
       setPersonalizationBusy(true);
-      personalizationStatus.textContent = "Clearing smart ordering history…";
+      setPersonalizationStatus("Clearing smart ordering history…");
       void invoke("reset_personalization_history")
         .then(() => {
-          personalizationStatus.textContent =
-            "History cleared. Pins, aliases, and shortcuts were kept.";
+          setPersonalizationStatus("History cleared. Pins, aliases, and shortcuts were kept.");
         })
         .catch((error) => {
-          personalizationStatus.textContent = String(error);
+          setPersonalizationStatus(String(error), true);
         })
         .finally(() => setPersonalizationBusy(false));
       return;
@@ -1901,25 +1908,24 @@ async function initSettings(): Promise<void> {
         clearItemShortcutsArmed = true;
         personalizationClearShortcutsButton.textContent = "Confirm Clear All";
         personalizationClearShortcutsButton.classList.add("armed");
-        personalizationStatus.textContent =
-          "Click Confirm Clear All to remove every direct shortcut.";
+        setPersonalizationStatus("Click Confirm Clear All to remove every direct shortcut.");
         return;
       }
 
       resetClearItemShortcutsConfirmation();
       setPersonalizationBusy(true);
-      personalizationStatus.textContent = "Removing direct shortcuts…";
+      setPersonalizationStatus("Removing direct shortcuts…");
       void invoke<number>("clear_all_item_shortcuts")
         .then(async (cleared) => {
           await refreshPersonalizationManagers();
-          personalizationStatus.textContent = cleared === 0
+          setPersonalizationStatus(cleared === 0
             ? "No direct shortcuts were set."
             : cleared === 1
               ? "1 direct shortcut was removed. Saved items and aliases were kept."
-              : `${cleared} direct shortcuts were removed. Saved items and aliases were kept.`;
+              : `${cleared} direct shortcuts were removed. Saved items and aliases were kept.`);
         })
         .catch((error) => {
-          personalizationStatus.textContent = String(error);
+          setPersonalizationStatus(String(error), true);
         })
         .finally(() => setPersonalizationBusy(false));
       return;
@@ -2125,8 +2131,7 @@ async function initSettings(): Promise<void> {
     void refreshPersonalizationManagers();
   });
   void currentWindow.listen("personalization-history-reset", () => {
-    personalizationStatus.textContent =
-      "History cleared. Pins, aliases, and shortcuts were kept.";
+    setPersonalizationStatus("History cleared. Pins, aliases, and shortcuts were kept.");
   });
   updateAppearanceControls();
   await refreshAppState();
@@ -3289,7 +3294,7 @@ function customizationEditorMarkup(
       </label>
       ${shortcutControl}
       <div class="item-customization-actions">
-        <span class="item-customization-message" role="status">${escapeHtml(customizationMessage)}</span>
+        <span class="item-customization-message ${customizationMessage && !customizationSaving ? "error" : ""}" role="status">${escapeHtml(customizationMessage)}</span>
         <button type="button" class="secondary-action" data-cancel-item-customization ${disabled}>Cancel</button>
         <button type="submit" class="primary-action" ${disabled}>Save</button>
       </div>
@@ -3375,7 +3380,7 @@ function savedActionEditorMarkup(
               <button type="button" class="danger-action" data-confirm-saved-action-removal ${disabled}>${savedActionSaving ? "Unpinning…" : "Unpin"}</button>
             `
             : `
-              <span class="item-customization-message" role="status">${escapeHtml(savedActionMessage)}</span>
+              <span class="item-customization-message ${savedActionMessage && !savedActionSaving ? "error" : ""}" role="status">${escapeHtml(savedActionMessage)}</span>
               <button type="button" class="danger-action saved-action-remove" data-remove-saved-action ${disabled}>Unpin</button>
               <button type="button" class="secondary-action" data-cancel-saved-action-customization ${disabled}>Cancel</button>
               <button type="submit" class="primary-action" ${disabled}>Save</button>
