@@ -122,6 +122,7 @@ private struct ActivationSession {
 private struct AccessibilityActivationResult {
     let action: String?
     let usedProcessTargetedClick: Bool
+    let observedPopup: Bool
 }
 
 private struct CachedIconImage {
@@ -2063,68 +2064,45 @@ private func cachedActivationTarget(
     return target
 }
 
-func cachedCandidateIdentityMatches(
+func uniqueLiveElementCandidate(
     _ cached: AccessibilityCandidate,
-    live: AccessibilityCandidate
-) -> Bool {
-    guard cached.pid == live.pid,
-          cached.bundleIdentifier == live.bundleIdentifier,
-          cached.role == live.role else { return false }
-    if let identifier = cached.identifier {
-        return live.identifier == identifier
-    }
-    return !live.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        && cached.label.caseInsensitiveCompare(live.label) == .orderedSame
-}
-
-func uniqueLiveLabelCandidate(
-    _ cached: AccessibilityCandidate,
+    preferredAction: String?,
     in candidates: [AccessibilityCandidate]
 ) -> AccessibilityCandidate? {
-    let matches = candidates.filter { cachedCandidateIdentityMatches(cached, live: $0) }
-    return matches.count == 1 ? matches[0] : nil
+    let matches = candidates.filter {
+        $0.pid == cached.pid
+            && $0.bundleIdentifier == cached.bundleIdentifier
+            && $0.role == cached.role
+            && CFEqual($0.element, cached.element)
+    }
+    guard matches.count == 1, let live = matches.first else { return nil }
+    if let identifier = cached.identifier, live.identifier != identifier {
+        return nil
+    }
+    if let preferredAction, !live.actions.contains(preferredAction) {
+        return nil
+    }
+    return live
 }
 
 private func liveCachedCandidate(
     _ cached: AccessibilityCandidate,
     for request: ActivationRequest
 ) -> AccessibilityCandidate? {
-    guard let activationPID = request.activationPid else { return nil }
+    guard let activationPID = request.activationPid,
+          cached.pid == pid_t(activationPID) else { return nil }
     var elementPID: pid_t = 0
     guard AXUIElementGetPid(cached.element, &elementPID) == .success,
           elementPID == pid_t(activationPID),
           let currentFrame = frame(of: cached.element) else {
         return nil
     }
-    let currentIdentifier = (
-        attribute(kAXIdentifierAttribute, from: cached.element) as? String
-    )?.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let identifier = cached.identifier,
-       currentIdentifier != identifier {
-        return nil
-    }
-    let currentActions = actionNames(of: cached.element)
-    if let requestedAction = request.activationAction,
-       !currentActions.contains(requestedAction) {
-        return nil
-    }
-    let live = AccessibilityCandidate(
-        element: cached.element,
-        pid: cached.pid,
-        appName: cached.appName,
-        bundleIdentifier: cached.bundleIdentifier,
-        label: accessibilityText(from: cached.element, fallback: ""),
-        identifier: currentIdentifier?.isEmpty == false ? currentIdentifier : nil,
-        role: attribute(kAXRoleAttribute, from: cached.element) as? String,
-        frame: currentFrame,
-        actions: currentActions
-    )
-    guard cachedCandidateIdentityMatches(cached, live: live) else { return nil }
-    guard cached.identifier == nil else { return live }
-    // Label-based shortcuts still require one current item, but only this
-    // process needs checking—not every running app and every captured image.
+    // A status label can change on every metrics update, and consolidation
+    // can take its label/identifier from a child of the actionable element.
+    // Refresh that same AX element from this process's consolidated catalog;
+    // presentation text and old coordinates must not invalidate its identity.
     let displays = activeDisplayBounds()
-    guard let target = activationTargetDisplay(for: live.frame, in: displays) else { return nil }
+    guard let target = activationTargetDisplay(for: currentFrame, in: displays) else { return nil }
     let processItems = accessibilityCandidates(
         for: AccessibilityApplicationSnapshot(
             index: 0, pid: cached.pid, appName: cached.appName,
@@ -2132,9 +2110,11 @@ private func liveCachedCandidate(
         ),
         displays: displays
     )
-    return uniqueLiveLabelCandidate(cached, in: catalogCandidates(
-        processItems, targetDisplay: target, displays: displays
-    ))
+    return uniqueLiveElementCandidate(
+        cached,
+        preferredAction: request.activationAction,
+        in: catalogCandidates(processItems, targetDisplay: target, displays: displays)
+    )
 }
 
 private func unchangedCachedMenuWindow(
@@ -2252,7 +2232,7 @@ private func performAccessibilityAction(
             action as CFString
         )
         if result == .success || result == .cannotComplete {
-            _ = waitForOpenedPopup(
+            let observedPopup = waitForOpenedPopup(
                 since: baselineWindowIDs,
                 targetPID: candidate.pid,
                 anchor: CGPoint(x: candidate.frame.midX, y: candidate.frame.midY)
@@ -2263,19 +2243,21 @@ private func performAccessibilityAction(
             // click that could toggle it closed or execute it twice.
             return AccessibilityActivationResult(
                 action: action,
-                usedProcessTargetedClick: false
+                usedProcessTargetedClick: false,
+                observedPopup: observedPopup
             )
         }
     }
     if postProcessTargetedClick(candidate) {
-        _ = waitForOpenedPopup(
+        let observedPopup = waitForOpenedPopup(
             since: baselineWindowIDs,
             targetPID: candidate.pid,
             anchor: CGPoint(x: candidate.frame.midX, y: candidate.frame.midY)
         )
         return AccessibilityActivationResult(
             action: nil,
-            usedProcessTargetedClick: true
+            usedProcessTargetedClick: true,
+            observedPopup: observedPopup
         )
     }
     return nil
@@ -3228,7 +3210,25 @@ public func macnuActivateMenuIconJSON(
         return 4
     }
 
+    var cacheState = "not-checked"
+    func logResult(_ message: String, observedPopup: Bool? = nil) {
+        NSLog("%@", message)
+        guard diagnosticsEnabled else { return }
+        let details = [
+            "time=\(Date())",
+            message,
+            "pid=\(request.activationPid ?? 0)",
+            "bundle=\(request.activationBundleId ?? "nil")",
+            "cache=\(cacheState)",
+            "popupObserved=\(observedPopup.map(String.init) ?? "not-attempted")"
+        ].joined(separator: "\n")
+        // Keep only the latest result; diagnostics must not grow a log forever.
+        try? details.write(toFile: "/tmp/macnu-activation.log",
+            atomically: true, encoding: .utf8)
+    }
+
     guard AXIsProcessTrusted() else {
+        logResult("[Macnu activation] Accessibility permission unavailable")
         _ = macnuRequestAccessibility()
         return 2
     }
@@ -3237,6 +3237,7 @@ public func macnuActivateMenuIconJSON(
     let requestedFrame = CGRect(x: request.x, y: request.y,
                                 width: request.width, height: request.height)
     guard activationTargetDisplay(for: requestedFrame, in: displays) != nil else {
+        logResult("[Macnu activation] requested display unavailable")
         return 1
     }
 
@@ -3244,11 +3245,13 @@ public func macnuActivateMenuIconJSON(
     // notch-safe matching, and ambiguity checks. Reuse that exact result on
     // Enter. Validate only the selected AX element and its previously matched
     // WindowServer window; never infer a neighbouring window here.
-    if let cachedTarget = cachedActivationTarget(for: request),
-       let activationCandidate = liveCachedCandidate(
-           cachedTarget.candidate,
-           for: request
-       ) {
+    let cachedTarget = cachedActivationTarget(for: request)
+    let cachedCandidate = cachedTarget.flatMap {
+        liveCachedCandidate($0.candidate, for: request)
+    }
+    cacheState = cachedTarget == nil ? "missing"
+        : (cachedCandidate == nil ? "live-element-rejected" : "validated")
+    if let cachedTarget, let activationCandidate = cachedCandidate {
         let baselineWindowIDs = Set(onScreenWindows().map(\.id))
         if let menuWindow = unchangedCachedMenuWindow(
             cachedTarget.menuWindow,
@@ -3258,7 +3261,7 @@ public func macnuActivateMenuIconJSON(
         ), activationFramesShareDisplay(
             requested: requestedFrame, target: menuWindow.bounds, displays: displays
         ), postMenuWindowClick(menuWindow) {
-            _ = waitForOpenedPopup(
+            let observedPopup = waitForOpenedPopup(
                 since: baselineWindowIDs,
                 targetPID: activationCandidate.pid,
                 anchor: CGPoint(
@@ -3272,10 +3275,10 @@ public func macnuActivateMenuIconJSON(
                 action: request.activationAction,
                 baselineWindowIDs: baselineWindowIDs
             )
-            NSLog(
+            logResult(String(format:
                 "[Macnu activation] cached WindowServer match in %.1f ms",
                 (ProcessInfo.processInfo.systemUptime - activationStartedAt) * 1_000
-            )
+            ), observedPopup: observedPopup)
             return 0
         }
 
@@ -3296,13 +3299,14 @@ public func macnuActivateMenuIconJSON(
             let route = activation.usedProcessTargetedClick
                 ? "process-targeted click"
                 : (activation.action ?? "Accessibility action")
-            NSLog(
+            logResult(String(format:
                 "[Macnu activation] cached %@ in %.1f ms",
                 route,
                 (ProcessInfo.processInfo.systemUptime - activationStartedAt) * 1_000
-            )
+            ), observedPopup: activation.observedPopup)
             return 0
         }
+        cacheState = "validated-no-activation-route"
     }
 
     // A cache miss means the selected element disappeared, moved, or is older
@@ -3313,7 +3317,7 @@ public func macnuActivateMenuIconJSON(
         for: request,
         in: accessibilityItems
     ) else {
-        NSLog("[Macnu activation] accessibility item is no longer available")
+        logResult("[Macnu activation] accessibility item is no longer available")
         return 1
     }
     let baselineWindowIDs = Set(onScreenWindows().map(\.id))
@@ -3331,7 +3335,7 @@ public func macnuActivateMenuIconJSON(
        activationFramesShareDisplay(
            requested: requestedFrame, target: menuWindow.bounds, displays: displays
        ), postMenuWindowClick(menuWindow) {
-        _ = waitForOpenedPopup(
+        let observedPopup = waitForOpenedPopup(
             since: baselineWindowIDs,
             targetPID: activationCandidate.pid,
             anchor: CGPoint(
@@ -3354,10 +3358,10 @@ public func macnuActivateMenuIconJSON(
                 )
             ], at: ProcessInfo.processInfo.systemUptime)
         }
-        NSLog(
+        logResult(String(format:
             "[Macnu activation] refreshed WindowServer match in %.1f ms",
             (ProcessInfo.processInfo.systemUptime - activationStartedAt) * 1_000
-        )
+        ), observedPopup: observedPopup)
         return 0
     }
 
@@ -3388,14 +3392,14 @@ public func macnuActivateMenuIconJSON(
         let route = activation.usedProcessTargetedClick
             ? "process-targeted click"
             : (activation.action ?? "Accessibility action")
-        NSLog(
+        logResult(String(format:
             "[Macnu activation] refreshed %@ in %.1f ms",
             route,
             (ProcessInfo.processInfo.systemUptime - activationStartedAt) * 1_000
-        )
+        ), observedPopup: activation.observedPopup)
         return 0
     }
 
-    NSLog("[Macnu activation] no activation path succeeded")
+    logResult("[Macnu activation] no activation path succeeded")
     return 3
 }

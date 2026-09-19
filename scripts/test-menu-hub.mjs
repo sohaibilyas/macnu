@@ -21,7 +21,7 @@ await page.route(/\/@tauri-apps_api_(core|window|app)\.js/, async (route) => {
       onCloseRequested:async()=>()=>{},
       onThemeChanged:async()=>()=>{}, onFocusChanged:async()=>()=>{},
       isVisible:async()=>!window.testHidden, isFocused:async()=>true,
-      hide:async()=>{window.testHidden=true;},show:async()=>{},setFocus:async()=>{},startDragging:async()=>{}
+      hide:async()=>{window.testHidden=true;},show:async()=>{window.testHidden=false;},setFocus:async()=>{},startDragging:async()=>{}
     });`;
   await route.fulfill({ contentType: "application/javascript", body });
 });
@@ -210,6 +210,52 @@ try {
   await page.waitForFunction(() => document.querySelectorAll(".result-row").length === 0);
   await search.fill("");
   assert.equal(await rows.count(), 8);
+  // Native activation failures must reopen the search with a visible error.
+  await page.evaluate(() => {
+    const base = window.testInvoke;
+    window.testInvoke = async (command, args) => {
+      if (command === "activate_menu_icon") {
+        return new Promise((resolve, reject) => {
+          window.finishMenuActivation = () => reject("That menu item is no longer available.");
+        });
+      }
+      return base(command, args);
+    };
+    window.restoreActivationInvoke = () => { window.testInvoke = base; };
+  });
+  await search.fill("Monitor");
+  await search.press("Enter");
+  await page.waitForFunction(() => window.testHidden && typeof window.finishMenuActivation === "function");
+  await page.evaluate(() => window.finishMenuActivation());
+  await page.locator("[data-menu-activation-error]").waitFor();
+  assert.equal(await page.evaluate(() => window.testHidden), false);
+  assert.equal(await search.inputValue(), "Monitor");
+  assert.match(await page.locator("[data-menu-activation-error]").innerText(), /Couldn’t open Monitor’s menu.*no longer available/);
+  await page.evaluate(() => {
+    window.testResponse.icons[1].label = "CPU 30%, Memory 76%";
+    window.testEvents["menu-cache-updated"]({ payload: structuredClone(window.testResponse) });
+  });
+  assert.equal(await page.locator("[data-menu-activation-error]").count(), 1, "A catalog refresh must not erase the activation error");
+  await page.locator("[data-dismiss-menu-activation-error]").click();
+  assert.equal(await page.locator("[data-menu-activation-error]").count(), 0);
+  // A late rejection must not override a newly opened palette or undo Escape.
+  for (const dismiss of [false, true]) {
+    await page.evaluate(() => { window.finishMenuActivation = null; });
+    await search.press("Enter");
+    await page.waitForFunction(() => typeof window.finishMenuActivation === "function");
+    if (!dismiss) await page.evaluate(() => window.testEvents["palette-opened"]({}));
+    await search.fill("Tailscale");
+    if (dismiss) await search.press("Escape");
+    await page.evaluate(() => window.finishMenuActivation());
+    await page.waitForTimeout(50);
+    assert.equal(await page.locator("[data-menu-activation-error]").count(), 0);
+    assert.equal(await search.inputValue(), "Tailscale");
+    assert.equal(await page.evaluate(() => window.testHidden), dismiss);
+  }
+  await page.evaluate(() => {
+    window.restoreActivationInvoke();
+    window.testEvents["palette-opened"]({});
+  });
   // Repeated catalog delivery shares one personalization read. A newer edit
   // event must also win over an older read already in progress.
   await page.evaluate(() => {
@@ -392,5 +438,5 @@ try {
   await page.screenshot({ path: "/tmp/macnu-v0.5.2-update-actions.png", scale: "css" });
   await verifyDesignSystem(page);
   assert.deepEqual(errors, []);
-  console.log("Browser checks passed: grid/list, navigation, status, Macnu title, Actions, pin identity, unavailable app, reopen-to-menu, provisional monitor cache, focus settling, automatic-update controls, manual-only installation, and update indicators.");
+  console.log("Browser checks passed: grid/list, navigation, status, Macnu title, Actions, pin identity, unavailable app, reopen-to-menu, activation errors and stale replies, provisional monitor cache, focus settling, automatic-update controls, manual-only installation, and update indicators.");
 } finally { await browser.close(); }

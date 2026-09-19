@@ -4677,6 +4677,8 @@ fn open_login_items_settings() {
 #[tauri::command]
 fn palette_test_mode() -> bool {
     std::env::args().any(|argument| argument == "--palette")
+        || (cfg!(feature = "source-build")
+            && std::env::var("MACNU_PALETTE_TEST_MODE").as_deref() == Ok("1"))
 }
 
 fn position_palette(window: &tauri::WebviewWindow) -> tauri::Result<()> {
@@ -4808,8 +4810,7 @@ fn toggle_palette(app: &tauri::AppHandle) {
     // UI automation test mode suppresses AppKit's synthetic Reopen event so it
     // cannot replace the palette with Settings while a slow first catalog is
     // still loading.
-    let palette_test_launch = std::env::args().any(|argument| argument == "--palette");
-    if !palette_test_launch {
+    if !palette_test_mode() {
         let suppression = presentation.suppress_reopen.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(750));
@@ -5085,10 +5086,7 @@ pub fn run() {
             app_updater::start_background_checks(app.handle().clone())?;
 
             let launch_arguments: Vec<String> = std::env::args().collect();
-            if launch_arguments
-                .iter()
-                .any(|argument| argument == "--palette")
-            {
+            if palette_test_mode() {
                 // Let the UI automation test runner return focus first;
                 // otherwise the normal click-away behavior correctly hides
                 // the palette before the test can inspect it.

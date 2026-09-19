@@ -2218,6 +2218,7 @@ let actionPinSaving = false;
 let itemPinSavingId: string | null = null;
 let launchingItemId: string | null = null;
 let itemPinError: string | null = null;
+let menuActivationError: string | null = null;
 let pendingActionUnpinId: string | null = null;
 let paletteRankingMode: RankingMode = "smart";
 let palettePersonalizePerDisplay = true;
@@ -3509,8 +3510,17 @@ function render(): void {
   }
   updatePaletteChrome();
 
+  const menuActivationErrorMarkup = menuActivationError
+    ? `
+        <div class="action-pin-error" data-menu-activation-error role="alert">
+          <span>${escapeHtml(menuActivationError)}</span>
+          <button type="button" data-dismiss-menu-activation-error aria-label="Dismiss menu error">×</button>
+        </div>
+      `
+    : "";
+
   if (!paletteResults.length) {
-    results.innerHTML = `
+    results.innerHTML = menuActivationErrorMarkup + `
       <div class="state">
         <span class="empty-symbol">⌕</span>
         <strong>No matching menu bar icons</strong>
@@ -3527,7 +3537,7 @@ function render(): void {
         </div>
       `
     : "";
-  results.innerHTML = itemPinErrorMarkup + paletteResults
+  results.innerHTML = menuActivationErrorMarkup + itemPinErrorMarkup + paletteResults
     .map(
       (entry, index) => {
         const icon = resultParent(entry);
@@ -3872,6 +3882,7 @@ function updateSelection(next: number, announce = false, scroll = true): void {
 async function restorePaletteFocus(generation: number): Promise<void> {
   if (generation !== blurDismissGeneration) return;
   await currentWindow.show();
+  if (generation !== blurDismissGeneration) return;
   await currentWindow.setFocus();
   window.setTimeout(() => {
     if (generation === blurDismissGeneration) input.focus();
@@ -4016,6 +4027,7 @@ async function activateScopedAction(action: MenuAction): Promise<void> {
 }
 
 async function activate(icon: MenuIcon): Promise<void> {
+  menuActivationError = null;
   if (icon.savedApp) {
     if (launchingItemId || !icon.itemId || !response) return;
     const itemId = icon.itemId;
@@ -4058,15 +4070,22 @@ async function activate(icon: MenuIcon): Promise<void> {
     }
     return;
   }
+  const generation = blurDismissGeneration;
   await currentWindow.hide();
   try {
     await invoke("activate_menu_icon", { icon });
   } catch (error) {
+    if (generation !== blurDismissGeneration) return;
     if (String(error).toLowerCase().includes("accessibility")) {
       await invoke<boolean>("request_permission", { kind: "accessibility" });
       await invoke("open_privacy_settings", { kind: "accessibility" });
     } else {
-      console.error(error);
+      menuActivationError = `Couldn’t open ${icon.owner}’s menu. ${String(error)}`;
+      blurDismissArmed = false;
+      pendingBlur = false;
+      render();
+      await restorePaletteFocus(generation);
+      armBlurDismissAfterDelay(generation);
     }
   }
 }
@@ -4114,6 +4133,7 @@ input.addEventListener("input", () => {
   selectedIndex = 0;
   selectedItemIdentity = null;
   itemShortcutError = null;
+  menuActivationError = null;
   savedActionError = null;
   actionPinError = null;
   pendingActionUnpinId = null;
@@ -4442,6 +4462,13 @@ results.addEventListener("click", (event) => {
     dismissSavedActionError();
     return;
   }
+  if (target.closest("[data-dismiss-menu-activation-error]")) {
+    event.preventDefault();
+    menuActivationError = null;
+    render();
+    input.focus();
+    return;
+  }
   if (target.closest("[data-dismiss-item-pin-error]")) {
     event.preventDefault();
     itemPinError = null;
@@ -4722,6 +4749,7 @@ void currentWindow.listen("palette-opened", () => {
   actionLoading = false;
   actionRunError = null;
   itemPinError = null;
+  menuActivationError = null;
   actionPinError = null;
   pendingActionUnpinId = null;
   input.value = "";

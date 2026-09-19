@@ -62,15 +62,53 @@ final class CatalogTests: XCTestCase {
         XCTAssertEqual(strict[0]?.id, mole.id)
     }
 
-    func testTargetedLabelValidationRejectsNewDuplicatesAndReplacements() {
+    func testCachedElementSurvivesChangingMetricsAndWidth() {
+        let frame = CGRect(x: 748, y: 4.5, width: 128, height: 24)
+        let original = candidate(label: "CPU 18% Memory 42%", frame: frame)
+        let current = candidate(label: "CPU 76% Memory 43%",
+            frame: CGRect(x: 738, y: 4.5, width: 138, height: 24))
+        let refreshed = uniqueLiveElementCandidate(original,
+            preferredAction: kAXPressAction as String, in: [current])
+
+        XCTAssertEqual(refreshed?.label, current.label)
+        XCTAssertEqual(refreshed?.frame, current.frame)
+        // Without the retained AX identity, a changed label/position remains
+        // insufficient evidence to select an item from a fresh global scan.
+        XCTAssertNil(resolvedAccessibilityCandidate(
+            pid: original.pid, bundleIdentifier: original.bundleIdentifier,
+            identifier: nil, label: original.label, frame: original.frame,
+            preferredAction: kAXPressAction as String, in: [current]
+        ))
+    }
+
+    func testCachedElementValidationRejectsDuplicatesAndReplacementElements() {
         let frame = CGRect(x: 1200, y: 4, width: 24, height: 24)
         let original = candidate(label: "Menu", frame: frame)
-        let moved = candidate(label: "Menu", frame: frame.offsetBy(dx: 1800, dy: -98))
-        XCTAssertNotNil(uniqueLiveLabelCandidate(original, in: [moved]))
-        XCTAssertNil(uniqueLiveLabelCandidate(original, in: [moved, moved]))
-        XCTAssertNil(uniqueLiveLabelCandidate(original,
-            in: [candidate(label: "Replacement", frame: frame)]))
-        XCTAssertNil(uniqueLiveLabelCandidate(original, in: []))
+        // Distinct synthetic AX objects model two items owned by the same app.
+        let replacement = candidate(element: AXUIElementCreateApplication(999),
+            label: "Menu", frame: frame)
+        let resolve: ([AccessibilityCandidate]) -> AccessibilityCandidate? = {
+            uniqueLiveElementCandidate(original,
+                preferredAction: kAXPressAction as String, in: $0)
+        }
+
+        XCTAssertNil(resolve([original, original]))
+        XCTAssertNil(resolve([replacement]))
+        XCTAssertNil(resolve([]))
+        XCTAssertTrue(CFEqual(resolve([replacement, original])?.element, original.element))
+    }
+
+    func testCachedElementRefreshPreservesDisplayBoundary() {
+        let frame = CGRect(x: 1200, y: 4, width: 24, height: 24)
+        let external = display.offsetBy(dx: 1440, dy: 0)
+        let original = candidate(label: "CPU 18%", frame: frame)
+        let moved = candidate(label: "CPU 76%", frame: frame.offsetBy(dx: 1440, dy: 0))
+        let refreshed = uniqueLiveElementCandidate(original,
+            preferredAction: kAXPressAction as String, in: [moved])
+
+        XCTAssertNotNil(refreshed)
+        XCTAssertFalse(activationFramesShareDisplay(requested: original.frame,
+            target: refreshed!.frame, displays: [display, external]))
     }
 
     func testStalePositionCannotSelectAReplacementItem() {
@@ -116,27 +154,26 @@ final class CatalogTests: XCTestCase {
         XCTAssertNil(resolve([candidate(label: "CPU 18%", identifier: "other", frame: frame)]))
     }
 
-    func testCachedLabelTargetsRejectReplacementAndChangedRole() {
+    func testCachedElementRejectsChangedIdentityRoleAndRequestedAction() {
         let frame = CGRect(x: 1200, y: 0, width: 24, height: 24)
         let original = candidate(label: "Original menu", frame: frame)
-        XCTAssertTrue(cachedCandidateIdentityMatches(
-            original, live: candidate(label: "Original menu", frame: frame.offsetBy(dx: 4, dy: 0))
-        ))
         for changed in [
-            candidate(label: "Replacement", frame: frame),
-            candidate(label: "", frame: frame),
             candidate(pid: 999, label: "Original menu", frame: frame),
             candidate(bundle: "other.app", label: "Original menu", frame: frame),
-            candidate(label: "Original menu", role: kAXStaticTextRole as String, frame: frame)
+            candidate(label: "Original menu", role: kAXStaticTextRole as String, frame: frame),
+            candidate(label: "Original menu", frame: frame, actions: [])
         ] {
-            XCTAssertFalse(cachedCandidateIdentityMatches(original, live: changed))
+            XCTAssertNil(uniqueLiveElementCandidate(original,
+                preferredAction: kAXPressAction as String, in: [changed]))
         }
         let stable = candidate(label: "CPU 18%", identifier: "stable", frame: frame)
-        XCTAssertTrue(cachedCandidateIdentityMatches(
-            stable, live: candidate(label: "CPU 76%", identifier: "stable", frame: frame)
+        XCTAssertNotNil(uniqueLiveElementCandidate(
+            stable, preferredAction: kAXPressAction as String,
+            in: [candidate(label: "CPU 76%", identifier: "stable", frame: frame)]
         ))
-        XCTAssertFalse(cachedCandidateIdentityMatches(
-            stable, live: candidate(label: "CPU 18%", identifier: "replacement", frame: frame)
+        XCTAssertNil(uniqueLiveElementCandidate(
+            stable, preferredAction: kAXPressAction as String,
+            in: [candidate(label: "CPU 18%", identifier: "replacement", frame: frame)]
         ))
     }
 
@@ -301,6 +338,7 @@ final class CatalogTests: XCTestCase {
     private let display = CGRect(x: 0, y: 0, width: 1440, height: 900)
 
     private func candidate(
+        element: AXUIElement? = nil,
         pid: pid_t = 100,
         bundle: String = "example.status",
         label: String = "Status",
@@ -310,7 +348,7 @@ final class CatalogTests: XCTestCase {
         actions: Set<String> = [kAXPressAction as String]
     ) -> AccessibilityCandidate {
         AccessibilityCandidate(
-            element: element,
+            element: element ?? self.element,
             pid: pid,
             appName: "Example",
             bundleIdentifier: bundle,
@@ -417,6 +455,29 @@ private func action(
         XCTAssertEqual(result[0].label, "Connected")
         XCTAssertEqual(result[0].identifier, "connection-state")
         XCTAssertTrue(result[0].actions.contains(kAXPressAction as String))
+    }
+
+    func testCachedWrapperRefreshUsesConsolidatedChildMetadata() {
+        let wrapper = candidate(label: "Example",
+            frame: CGRect(x: 1200, y: 0, width: 32, height: 24))
+        let labelElement = AXUIElementCreateApplication(999)
+        func status(_ label: String) -> AccessibilityCandidate {
+            consolidatedStatusCandidates([
+                wrapper,
+                candidate(element: labelElement, label: label,
+                    identifier: "connection-state", role: kAXStaticTextRole as String,
+                    frame: CGRect(x: 1206, y: 4, width: 20, height: 16), actions: [])
+            ])[0]
+        }
+        let original = status("Connected")
+        let current = status("Synchronizing")
+        let refreshed = uniqueLiveElementCandidate(original,
+            preferredAction: kAXPressAction as String, in: [current])
+
+        XCTAssertNil(wrapper.identifier)
+        XCTAssertEqual(refreshed?.identifier, "connection-state")
+        XCTAssertEqual(refreshed?.label, "Synchronizing")
+        XCTAssertTrue(CFEqual(refreshed?.element, wrapper.element))
     }
 
     func testDirectTargetHitDoesNotDependOnProjectedSourceGeometry() {
