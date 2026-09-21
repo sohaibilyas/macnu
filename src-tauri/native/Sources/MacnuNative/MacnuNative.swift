@@ -117,12 +117,20 @@ private struct ActivationSession {
     let accessibilityCandidate: AccessibilityCandidate?
     let accessibilityAction: String?
     let usesProcessTargetedClick: Bool
+    let usesVisibleClick: Bool
 }
 
 private struct AccessibilityActivationResult {
     let action: String?
     let usedProcessTargetedClick: Bool
     let observedPopup: Bool
+    var usedVisibleClick: Bool = false
+
+    var routeDescription: String {
+        if usedVisibleClick { return "verified visible click" }
+        if usedProcessTargetedClick { return "process-targeted click" }
+        return action ?? "Accessibility action"
+    }
 }
 
 private struct CachedIconImage {
@@ -1829,7 +1837,8 @@ private func rememberActivation(
     candidate: AccessibilityCandidate?,
     action: String?,
     baselineWindowIDs: Set<CGWindowID>,
-    usesProcessTargetedClick: Bool = false
+    usesProcessTargetedClick: Bool = false,
+    usesVisibleClick: Bool = false
 ) {
     guard let anchor = menuWindow.map({
         CGPoint(x: $0.bounds.midX, y: $0.bounds.midY)
@@ -1844,7 +1853,8 @@ private func rememberActivation(
         baselineWindowIDs: baselineWindowIDs,
         accessibilityCandidate: candidate,
         accessibilityAction: action,
-        usesProcessTargetedClick: usesProcessTargetedClick
+        usesProcessTargetedClick: usesProcessTargetedClick,
+        usesVisibleClick: usesVisibleClick
     )
     activationSessionLock.lock()
     lastActivationSession = session
@@ -1893,7 +1903,10 @@ private func dismissLastActivatedPopup() {
                 frame: currentFrame,
                 actions: actionNames(of: cachedCandidate.element)
             )
-            if session.usesProcessTargetedClick {
+            if session.usesVisibleClick {
+                _ = activateHostedStatusItem(candidate, displays: displays,
+                    baseline: session.baselineWindowIDs, observePopup: false)
+            } else if session.usesProcessTargetedClick {
                 _ = postProcessTargetedClick(candidate)
             } else {
                 let action = session.accessibilityAction
@@ -2201,6 +2214,126 @@ func activationFramesShareDisplay(
     return requestedDisplay == targetDisplay
 }
 
+private func postVisibleStatusClick(at point: CGPoint) -> Bool {
+    guard let source = CGEventSource(stateID: .hidSystemState),
+          let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
+              mouseCursorPosition: point, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
+              mouseCursorPosition: point, mouseButton: .left) else { return false }
+    configurePlainMenuClick(down)
+    configurePlainMenuClick(up)
+    down.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.035)
+    up.post(tap: .cghidEventTap)
+    return true
+}
+
+private func activateHostedStatusItem(
+    _ candidate: AccessibilityCandidate, displays: [CGRect], baseline: Set<CGWindowID>,
+    observePopup: Bool = true
+) -> AccessibilityActivationResult? {
+    var trace: [String] = []
+    let originalPointer = CGEvent(source: nil)?.location
+    var lastPostedPoint: CGPoint?
+    defer {
+        if let originalPointer, let lastPostedPoint,
+           let current = CGEvent(source: nil)?.location,
+           let restore = statusClickRestorationPoint(original: originalPointer,
+               current: current, posted: lastPostedPoint) {
+            CGWarpMouseCursorPosition(restore)
+        }
+        if diagnosticsEnabled {
+            try? trace.joined(separator: "\n").write(toFile: "/tmp/macnu-generic-activation.log", atomically: true, encoding: .utf8)
+        }
+    }
+    // macOS 27 exposes a host wrapper and a distinct app-owned control. The
+    // legacy AXMenuBarItem proxy can acknowledge AXPress without a real click.
+    // Resolve the host link first, then hit-test the exposed control before
+    // posting one ordinary event pair. No application names affect this route.
+    var matches: [HostedStatusTarget] = []
+    for host in NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent") {
+        let application = AXUIElementCreateApplication(host.processIdentifier)
+        for window in accessibilityElements(from: attribute(kAXChildrenAttribute, from: application))
+            where attribute(kAXRoleAttribute, from: window) as? String == kAXWindowRole as String {
+            guard let windowFrame = frame(of: window), windowFrame.height > 0,
+                  windowFrame.height <= 72,
+                  activationFramesShareDisplay(requested: candidate.frame, target: windowFrame, displays: displays)
+            else { continue }
+            for wrapper in accessibilityElements(from: attribute(kAXChildrenAttribute, from: window)) {
+                var wrapperPID: pid_t = 0
+                guard AXUIElementGetPid(wrapper, &wrapperPID) == .success,
+                      wrapperPID == host.processIdentifier, let bounds = frame(of: wrapper), bounds.height > 0, bounds.height <= 72,
+                      activationFramesShareDisplay(requested: candidate.frame, target: bounds, displays: displays) else { continue }
+                for child in accessibilityElements(from: attribute(kAXChildrenAttribute, from: wrapper)) {
+                    var pid: pid_t = 0
+                    guard AXUIElementGetPid(child, &pid) == .success, pid == candidate.pid,
+                          let bounds = frame(of: child),
+                          statusFramesMatch(bounds, candidate.frame) else { continue }
+                    matches.append(HostedStatusTarget(wrapper: wrapper, child: child,
+                        window: window, hostPID: host.processIdentifier))
+                }
+            }
+        }
+    }
+    trace.append("matches=\(matches.count)")
+    guard let target = uniqueHostedStatusTarget(matches) else { return nil }
+    trace.append("unique target verified")
+    let wrapper = target.wrapper
+    let child = target.child
+    let window = target.window
+    func click(at point: CGPoint) -> Bool {
+        guard postVisibleStatusClick(at: point) else { return false }
+        lastPostedPoint = point
+        return true
+    }
+    func hit(at point: CGPoint) -> AXUIElement? {
+        var element: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &element) == .success else { return nil }
+        return element
+    }
+    func targetPoint() -> CGPoint? {
+        guard let bounds = frame(of: child),
+              activationFramesShareDisplay(requested: candidate.frame, target: bounds, displays: displays),
+              let actual = hit(at: CGPoint(x: bounds.midX, y: bounds.midY)) else { return nil }
+        let lineage = accessibilityLineage(from: actual)
+        trace.append("targetHit=\(actual) frame=\(String(describing: frame(of: actual)))")
+        var actualPID: pid_t = 0
+        let exactOwnedFrame = AXUIElementGetPid(actual, &actualPID) == .success
+            && frame(of: actual).flatMap {
+                verifiedStatusClickPoint(hitPID: actualPID, hitFrame: $0,
+                    targetPID: candidate.pid, targetFrame: bounds,
+                    requestedFrame: candidate.frame, displays: displays)
+            } != nil
+        guard exactOwnedFrame || lineage.contains(where: {
+            CFEqual($0, child) || CFEqual($0, wrapper) || CFEqual($0, candidate.element)
+        }) else { return nil }
+        return CGPoint(x: bounds.midX, y: bounds.midY)
+    }
+    if targetPoint() == nil {
+        let controls = accessibilityElements(from: attribute(kAXChildrenAttribute, from: window)).filter {
+            attribute(kAXRoleAttribute, from: $0) as? String == kAXButtonRole as String
+        }
+        trace.append("overflowControls=\(controls.count) host=\(target.hostPID)")
+        guard controls.count == 1, let bounds = frame(of: controls[0]),
+              bounds.minX > candidate.frame.maxX,
+              activationFramesShareDisplay(requested: candidate.frame, target: bounds, displays: displays),
+              let actual = hit(at: CGPoint(x: bounds.midX, y: bounds.midY)),
+              accessibilityLineage(from: actual).contains(where: { CFEqual($0, controls[0]) }) else { return nil }
+        trace.append("revealing")
+        guard click(at: CGPoint(x: bounds.midX, y: bounds.midY)) else { return nil }
+        for _ in 0..<20 {
+            Thread.sleep(forTimeInterval: 0.02)
+            if targetPoint() != nil { break }
+        }
+    }
+    guard let point = targetPoint() else { trace.append("target not exposed"); return nil }
+    trace.append("clicking \(point)")
+    guard click(at: point) else { return nil }
+    return AccessibilityActivationResult(action: nil, usedProcessTargetedClick: false,
+        observedPopup: observePopup && waitForOpenedPopup(since: baseline, targetPID: candidate.pid, anchor: point),
+        usedVisibleClick: true)
+}
+
 private func performAccessibilityAction(
     on candidate: AccessibilityCandidate,
     preferredAction: String?,
@@ -2208,11 +2341,14 @@ private func performAccessibilityAction(
     requestedFrame: CGRect,
     displays: [CGRect]
 ) -> AccessibilityActivationResult? {
-    // Both AX actions and process-targeted clicks address this exact AX element.
+    // Every activation route must address the selected control on its display.
     // A projected icon must retain a verified window on the requested display.
     guard activationFramesShareDisplay(
         requested: requestedFrame, target: candidate.frame, displays: displays
     ) else { return nil }
+    if let activation = activateHostedStatusItem(candidate, displays: displays, baseline: baselineWindowIDs) {
+        return activation
+    }
     AXUIElementSetMessagingTimeout(
         candidate.element,
         activationAXMessagingTimeout
@@ -3294,14 +3430,12 @@ public func macnuActivateMenuIconJSON(
                 candidate: activationCandidate,
                 action: activation.action,
                 baselineWindowIDs: baselineWindowIDs,
-                usesProcessTargetedClick: activation.usedProcessTargetedClick
+                usesProcessTargetedClick: activation.usedProcessTargetedClick,
+                usesVisibleClick: activation.usedVisibleClick
             )
-            let route = activation.usedProcessTargetedClick
-                ? "process-targeted click"
-                : (activation.action ?? "Accessibility action")
             logResult(String(format:
                 "[Macnu activation] cached %@ in %.1f ms",
-                route,
+                activation.routeDescription,
                 (ProcessInfo.processInfo.systemUptime - activationStartedAt) * 1_000
             ), observedPopup: activation.observedPopup)
             return 0
@@ -3377,7 +3511,8 @@ public func macnuActivateMenuIconJSON(
             candidate: activationCandidate,
             action: activation.action,
             baselineWindowIDs: baselineWindowIDs,
-            usesProcessTargetedClick: activation.usedProcessTargetedClick
+            usesProcessTargetedClick: activation.usedProcessTargetedClick,
+            usesVisibleClick: activation.usedVisibleClick
         )
         if let key = activationCacheKey(for: request) {
             let timestamp = ProcessInfo.processInfo.systemUptime
@@ -3389,12 +3524,9 @@ public func macnuActivateMenuIconJSON(
                 )
             ], at: timestamp)
         }
-        let route = activation.usedProcessTargetedClick
-            ? "process-targeted click"
-            : (activation.action ?? "Accessibility action")
         logResult(String(format:
             "[Macnu activation] refreshed %@ in %.1f ms",
-            route,
+            activation.routeDescription,
             (ProcessInfo.processInfo.systemUptime - activationStartedAt) * 1_000
         ), observedPopup: activation.observedPopup)
         return 0
