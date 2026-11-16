@@ -197,6 +197,103 @@ final class CatalogTests: XCTestCase {
         }
     }
 
+    func testItemThatMovedToAnotherDisplayStillResolvesByIdentity() {
+        let external = CGRect(x: 1440, y: -180, width: 1920, height: 1080)
+        let monitors = [display, external]
+        // Catalogued 240pt from the built-in display's right edge.
+        let catalogued = CGRect(x: 1200, y: 4, width: 24, height: 24)
+        // macOS now reports the same item on the external display.
+        let moved = CGRect(x: external.maxX - 240, y: external.minY + 4,
+                           width: 24, height: 24)
+        func resolve(
+            _ items: [AccessibilityCandidate], displays: [CGRect]
+        ) -> AccessibilityCandidate? {
+            resolvedAccessibilityCandidate(
+                pid: 100, bundleIdentifier: "example.status", identifier: nil,
+                label: "Status", frame: catalogued,
+                preferredAction: kAXPressAction as String, in: items,
+                displays: displays
+            )
+        }
+        XCTAssertEqual(resolve([candidate(frame: moved)], displays: monitors)?.frame, moved)
+        // Without display knowledge the old global comparison still applies.
+        XCTAssertNil(resolve([candidate(frame: moved)], displays: []))
+        // A different label, a different slot, or duplicates stay rejected.
+        XCTAssertNil(resolve([candidate(label: "Other", frame: moved)], displays: monitors))
+        XCTAssertNil(resolve(
+            [candidate(frame: moved.offsetBy(dx: -60, dy: 0))], displays: monitors
+        ))
+        XCTAssertNil(resolve(
+            [candidate(frame: moved), candidate(frame: moved)], displays: monitors
+        ))
+        // A copy that is still on the catalogued display always wins.
+        let local = candidate(frame: catalogued)
+        XCTAssertEqual(
+            resolve([local, candidate(frame: moved)], displays: monitors)?.frame,
+            catalogued
+        )
+    }
+
+    func testGeometryWaitReturnsOnceTheItemReachesTheRequestedDisplay() {
+        let external = display.offsetBy(dx: 1440, dy: 0)
+        let monitors = [display, external]
+        let requested = CGRect(x: external.minX + 900, y: 0, width: 24, height: 24)
+        let away = CGRect(x: 900, y: 0, width: 24, height: 24)
+        var reads = 0
+        var sleeps = 0
+        let settled = settledStatusFrame(
+            requested: requested, displays: monitors,
+            read: { reads += 1; return reads < 4 ? away : requested },
+            sleep: { _ in sleeps += 1 }
+        )
+        XCTAssertEqual(settled, requested)
+        XCTAssertEqual(sleeps, 3)
+
+        var timedOutSleeps = 0
+        XCTAssertNil(settledStatusFrame(
+            requested: requested, displays: monitors, timeout: 0.09, interval: 0.025,
+            read: { away }, sleep: { _ in timedOutSleeps += 1 }
+        ))
+        XCTAssertEqual(timedOutSleeps, 4)
+        // Already on the requested display: no waiting at all.
+        XCTAssertEqual(settledStatusFrame(
+            requested: requested, displays: monitors,
+            read: { requested }, sleep: { _ in XCTFail("Must not wait") }
+        ), requested)
+    }
+
+    func testCrossDisplayWindowRequiresOneItemAndOneOwnedWindow() {
+        let external = display.offsetBy(dx: 1440, dy: 0)
+        let monitors = [display, external]
+        let item = candidate(frame: CGRect(x: 1200, y: 4, width: 24, height: 24))
+        func window(
+            _ id: CGWindowID, pid: pid_t = 100, x: CGFloat, width: CGFloat = 24
+        ) -> MenuWindow {
+            MenuWindow(id: id, pid: pid, owner: "Example",
+                bounds: CGRect(x: x, y: 0, width: width, height: 24), isOnScreen: true)
+        }
+        let copy = window(1, x: external.minX + 1200)
+        func resolve(
+            _ windows: [MenuWindow],
+            candidates: [AccessibilityCandidate]? = nil,
+            target: CGRect? = nil
+        ) -> MenuWindow? {
+            crossDisplayOwnedWindow(
+                for: item, candidates: candidates ?? [item], windows: windows,
+                targetDisplay: target ?? external, displays: monitors
+            )
+        }
+        XCTAssertEqual(resolve([copy, window(2, x: 1200)])?.id, copy.id)
+        // Another process's window is never borrowed.
+        XCTAssertNil(resolve([window(3, pid: 1073, x: external.minX + 1200)]))
+        // Two windows, two items, or a mismatched width are ambiguous.
+        XCTAssertNil(resolve([copy, window(4, x: external.minX + 1300)]))
+        XCTAssertNil(resolve([copy], candidates: [item, item]))
+        XCTAssertNil(resolve([window(5, x: external.minX + 1200, width: 126)]))
+        // The item already lives on the requested display: not this route.
+        XCTAssertNil(resolve([window(6, x: 1200)], target: display))
+    }
+
     func testDisconnectedAndInvalidDisplayTargetsFailClosed() {
         let local = CGRect(x: 1200, y: 0, width: 24, height: 24)
         let disconnected = local.offsetBy(dx: 1440, dy: 0)

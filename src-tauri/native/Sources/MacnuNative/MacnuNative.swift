@@ -1932,7 +1932,8 @@ func resolvedAccessibilityCandidate(
     label: String,
     frame: CGRect?,
     preferredAction: String?,
-    in candidates: [AccessibilityCandidate]
+    in candidates: [AccessibilityCandidate],
+    displays: [CGRect] = []
 ) -> AccessibilityCandidate? {
     let matchingProcess = candidates.filter { candidate in
         guard candidate.pid == pid else { return false }
@@ -1947,13 +1948,40 @@ func resolvedAccessibilityCandidate(
     }
     guard !matchingProcess.isEmpty else { return nil }
 
+    // macOS reports a status item's geometry on whichever display currently
+    // owns the active menu bar, so the same item can move between monitors
+    // after it was catalogued. When none of this process's items remain on
+    // the catalogued display, compare positions relative to each display's
+    // top-right corner instead of in global coordinates. Identity (process,
+    // identifier or label, uniqueness) is still required below.
+    let requestedDisplay = frame.flatMap {
+        activationTargetDisplay(for: $0, in: displays)
+    }
+    let compareAcrossDisplays = requestedDisplay != nil
+        && !matchingProcess.contains {
+            activationTargetDisplay(for: $0.frame, in: displays) == requestedDisplay
+        }
+
     func frameDistance(_ candidate: AccessibilityCandidate) -> CGFloat {
         guard let frame else { return .greatestFiniteMagnitude }
+        var candidateFrame = candidate.frame
+        var requestedFrame = frame
+        if compareAcrossDisplays, let requestedDisplay,
+           let candidateDisplay = activationTargetDisplay(
+               for: candidate.frame, in: displays
+           ) {
+            candidateFrame = candidateFrame.offsetBy(
+                dx: -candidateDisplay.maxX, dy: -candidateDisplay.minY
+            )
+            requestedFrame = requestedFrame.offsetBy(
+                dx: -requestedDisplay.maxX, dy: -requestedDisplay.minY
+            )
+        }
         return max(
-            abs(candidate.frame.midX - frame.midX),
-            abs(candidate.frame.midY - frame.midY),
-            abs(candidate.frame.width - frame.width),
-            abs(candidate.frame.height - frame.height)
+            abs(candidateFrame.midX - requestedFrame.midX),
+            abs(candidateFrame.midY - requestedFrame.midY),
+            abs(candidateFrame.width - requestedFrame.width),
+            abs(candidateFrame.height - requestedFrame.height)
         )
     }
 
@@ -2214,6 +2242,97 @@ func activationFramesShareDisplay(
     return requestedDisplay == targetDisplay
 }
 
+/// Waits for macOS to report a status item on the display the user selected.
+/// The active menu bar (and with it every status item's live geometry) follows
+/// keyboard focus between monitors a moment after focus changes.
+func settledStatusFrame(
+    requested: CGRect,
+    displays: [CGRect],
+    timeout: TimeInterval = 0.4,
+    interval: TimeInterval = 0.025,
+    read: () -> CGRect?,
+    sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+) -> CGRect? {
+    var waited: TimeInterval = 0
+    while true {
+        if let current = read(), activationFramesShareDisplay(
+            requested: requested, target: current, displays: displays
+        ) {
+            return current
+        }
+        guard waited < timeout else { return nil }
+        sleep(interval)
+        waited += interval
+    }
+}
+
+/// When an item's live geometry stays on another display, its copy on the
+/// requested display may still be clicked if the owning process has exactly
+/// one status item and exactly one status-level window there. Anything less
+/// certain is refused rather than paired by position.
+func crossDisplayOwnedWindow(
+    for candidate: AccessibilityCandidate,
+    candidates: [AccessibilityCandidate],
+    windows: [MenuWindow],
+    targetDisplay: CGRect,
+    displays: [CGRect]
+) -> MenuWindow? {
+    guard let sourceDisplay = activationTargetDisplay(
+        for: candidate.frame, in: displays
+    ), sourceDisplay != targetDisplay,
+        candidates.filter({ $0.pid == candidate.pid }).count == 1
+    else { return nil }
+    let owned = windows.filter {
+        $0.pid == candidate.pid
+            && activationTargetDisplay(for: $0.bounds, in: displays) == targetDisplay
+    }
+    guard owned.count == 1, let window = owned.first,
+          abs(window.bounds.width - candidate.frame.width)
+              <= max(4, candidate.frame.width * 0.15)
+    else { return nil }
+    return window
+}
+
+/// Frame of the single hosted control that `pid` owns on `targetDisplay`.
+/// The menu-bar host keeps one window per display, so this finds the copy on
+/// the user's monitor even while the app's own geometry sits on another one.
+private func hostedStatusFrame(
+    ownedBy pid: pid_t, on targetDisplay: CGRect, displays: [CGRect]
+) -> CGRect? {
+    var frames: [CGRect] = []
+    for host in NSRunningApplication.runningApplications(
+        withBundleIdentifier: "com.apple.MenuBarAgent"
+    ) {
+        let application = AXUIElementCreateApplication(host.processIdentifier)
+        for window in accessibilityElements(
+            from: attribute(kAXChildrenAttribute, from: application)
+        ) where attribute(kAXRoleAttribute, from: window) as? String
+            == kAXWindowRole as String {
+            guard let windowFrame = frame(of: window), windowFrame.height > 0,
+                  windowFrame.height <= 72,
+                  activationTargetDisplay(for: windowFrame, in: displays)
+                      == targetDisplay
+            else { continue }
+            for wrapper in accessibilityElements(
+                from: attribute(kAXChildrenAttribute, from: window)
+            ) {
+                for child in accessibilityElements(
+                    from: attribute(kAXChildrenAttribute, from: wrapper)
+                ) {
+                    var childPID: pid_t = 0
+                    guard AXUIElementGetPid(child, &childPID) == .success,
+                          childPID == pid, let bounds = frame(of: child),
+                          activationTargetDisplay(for: bounds, in: displays)
+                              == targetDisplay
+                    else { continue }
+                    frames.append(bounds)
+                }
+            }
+        }
+    }
+    return frames.count == 1 ? frames[0] : nil
+}
+
 private func postVisibleStatusClick(at point: CGPoint) -> Bool {
     guard let source = CGEventSource(stateID: .hidSystemState),
           let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
@@ -2339,14 +2458,18 @@ private func performAccessibilityAction(
     preferredAction: String?,
     baselineWindowIDs: Set<CGWindowID>,
     requestedFrame: CGRect,
-    displays: [CGRect]
+    displays: [CGRect],
+    allowCrossDisplaySemanticAction: Bool = false
 ) -> AccessibilityActivationResult? {
-    // Every activation route must address the selected control on its display.
-    // A projected icon must retain a verified window on the requested display.
-    guard activationFramesShareDisplay(
+    // Every click route must address the selected control on its display.
+    // When the item's geometry stays on another monitor, only a semantic
+    // Accessibility action on the exact element is allowed: it cannot hit a
+    // neighbouring item, whichever display macOS opens the menu on.
+    let sharesDisplay = activationFramesShareDisplay(
         requested: requestedFrame, target: candidate.frame, displays: displays
-    ) else { return nil }
-    if let activation = activateHostedStatusItem(candidate, displays: displays, baseline: baselineWindowIDs) {
+    )
+    guard sharesDisplay || allowCrossDisplaySemanticAction else { return nil }
+    if sharesDisplay, let activation = activateHostedStatusItem(candidate, displays: displays, baseline: baselineWindowIDs) {
         return activation
     }
     AXUIElementSetMessagingTimeout(
@@ -2384,7 +2507,7 @@ private func performAccessibilityAction(
             )
         }
     }
-    if postProcessTargetedClick(candidate) {
+    if sharesDisplay, postProcessTargetedClick(candidate) {
         let observedPopup = waitForOpenedPopup(
             since: baselineWindowIDs,
             targetPID: candidate.pid,
@@ -2418,7 +2541,8 @@ private func resolvedStatusItem(
     let candidates = accessibilityCandidates()
     guard let candidate = cachedActivationCandidate(
         for: request,
-        in: candidates
+        in: candidates,
+        displays: displays
     ) else {
         return nil
     }
@@ -2516,7 +2640,8 @@ private func performDiscoveredMenuAction(
 
 private func cachedActivationCandidate(
     for request: ActivationRequest,
-    in candidates: [AccessibilityCandidate]
+    in candidates: [AccessibilityCandidate],
+    displays: [CGRect] = []
 ) -> AccessibilityCandidate? {
     guard let activationPid = request.activationPid else { return nil }
     let cachedFrame: CGRect?
@@ -2535,7 +2660,8 @@ private func cachedActivationCandidate(
         label: request.label,
         frame: cachedFrame,
         preferredAction: request.activationAction,
-        in: candidates
+        in: candidates,
+        displays: displays
     )
 }
 
@@ -3382,6 +3508,20 @@ public func macnuActivateMenuIconJSON(
     // Enter. Validate only the selected AX element and its previously matched
     // WindowServer window; never infer a neighbouring window here.
     let cachedTarget = cachedActivationTarget(for: request)
+    // Closing the palette returns focus to the previous app, and macOS can
+    // move every status item's geometry to that app's monitor. Give it a
+    // moment to settle on the requested display before validating anything.
+    var waitedForGeometry = false
+    if let cachedTarget,
+       let liveFrame = frame(of: cachedTarget.candidate.element),
+       !activationFramesShareDisplay(
+           requested: requestedFrame, target: liveFrame, displays: displays
+       ) {
+        waitedForGeometry = true
+        _ = settledStatusFrame(requested: requestedFrame, displays: displays, read: {
+            frame(of: cachedTarget.candidate.element)
+        })
+    }
     let cachedCandidate = cachedTarget.flatMap {
         liveCachedCandidate($0.candidate, for: request)
     }
@@ -3446,14 +3586,35 @@ public func macnuActivateMenuIconJSON(
     // A cache miss means the selected element disappeared, moved, or is older
     // than the retained catalog. Only that exceptional case pays for a fresh
     // all-item scan and confidence match.
-    let accessibilityItems = accessibilityCandidates()
-    guard let activationCandidate = cachedActivationCandidate(
+    var accessibilityItems = accessibilityCandidates()
+    guard var activationCandidate = cachedActivationCandidate(
         for: request,
-        in: accessibilityItems
+        in: accessibilityItems,
+        displays: displays
     ) else {
         logResult("[Macnu activation] accessibility item is no longer available")
         return 1
     }
+    if !waitedForGeometry, !activationFramesShareDisplay(
+        requested: requestedFrame, target: activationCandidate.frame, displays: displays
+    ) {
+        let element = activationCandidate.element
+        if settledStatusFrame(requested: requestedFrame, displays: displays, read: {
+            frame(of: element)
+        }) != nil {
+            let settledItems = accessibilityCandidates()
+            if let settled = cachedActivationCandidate(
+                for: request, in: settledItems, displays: displays
+            ) {
+                accessibilityItems = settledItems
+                activationCandidate = settled
+            }
+        }
+    }
+    let livesOnAnotherDisplay = !activationFramesShareDisplay(
+        requested: requestedFrame, target: activationCandidate.frame, displays: displays
+    )
+    if livesOnAnotherDisplay { cacheState += "+cross-display" }
     let baselineWindowIDs = Set(onScreenWindows().map(\.id))
     let menuWindow = confidentMenuWindow(
         for: request,
@@ -3499,12 +3660,77 @@ public func macnuActivateMenuIconJSON(
         return 0
     }
 
+    // The item's live geometry stayed on another monitor. Prefer its copy on
+    // the display the user is working on, and only when that copy is the one
+    // unambiguous item this process owns there.
+    if livesOnAnotherDisplay,
+       accessibilityItems.filter({ $0.pid == activationCandidate.pid }).count == 1,
+       let targetDisplay = activationTargetDisplay(for: requestedFrame, in: displays) {
+        if let hostedFrame = hostedStatusFrame(
+            ownedBy: activationCandidate.pid, on: targetDisplay, displays: displays
+        ) {
+            let local = AccessibilityCandidate(
+                element: activationCandidate.element,
+                pid: activationCandidate.pid,
+                appName: activationCandidate.appName,
+                bundleIdentifier: activationCandidate.bundleIdentifier,
+                label: activationCandidate.label,
+                identifier: activationCandidate.identifier,
+                role: activationCandidate.role,
+                frame: hostedFrame,
+                actions: activationCandidate.actions
+            )
+            if let activation = activateHostedStatusItem(
+                local, displays: displays, baseline: baselineWindowIDs
+            ) {
+                rememberActivation(
+                    menuWindow: nil,
+                    candidate: local,
+                    action: activation.action,
+                    baselineWindowIDs: baselineWindowIDs,
+                    usesProcessTargetedClick: activation.usedProcessTargetedClick,
+                    usesVisibleClick: activation.usedVisibleClick
+                )
+                logResult(String(format:
+                    "[Macnu activation] cross-display hosted click in %.1f ms",
+                    (ProcessInfo.processInfo.systemUptime - activationStartedAt) * 1_000
+                ), observedPopup: activation.observedPopup)
+                return 0
+            }
+        }
+        if let ownedWindow = crossDisplayOwnedWindow(
+            for: activationCandidate,
+            candidates: accessibilityItems,
+            windows: menuWindows(in: displays),
+            targetDisplay: targetDisplay,
+            displays: displays
+        ), postMenuWindowClick(ownedWindow) {
+            let observedPopup = waitForOpenedPopup(
+                since: baselineWindowIDs,
+                targetPID: activationCandidate.pid,
+                anchor: CGPoint(x: ownedWindow.bounds.midX, y: ownedWindow.bounds.midY)
+            )
+            rememberActivation(
+                menuWindow: ownedWindow,
+                candidate: activationCandidate,
+                action: request.activationAction,
+                baselineWindowIDs: baselineWindowIDs
+            )
+            logResult(String(format:
+                "[Macnu activation] cross-display WindowServer click in %.1f ms",
+                (ProcessInfo.processInfo.systemUptime - activationStartedAt) * 1_000
+            ), observedPopup: observedPopup)
+            return 0
+        }
+    }
+
     if let activation = performAccessibilityAction(
         on: activationCandidate,
         preferredAction: request.activationAction,
         baselineWindowIDs: baselineWindowIDs,
         requestedFrame: requestedFrame,
-        displays: displays
+        displays: displays,
+        allowCrossDisplaySemanticAction: true
     ) {
         rememberActivation(
             menuWindow: nil,
@@ -3514,7 +3740,7 @@ public func macnuActivateMenuIconJSON(
             usesProcessTargetedClick: activation.usedProcessTargetedClick,
             usesVisibleClick: activation.usedVisibleClick
         )
-        if let key = activationCacheKey(for: request) {
+        if !livesOnAnotherDisplay, let key = activationCacheKey(for: request) {
             let timestamp = ProcessInfo.processInfo.systemUptime
             storeActivationTargets([
                 key: CachedActivationTarget(

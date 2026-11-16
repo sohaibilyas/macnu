@@ -5,6 +5,8 @@ import {
   paletteResultLabel,
   pinnedFirstWhenIdle,
   pointerPositionChanged,
+  PENDING_GEOMETRY_RETRY_LIMIT,
+  shouldRetryPendingGeometry,
 } from "./palette-behavior";
 
 describe("direct-shortcut error keyboard policy", () => {
@@ -85,5 +87,19 @@ describe("palette result labels", () => {
   it("keeps native activation metadata out of the visible Macnu title", () => {
     expect(paletteResultLabel(true, "Macnu \u2014 Command+Semicolon")).toBe("Macnu");
     expect(paletteResultLabel(false, "Work VPN")).toBe("Work VPN");
+  });
+});
+
+describe("pending display geometry rescans", () => {
+  it("rescans only a flagged catalog and stops at the limit", () => {
+    expect(shouldRetryPendingGeometry(true, 0)).toBe(true);
+    expect(
+      shouldRetryPendingGeometry(true, PENDING_GEOMETRY_RETRY_LIMIT - 1),
+    ).toBe(true);
+    expect(
+      shouldRetryPendingGeometry(true, PENDING_GEOMETRY_RETRY_LIMIT),
+    ).toBe(false);
+    expect(shouldRetryPendingGeometry(false, 0)).toBe(false);
+    expect(shouldRetryPendingGeometry(undefined, 0)).toBe(false);
   });
 });

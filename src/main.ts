@@ -13,6 +13,8 @@ import {
   pinnedFirstWhenIdle,
   pointerPositionChanged,
   type PointerPosition,
+  PENDING_GEOMETRY_RETRY_DELAY_MS,
+  shouldRetryPendingGeometry,
 } from "./palette-behavior";
 import {
   buildPaletteResults,
@@ -2198,6 +2200,8 @@ let refreshing = false;
 let queuedRefresh = false;
 let queuedPermissionPrompt = false;
 let queuedForceRefresh = false;
+let pendingGeometryAttempts = 0;
+let pendingGeometryTimer: number | null = null;
 let selectedIndex = 0;
 let permissionFlowStarted = false;
 let accessibilityFlowStarted = false;
@@ -3775,6 +3779,28 @@ function applyResponse(
   render();
 }
 
+function schedulePendingGeometryRefresh(next: MenuResponse): void {
+  if (pendingGeometryTimer !== null) {
+    window.clearTimeout(pendingGeometryTimer);
+    pendingGeometryTimer = null;
+  }
+  if (!next.geometryPending) {
+    pendingGeometryAttempts = 0;
+    return;
+  }
+  if (!shouldRetryPendingGeometry(next.geometryPending, pendingGeometryAttempts)) {
+    return;
+  }
+  pendingGeometryAttempts += 1;
+  pendingGeometryTimer = window.setTimeout(() => {
+    pendingGeometryTimer = null;
+    void currentWindow.isVisible().then((visible) => {
+      // A forced scan bypasses the cached catalog that was flagged as pending.
+      if (visible) void refreshIcons(false, true);
+    });
+  }, PENDING_GEOMETRY_RETRY_DELAY_MS);
+}
+
 async function refreshIcons(
   promptPermissions = false,
   force = false,
@@ -3792,6 +3818,7 @@ async function refreshIcons(
   try {
     next = await invoke<MenuResponse>("list_menu_icons", { force });
     applyResponse(next, force);
+    schedulePendingGeometryRefresh(next);
   } catch (error) {
     next = {
       icons: [],
@@ -3822,6 +3849,7 @@ async function refreshIcons(
 
 async function openPalette(generation: number): Promise<void> {
   selectedIndex = 0;
+  pendingGeometryAttempts = 0;
 
   try {
     const snapshot = await invoke<ActiveDisplayCache>(
@@ -3838,6 +3866,8 @@ async function openPalette(generation: number): Promise<void> {
     if (!snapshot.response || snapshot.stale) {
       // Updating an existing catalog must not re-prompt optional permissions.
       void refreshIcons(!snapshot.response);
+    } else {
+      schedulePendingGeometryRefresh(snapshot.response);
     }
   } catch {
     if (generation !== blurDismissGeneration) return;

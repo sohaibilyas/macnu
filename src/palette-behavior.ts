@@ -65,3 +65,16 @@ export function paletteResultLabel(
 ): string {
   return isMacnu ? "Macnu" : personalizedLabel;
 }
+
+export const PENDING_GEOMETRY_RETRY_LIMIT = 2;
+export const PENDING_GEOMETRY_RETRY_DELAY_MS = 350;
+
+// macOS moves menu bar item positions to the newly focused display a moment
+// after the palette opens. A catalog captured mid-move is flagged as pending;
+// rescan a bounded number of times instead of keeping the stale positions.
+export function shouldRetryPendingGeometry(
+  geometryPending: boolean | undefined,
+  attempts: number,
+): boolean {
+  return geometryPending === true && attempts < PENDING_GEOMETRY_RETRY_LIMIT;
+}
