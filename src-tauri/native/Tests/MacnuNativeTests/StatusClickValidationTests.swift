@@ -41,6 +41,33 @@ final class StatusClickValidationTests: XCTestCase {
         XCTAssertNil(statusClickRestorationPoint(original: original, current: original, posted: clicked))
     }
 
+    func testCollapsedItemsStackedUnderTheOverflowControlAreRevealed() {
+        // Frames reported by macOS 27 with the menu bar collapsed.
+        let control = CGRect(x: 871, y: 1, width: 17.5, height: 30)
+        for hidden in [
+            CGRect(x: 837, y: 4.5, width: 52, height: 24),
+            CGRect(x: 853, y: 4.5, width: 36, height: 24),
+            CGRect(x: 857, y: 4.5, width: 24, height: 24),
+            // Earlier layouts end entirely to the control's left.
+            CGRect(x: 700, y: 4.5, width: 24, height: 24)
+        ] {
+            XCTAssertTrue(statusItemIsBehindOverflowControl(item: hidden, control: control))
+        }
+        for visible in [
+            CGRect(x: 895, y: 4.5, width: 32, height: 24),
+            CGRect(x: 1267, y: 5.5, width: 22, height: 22),
+            control
+        ] {
+            XCTAssertFalse(statusItemIsBehindOverflowControl(item: visible, control: control))
+        }
+        for invalid in [CGRect.zero, CGRect.infinite, CGRect.null] {
+            XCTAssertFalse(statusItemIsBehindOverflowControl(item: invalid, control: control))
+            XCTAssertFalse(statusItemIsBehindOverflowControl(
+                item: CGRect(x: 837, y: 4.5, width: 52, height: 24), control: invalid
+            ))
+        }
+    }
+
     func testRepeatedReferencesAreDeduplicatedButDifferentTargetsAreRejected() {
         let wrapper = AXUIElementCreateApplication(100)
         let child = AXUIElementCreateApplication(42)

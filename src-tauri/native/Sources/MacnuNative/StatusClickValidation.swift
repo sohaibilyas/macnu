@@ -26,6 +26,16 @@ func statusFramesMatch(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
         && abs(lhs.width - rhs.width) <= 1 && abs(lhs.height - rhs.height) <= 1
 }
 
+/// Whether a status item sits on the collapsed side of the menu bar's
+/// overflow control. Collapsed items either end to the control's left or are
+/// stacked underneath it; visible items always start to its right.
+func statusItemIsBehindOverflowControl(item: CGRect, control: CGRect) -> Bool {
+    [item, control].allSatisfy {
+        !$0.isNull && !$0.isInfinite && $0.width > 0 && $0.height > 0
+            && [$0.minX, $0.minY, $0.width, $0.height].allSatisfy(\.isFinite)
+    } && item.minX < control.minX
+}
+
 func verifiedStatusClickPoint(
     hitPID: pid_t, hitFrame: CGRect, targetPID: pid_t, targetFrame: CGRect,
     requestedFrame: CGRect, displays: [CGRect]

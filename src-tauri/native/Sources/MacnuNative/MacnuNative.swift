@@ -2433,16 +2433,36 @@ private func activateHostedStatusItem(
             attribute(kAXRoleAttribute, from: $0) as? String == kAXButtonRole as String
         }
         trace.append("overflowControls=\(controls.count) host=\(target.hostPID)")
+        // macOS 27 stacks collapsed items underneath the "Show Hidden Menu
+        // Bar Items" control, so their frames overlap it instead of ending to
+        // its left. Reveal only an item that starts on the hidden side.
         guard controls.count == 1, let bounds = frame(of: controls[0]),
-              bounds.minX > candidate.frame.maxX,
+              statusItemIsBehindOverflowControl(item: candidate.frame, control: bounds),
               activationFramesShareDisplay(requested: candidate.frame, target: bounds, displays: displays),
-              let actual = hit(at: CGPoint(x: bounds.midX, y: bounds.midY)),
-              accessibilityLineage(from: actual).contains(where: { CFEqual($0, controls[0]) }) else { return nil }
+              let actual = hit(at: CGPoint(x: bounds.midX, y: bounds.midY)) else {
+            trace.append("overflow control rejected")
+            return nil
+        }
+        var actualPID: pid_t = 0
+        let hitIsControl = accessibilityLineage(from: actual).contains(where: {
+            CFEqual($0, controls[0])
+        }) || (AXUIElementGetPid(actual, &actualPID) == .success
+            && actualPID == target.hostPID
+            && (frame(of: actual).map { statusFramesMatch($0, bounds) } ?? false))
+        guard hitIsControl else {
+            trace.append("overflow control not hit")
+            return nil
+        }
         trace.append("revealing")
         guard click(at: CGPoint(x: bounds.midX, y: bounds.midY)) else { return nil }
-        for _ in 0..<20 {
+        // The bar animates open. Wait until the item reports the same
+        // clickable point twice so the click cannot land mid-animation.
+        var previous: CGPoint?
+        for _ in 0..<50 {
             Thread.sleep(forTimeInterval: 0.02)
-            if targetPoint() != nil { break }
+            let current = targetPoint()
+            if let current, current == previous { break }
+            previous = current
         }
     }
     guard let point = targetPoint() else { trace.append("target not exposed"); return nil }
