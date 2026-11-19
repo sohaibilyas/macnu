@@ -68,6 +68,46 @@ final class StatusClickValidationTests: XCTestCase {
         }
     }
 
+    func testOpenedMenuKeepsTheBarExpandedUntilItCloses() {
+        let anchor = CGPoint(x: 869, y: 16)
+        func open(_ windows: [OnScreenWindow], baseline: Set<CGWindowID> = []) -> Bool {
+            statusPopupIsOpen(windows: windows, baseline: baseline, itemPID: 42, anchor: anchor)
+        }
+        let menu = OnScreenWindow(id: 1, pid: 42,
+            bounds: CGRect(x: 820, y: 33, width: 240, height: 300), layer: 101)
+        XCTAssertTrue(open([menu]))
+        // A popover hosted by another process still floats below the item.
+        XCTAssertTrue(open([OnScreenWindow(id: 2, pid: 7,
+            bounds: CGRect(x: 800, y: 33, width: 320, height: 400), layer: 101)]))
+        // The app's own normal-level dropdown panel counts too.
+        XCTAssertTrue(open([OnScreenWindow(id: 3, pid: 42,
+            bounds: CGRect(x: 820, y: 33, width: 240, height: 300))]))
+        // Windows that existed before, sit elsewhere, or are ordinary windows
+        // of other apps never keep the bar expanded.
+        XCTAssertFalse(open([menu], baseline: [1]))
+        XCTAssertFalse(open([OnScreenWindow(id: 4, pid: 42,
+            bounds: CGRect(x: 100, y: 300, width: 600, height: 400))]))
+        XCTAssertFalse(open([OnScreenWindow(id: 5, pid: 7,
+            bounds: CGRect(x: 0, y: 33, width: 1512, height: 900))]))
+        XCTAssertFalse(open([]))
+    }
+
+    func testCollapseWaitsWhileTheMenuBarIsInUse() {
+        XCTAssertFalse(overflowCollapseShouldWait(OverflowCollapseConditions()))
+        XCTAssertTrue(overflowCollapseShouldWait(OverflowCollapseConditions(menuOpen: true)))
+        XCTAssertTrue(overflowCollapseShouldWait(OverflowCollapseConditions(launcherActive: true)))
+        XCTAssertTrue(overflowCollapseShouldWait(OverflowCollapseConditions(mouseDown: true)))
+        XCTAssertTrue(overflowCollapseShouldWait(OverflowCollapseConditions(pointerInMenuBar: true)))
+
+        let builtIn = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let external = CGRect(x: 1512, y: -98, width: 1920, height: 1080)
+        XCTAssertTrue(pointIsInMenuBar(CGPoint(x: 900, y: 12), display: builtIn))
+        XCTAssertFalse(pointIsInMenuBar(CGPoint(x: 900, y: 200), display: builtIn))
+        // The other display's menu bar is not this display's menu bar.
+        XCTAssertFalse(pointIsInMenuBar(CGPoint(x: 2000, y: -90), display: builtIn))
+        XCTAssertTrue(pointIsInMenuBar(CGPoint(x: 2000, y: -90), display: external))
+    }
+
     func testRepeatedReferencesAreDeduplicatedButDifferentTargetsAreRejected() {
         let wrapper = AXUIElementCreateApplication(100)
         let child = AXUIElementCreateApplication(42)

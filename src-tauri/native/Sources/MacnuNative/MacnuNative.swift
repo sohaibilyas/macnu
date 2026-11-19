@@ -15,10 +15,11 @@ struct MenuWindow {
     let isOnScreen: Bool
 }
 
-private struct OnScreenWindow {
+struct OnScreenWindow {
     let id: CGWindowID
     let pid: pid_t
     let bounds: CGRect
+    var layer: Int = 0
 }
 
 struct AccessibilityCandidate {
@@ -1782,7 +1783,8 @@ private func onScreenWindows() -> [OnScreenWindow] {
         return OnScreenWindow(
             id: CGWindowID(number),
             pid: pid_t(pid),
-            bounds: bounds
+            bounds: bounds,
+            layer: layer
         )
     }
 }
@@ -2347,11 +2349,195 @@ private func postVisibleStatusClick(at point: CGPoint) -> Bool {
     return true
 }
 
+// MARK: - Collapsing the menu bar again after Macnu expanded it
+
+/// Everything needed to put the macOS 27 menu bar back the way Macnu found it
+/// once the menu it opened has closed.
+private struct OverflowCollapseContext {
+    let window: AXUIElement
+    let wrapper: AXUIElement
+    let child: AXUIElement
+    let itemElement: AXUIElement
+    let itemPID: pid_t
+    let hostPID: pid_t
+    let baseline: Set<CGWindowID>
+    var anchor: CGPoint
+    let display: CGRect
+}
+
+private let overflowCollapseQueue = DispatchQueue(
+    label: "com.qoest.macnu.overflow-collapse"
+)
+private let overflowCollapseStateLock = NSLock()
+/// Held only while the watcher posts its click, so a new activation never
+/// starts in the middle of a collapse. Never held across a wait.
+private let overflowActionLock = NSLock()
+private var overflowCollapseGeneration: UInt64 = 0
+private var overflowExpandedByMacnu = false
+private var overflowCollapseStoredContext: OverflowCollapseContext?
+
+/// Stops any running watcher and reports whether Macnu still owes a collapse.
+private func suspendOverflowCollapse() -> (owed: Bool, context: OverflowCollapseContext?) {
+    overflowCollapseStateLock.lock()
+    defer { overflowCollapseStateLock.unlock() }
+    overflowCollapseGeneration &+= 1
+    return (overflowExpandedByMacnu, overflowCollapseStoredContext)
+}
+
+private func overflowCollapseIsCurrent(_ generation: UInt64) -> Bool {
+    overflowCollapseStateLock.lock()
+    defer { overflowCollapseStateLock.unlock() }
+    return overflowCollapseGeneration == generation
+}
+
+/// Ends the duty for `generation`; false when a newer activation took over.
+private func finishOverflowCollapse(_ generation: UInt64) -> Bool {
+    overflowCollapseStateLock.lock()
+    defer { overflowCollapseStateLock.unlock() }
+    guard overflowCollapseGeneration == generation else { return false }
+    overflowCollapseGeneration &+= 1
+    overflowExpandedByMacnu = false
+    overflowCollapseStoredContext = nil
+    return true
+}
+
+private func accessibilityElement(at point: CGPoint) -> AXUIElement? {
+    var element: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(
+        AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &element
+    ) == .success else { return nil }
+    return element
+}
+
+/// The bar is expanded while the item Macnu revealed can still be hit where
+/// the menu-bar host says it is. Collapsed items cannot be hit at all.
+private func overflowItemIsExposed(_ context: OverflowCollapseContext) -> Bool {
+    guard let bounds = frame(of: context.child) else { return false }
+    let centre = CGPoint(x: bounds.midX, y: bounds.midY)
+    guard context.display.contains(centre),
+          let actual = accessibilityElement(at: centre) else { return false }
+    var actualPID: pid_t = 0
+    if AXUIElementGetPid(actual, &actualPID) == .success,
+       actualPID == context.itemPID,
+       let actualFrame = frame(of: actual),
+       statusFramesMatch(actualFrame, bounds) {
+        return true
+    }
+    return accessibilityLineage(from: actual).contains {
+        CFEqual($0, context.child) || CFEqual($0, context.wrapper)
+            || CFEqual($0, context.itemElement)
+    }
+}
+
+private func overflowCollapseConditions(
+    _ context: OverflowCollapseContext
+) -> OverflowCollapseConditions {
+    let pointer = CGEvent(source: nil)?.location
+    return OverflowCollapseConditions(
+        menuOpen: statusPopupIsOpen(
+            windows: onScreenWindows(), baseline: context.baseline,
+            itemPID: context.itemPID, anchor: context.anchor
+        ),
+        launcherActive: NSRunningApplication.current.isActive,
+        mouseDown: CGEventSource.buttonState(.combinedSessionState, button: .left)
+            || CGEventSource.buttonState(.combinedSessionState, button: .right),
+        pointerInMenuBar: pointer.map {
+            pointIsInMenuBar($0, display: context.display)
+        } ?? false
+    )
+}
+
+/// Clicks the overflow control once, only if the bar is still expanded.
+private func collapseOverflowIfExpanded(_ context: OverflowCollapseContext) -> String {
+    guard overflowItemIsExposed(context) else { return "already collapsed" }
+    let controls = accessibilityElements(
+        from: attribute(kAXChildrenAttribute, from: context.window)
+    ).filter {
+        attribute(kAXRoleAttribute, from: $0) as? String == kAXButtonRole as String
+    }
+    guard controls.count == 1, let bounds = frame(of: controls[0]) else {
+        return "overflow control unavailable (\(controls.count))"
+    }
+    let centre = CGPoint(x: bounds.midX, y: bounds.midY)
+    guard context.display.contains(centre),
+          let actual = accessibilityElement(at: centre) else {
+        return "overflow control not on display"
+    }
+    var actualPID: pid_t = 0
+    let hitIsControl = accessibilityLineage(from: actual).contains(where: {
+        CFEqual($0, controls[0])
+    }) || (AXUIElementGetPid(actual, &actualPID) == .success
+        && actualPID == context.hostPID
+        && (frame(of: actual).map { statusFramesMatch($0, bounds) } ?? false))
+    guard hitIsControl else { return "overflow control not hit" }
+    let originalPointer = CGEvent(source: nil)?.location
+    guard postVisibleStatusClick(at: centre) else { return "click failed" }
+    Thread.sleep(forTimeInterval: 0.05)
+    if let originalPointer, let current = CGEvent(source: nil)?.location,
+       let restore = statusClickRestorationPoint(
+           original: originalPointer, current: current, posted: centre
+       ) {
+        CGWarpMouseCursorPosition(restore)
+    }
+    return "collapsed"
+}
+
+/// Waits for the menu Macnu opened to close, then collapses the bar again.
+/// A newer activation supersedes this watcher and inherits the duty.
+private func armOverflowCollapse(_ context: OverflowCollapseContext) {
+    overflowCollapseStateLock.lock()
+    overflowCollapseGeneration &+= 1
+    let generation = overflowCollapseGeneration
+    overflowExpandedByMacnu = true
+    overflowCollapseStoredContext = context
+    overflowCollapseStateLock.unlock()
+
+    overflowCollapseQueue.asyncAfter(deadline: .now() + 0.8) {
+        func log(_ outcome: String) {
+            guard diagnosticsEnabled else { return }
+            try? "time=\(Date())\n\(outcome)".write(
+                toFile: "/tmp/macnu-overflow-collapse.log",
+                atomically: true, encoding: .utf8
+            )
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 600
+        while true {
+            guard overflowCollapseIsCurrent(generation) else { return }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                if finishOverflowCollapse(generation) { log("gave up waiting") }
+                return
+            }
+            if overflowCollapseShouldWait(overflowCollapseConditions(context)) {
+                Thread.sleep(forTimeInterval: 0.25)
+                continue
+            }
+            // Require the quiet state twice so a menu that is still opening,
+            // or a pointer just passing through, cannot trigger the collapse.
+            Thread.sleep(forTimeInterval: 0.5)
+            if overflowCollapseShouldWait(overflowCollapseConditions(context)) {
+                continue
+            }
+            break
+        }
+        overflowActionLock.lock()
+        defer { overflowActionLock.unlock() }
+        guard finishOverflowCollapse(generation) else { return }
+        log(collapseOverflowIfExpanded(context))
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+}
+
 private func activateHostedStatusItem(
     _ candidate: AccessibilityCandidate, displays: [CGRect], baseline: Set<CGWindowID>,
     observePopup: Bool = true
 ) -> AccessibilityActivationResult? {
     var trace: [String] = []
+    // Let a collapse that is already clicking finish, then take over its duty.
+    overflowActionLock.lock()
+    overflowActionLock.unlock()
+    let inheritedCollapse = suspendOverflowCollapse()
+    var revealedOverflow = false
+    var collapseContext: OverflowCollapseContext?
     let originalPointer = CGEvent(source: nil)?.location
     var lastPostedPoint: CGPoint?
     defer {
@@ -2360,6 +2546,11 @@ private func activateHostedStatusItem(
            let restore = statusClickRestorationPoint(original: originalPointer,
                current: current, posted: lastPostedPoint) {
             CGWarpMouseCursorPosition(restore)
+        }
+        if revealedOverflow || inheritedCollapse.owed,
+           let context = collapseContext ?? inheritedCollapse.context {
+            trace.append("collapse armed")
+            armOverflowCollapse(context)
         }
         if diagnosticsEnabled {
             try? trace.joined(separator: "\n").write(toFile: "/tmp/macnu-generic-activation.log", atomically: true, encoding: .utf8)
@@ -2400,6 +2591,15 @@ private func activateHostedStatusItem(
     let wrapper = target.wrapper
     let child = target.child
     let window = target.window
+    if let display = activationTargetDisplay(for: candidate.frame, in: displays) {
+        collapseContext = OverflowCollapseContext(
+            window: window, wrapper: wrapper, child: child,
+            itemElement: candidate.element, itemPID: candidate.pid,
+            hostPID: target.hostPID, baseline: baseline,
+            anchor: CGPoint(x: candidate.frame.midX, y: candidate.frame.midY),
+            display: display
+        )
+    }
     func click(at point: CGPoint) -> Bool {
         guard postVisibleStatusClick(at: point) else { return false }
         lastPostedPoint = point
@@ -2455,6 +2655,7 @@ private func activateHostedStatusItem(
         }
         trace.append("revealing")
         guard click(at: CGPoint(x: bounds.midX, y: bounds.midY)) else { return nil }
+        revealedOverflow = true
         // The bar animates open. Wait until the item reports the same
         // clickable point twice so the click cannot land mid-animation.
         var previous: CGPoint?
@@ -2466,6 +2667,7 @@ private func activateHostedStatusItem(
         }
     }
     guard let point = targetPoint() else { trace.append("target not exposed"); return nil }
+    collapseContext?.anchor = point
     trace.append("clicking \(point)")
     guard click(at: point) else { return nil }
     return AccessibilityActivationResult(action: nil, usedProcessTargetedClick: false,

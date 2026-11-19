@@ -53,3 +53,40 @@ func statusClickRestorationPoint(original: CGPoint, current: CGPoint, posted: CG
     // Do not override mouse movement the user made while the menu was opening.
     return original
 }
+
+/// Whether a window that appeared after activation is the menu or popover
+/// Macnu opened: it hangs below the item and belongs to the item's app or
+/// floats above normal windows. Ordinary windows opened elsewhere are ignored.
+func statusPopupIsOpen(
+    windows: [OnScreenWindow], baseline: Set<CGWindowID>, itemPID: pid_t, anchor: CGPoint
+) -> Bool {
+    windows.contains { window in
+        guard !baseline.contains(window.id) else { return false }
+        let horizontalDistance = max(
+            0, max(window.bounds.minX - anchor.x, anchor.x - window.bounds.maxX)
+        )
+        return horizontalDistance <= 48 && window.bounds.minY <= anchor.y + 100
+            && (window.pid == itemPID || window.layer > 0)
+    }
+}
+
+func pointIsInMenuBar(
+    _ point: CGPoint, display: CGRect, barHeight: CGFloat = 40
+) -> Bool {
+    display.contains(point) && point.y < display.minY + barHeight
+}
+
+struct OverflowCollapseConditions {
+    var menuOpen = false
+    var launcherActive = false
+    var mouseDown = false
+    var pointerInMenuBar = false
+}
+
+/// Macnu re-collapses the menu bar only when nothing is using it: the opened
+/// menu has closed, the palette is not focused, and the user is neither
+/// pressing a mouse button nor pointing at the menu bar.
+func overflowCollapseShouldWait(_ conditions: OverflowCollapseConditions) -> Bool {
+    conditions.menuOpen || conditions.launcherActive
+        || conditions.mouseDown || conditions.pointerInMenuBar
+}
